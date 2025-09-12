@@ -17,6 +17,11 @@ if str(ROOT) not in sys.path:
 
 from mae.lightning.models.mae_lightning import MAELightning  # noqa: E402
 
+# Fix for numpy issue with recent versions
+import numpy as np
+if not hasattr(np, "float"):
+    np.float = float
+
 
 def load_images(input_dir: Path) -> Iterable[Path]:
     exts = ("*.png", "*.jpg", "*.jpeg")
@@ -46,7 +51,7 @@ def main() -> None:
 
     transform = transforms.Compose(
         [
-            transforms.RandomResizedCrop(224),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
         ]
     )
@@ -71,8 +76,8 @@ def main() -> None:
         recon = model.model.unpatchify(recon_patches)
 
         # Compute heatmap (per-pixel squared error averaged over channels)
-        error = ((recon - tensor) ** 2).mean(dim=1, keepdim=True)  # [1,1,H,W]
-        error_norm = error / (error.max() + 1e-8)
+        # error = ((recon - tensor) ** 2).mean(dim=1, keepdim=True)  # [1,1,H,W]
+        # error_norm = error / (error.max() + 1e-8)
 
         # Save side-by-side reconstruction
         grid = torch.cat([tensor, img_masked, recon], dim=3)  # concatenate along width
@@ -80,14 +85,14 @@ def main() -> None:
         utils.save_image(grid, grid_path)
 
         # Save heatmap overlay
-        heatmap_path = output_dir / f"{path.stem}_heatmap.png"
-        orig = transforms.ToPILImage()(tensor[0].cpu())
-        err = error_norm[0, 0].cpu().numpy()
-        heatmap = cm.get_cmap("inferno")(err)
-        heatmap[..., 3] = 0.6  # set alpha channel
-        heatmap_img = Image.fromarray((heatmap * 255).astype("uint8"))
-        overlay = Image.alpha_composite(orig.convert("RGBA"), heatmap_img)
-        overlay.save(heatmap_path)
+        # heatmap_path = output_dir / f"{path.stem}_heatmap.png"
+        # orig = transforms.ToPILImage()(tensor[0].cpu())
+        # err = error_norm[0, 0].cpu().numpy()
+        # heatmap = cm.get_cmap("inferno")(err)
+        # heatmap[..., 3] = 0.6  # set alpha channel
+        # heatmap_img = Image.fromarray((heatmap * 255).astype("uint8"))
+        # overlay = Image.alpha_composite(orig.convert("RGBA"), heatmap_img)
+        # overlay.save(heatmap_path)
 
 
 if __name__ == "__main__":
