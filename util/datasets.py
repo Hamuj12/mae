@@ -12,12 +12,12 @@ import os
 import PIL
 import torch
 
+from torch.utils.data import Subset
 from torchvision import datasets, transforms
 from torch.utils.data import random_split
 
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
 
 def build_dataset(is_train, args):
     """Create a dataset for training or validation.
@@ -46,7 +46,6 @@ def build_dataset(is_train, args):
             full_dataset, [train_size, val_size], generator=generator
         )
         dataset = train_dataset if is_train else val_dataset
-
     return dataset
 
 

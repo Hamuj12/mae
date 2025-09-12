@@ -21,7 +21,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+from util.datasets import build_dataset
 
 import timm
 
@@ -79,6 +79,8 @@ def get_args_parser():
                         help='dataset path')
     parser.add_argument('--nb_classes', default=1000, type=int,
                         help='number of the classification types')
+    parser.add_argument('--val_split', type=float, default=0.2,
+                        help='Fraction of data for validation when no split dirs are present')
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -139,10 +141,8 @@ def main(args):
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
-    print(dataset_train)
-    print(dataset_val)
+    dataset_train = build_dataset(is_train=True, args=args, transform=transform_train)
+    dataset_val = build_dataset(is_train=False, args=args, transform=transform_val)
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()

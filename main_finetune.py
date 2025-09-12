@@ -121,6 +121,8 @@ def get_args_parser():
                         help='dataset path')
     parser.add_argument('--nb_classes', default=1000, type=int,
                         help='number of the classification types')
+    parser.add_argument('--val_split', type=float, default=0.2,
+                        help='Fraction of data for validation when no split dirs are present')
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
