@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, random_split
 
 # Ensure project root is on path when running as a script
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,15 +22,20 @@ from mae.lightning.utils.common import log_config, set_seed
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train MAE with Lightning")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
-    set_seed(args.seed)
+    set_seed(cfg.seed)
     log_config(cfg)
 
-    train_ds = BackgroundOnlyDataset(cfg.data.train_dir, cfg.data.image_size)
-    val_ds = BackgroundOnlyDataset(cfg.data.val_dir, cfg.data.image_size)
+    dataset = BackgroundOnlyDataset(cfg.data.data_dir, cfg.data.image_size)
+    val_len = int(len(dataset) * cfg.data.val_split)
+    train_len = len(dataset) - val_len
+    train_ds, val_ds = random_split(
+        dataset,
+        [train_len, val_len],
+        generator=torch.Generator().manual_seed(cfg.seed),
+    )
 
     train_loader = DataLoader(
         train_ds,
