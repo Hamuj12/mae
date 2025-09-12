@@ -1,0 +1,23 @@
+data:
+  train_dir: /path/to/train
+  val_dir: /path/to/val
+  image_size: 224
+  num_workers: 8
+  batch_size: 64
+
+optim:
+  lr: 1.5e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_epochs: 10
+  max_epochs: 200
+  mask_ratio: 0.75
+
+trainer:
+  devices: 4
+  accelerator: "gpu"
+  strategy: "ddp"
+  precision: "16-mixed"
+  log_every_n_steps: 50
+  default_root_dir: ./outputs/mae_runs
+  gradient_clip_val: 1.0
