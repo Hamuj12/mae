@@ -10,20 +10,42 @@
 
 import os
 import PIL
+import torch
 
 from torchvision import datasets, transforms
+from torch.utils.data import random_split
 
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
 def build_dataset(is_train, args):
+    """Create a dataset for training or validation.
+
+    If ``data_path`` contains ``train`` and ``val`` subdirectories, the
+    corresponding ImageFolder is returned. Otherwise the images in
+    ``data_path`` are deterministically split into training and validation
+    subsets using ``args.val_split`` (a fraction between 0 and 1) and
+    ``args.seed`` for reproducibility.
+    """
     transform = build_transform(is_train, args)
 
-    root = os.path.join(args.data_path, 'train' if is_train else 'val')
-    dataset = datasets.ImageFolder(root, transform=transform)
-
-    print(dataset)
+    train_dir = os.path.join(args.data_path, 'train')
+    val_dir = os.path.join(args.data_path, 'val')
+    if os.path.exists(train_dir) and os.path.exists(val_dir):
+        root = train_dir if is_train else val_dir
+        dataset = datasets.ImageFolder(root, transform=transform)
+    else:
+        if not 0 < args.val_split < 1:
+            raise ValueError("val_split must be between 0 and 1")
+        full_dataset = datasets.ImageFolder(args.data_path, transform=transform)
+        val_size = int(len(full_dataset) * args.val_split)
+        train_size = len(full_dataset) - val_size
+        generator = torch.Generator().manual_seed(args.seed)
+        train_dataset, val_dataset = random_split(
+            full_dataset, [train_size, val_size], generator=generator
+        )
+        dataset = train_dataset if is_train else val_dataset
 
     return dataset
 
