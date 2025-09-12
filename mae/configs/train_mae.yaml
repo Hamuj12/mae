@@ -1,6 +1,8 @@
+seed: 0
+
 data:
-  train_dir: /path/to/train
-  val_dir: /path/to/val
+  data_dir: /path/to/data
+  val_split: 0.2
   image_size: 224
   num_workers: 8
   batch_size: 64
