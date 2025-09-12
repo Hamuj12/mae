@@ -1,7 +1,7 @@
 seed: 0
 
 data:
-  data_dir: /path/to/data
+  data_dir: /home/hm25936/OrbitGen/outputs/midLighting_rmag_5m_to_100m_background_only
   val_split: 0.2
   image_size: 224
   num_workers: 8

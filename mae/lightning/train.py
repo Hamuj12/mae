@@ -9,6 +9,11 @@ from omegaconf import OmegaConf
 import torch
 from torch.utils.data import DataLoader, random_split
 
+# Fix for numpy issue with recent versions
+import numpy as np
+if not hasattr(np, "float"):
+    np.float = float
+
 # Ensure project root is on path when running as a script
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
