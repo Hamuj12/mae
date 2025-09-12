@@ -10,20 +10,41 @@
 
 import os
 import PIL
+import torch
 
+from torch.utils.data import Subset
 from torchvision import datasets, transforms
 
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
-def build_dataset(is_train, args):
-    transform = build_transform(is_train, args)
+def build_dataset(is_train, args, transform=None):
+    """Build dataset for training or validation.
 
-    root = os.path.join(args.data_path, 'train' if is_train else 'val')
-    dataset = datasets.ImageFolder(root, transform=transform)
+    If standard ImageNet-style ``train`` and ``val`` folders exist, they are
+    used directly. Otherwise a random split of the data at ``args.data_path`` is
+    created using ``args.val_split``.
+    """
+    if transform is None:
+        transform = build_transform(is_train, args)
 
-    print(dataset)
+    train_dir = os.path.join(args.data_path, 'train')
+    val_dir = os.path.join(args.data_path, 'val')
+
+    if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+        root = train_dir if is_train else val_dir
+        dataset = datasets.ImageFolder(root, transform=transform)
+    else:
+        full_dataset = datasets.ImageFolder(args.data_path, transform=transform)
+        if not hasattr(args, 'train_indices'):
+            generator = torch.Generator().manual_seed(getattr(args, 'seed', 0))
+            indices = torch.randperm(len(full_dataset), generator=generator)
+            val_len = int(len(full_dataset) * args.val_split)
+            args.val_indices = indices[:val_len].tolist()
+            args.train_indices = indices[val_len:].tolist()
+        indices = args.train_indices if is_train else args.val_indices
+        dataset = Subset(full_dataset, indices)
 
     return dataset
 
