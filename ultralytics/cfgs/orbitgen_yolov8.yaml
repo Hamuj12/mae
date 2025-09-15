@@ -1,0 +1,8 @@
+# OrbitGen dataset configuration for YOLOv8
+path: /path/to/orbitgen_dataset
+train: images/train
+val: images/val
+test: images/test
+keypoints: 128
+nc: 1
+mask: true
