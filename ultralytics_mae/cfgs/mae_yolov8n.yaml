@@ -1,19 +1,7 @@
-# mae + yolov8n detect-head
+# MAE-initialized YOLOv8 nano model definition.
+nc: 1
 backbone:
-  type: MaeViTBackbone
-  args:
-    ckpt_path: /abs/path/to/mae_backbone.ckpt
-    embed_dim: 768
-    patch_size: 16
-    freeze: False
-
-neck:
-  type: MaeSimpleFPN
-  args:
-    out_channels: 256
-
+  - [-1, 1, MaeViTBackbone, [null, 768, 16, false]]
 head:
-  type: Detect
-  args:
-    nc: 1
-    ch: [256, 256, 256]
+  - [-1, 1, MaeSimpleFPN, [768, 256]]
+  - [-1, 1, MaeDetect, [1, [256, 256, 256], [8, 16, 32]]]

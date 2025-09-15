@@ -168,15 +168,15 @@ Use the utilities under `ultralytics_mae/tools` to compose and train a YOLO dete
      --out model_weights/mae_yolov8n_full.pt
    ```
 3. Run `python tools/json_to_yolo.py --data_yaml ultralytics_mae/cfgs/orbitgen_yolov8.yaml --output /datasets/outdir` before training to materialize YOLO label files (adjust the `--output` path to your dataset root).
-4. Launch Ultralytics training directly from the saved `.pt` file:
+4. Launch Ultralytics training directly from either the composed `.pt` file or the YAML definition:
    ```bash
    python ultralytics_mae/tools/train_mae_yolov8.py \
-     --model model_weights/mae_yolov8n_full.pt \
+     --model ultralytics_mae/cfgs/mae_yolov8n.yaml \
      --data ultralytics_mae/cfgs/orbitgen_yolov8.yaml \
-     --img 1024 --epochs 50 --batch 16 --device 0,1,2,3
+     --img 1024 --epochs 50 --batch 16 --device 0,1,2,3 --orbitgen
    ```
 
-The `.pt` checkpoint contains the full model definition, so the standard Ultralytics training CLI works without any custom YAML parsing or monkey-patching.
+The repository ships a lightweight wrapper around the pip `ultralytics` package that imports `ultralytics_mae.nn` on start-up and injects `MaeViTBackbone`, `MaeSimpleFPN`, and the `MaeDetect` head into `ultralytics.nn.tasks.globals()`. Any new custom modules can be added by exposing them in `ultralytics_mae/nn/__init__.py` and updating `register_ultralytics_modules()` so they are discoverable when Ultralytics parses a YAML model.
 
 ### License
 

@@ -1,4 +1,4 @@
-"""Training entry point for MAE-initialized YOLO models saved as .pt checkpoints."""
+"""Training entry point for MAE-initialized YOLO models."""
 
 import argparse
 from pathlib import Path
@@ -8,8 +8,8 @@ from ultralytics import YOLO
 
 def main(opt: argparse.Namespace) -> None:
     model_path = Path(opt.model)
-    if model_path.suffix != ".pt":
-        raise ValueError("--model must point to a .pt checkpoint built with build_mae_yolo.py")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model definition '{model_path}' does not exist")
 
     model = YOLO(model_path)
     train_kwargs = dict(
@@ -28,7 +28,7 @@ def main(opt: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=str, required=True, help="Path to MAE+YOLO .pt checkpoint")
+    parser.add_argument("--model", type=str, required=True, help="Path to MAE+YOLO model YAML or .pt checkpoint")
     parser.add_argument("--data", type=str, required=True, help="Dataset YAML path")
     parser.add_argument("--img", type=int, default=640, help="Image size")
     parser.add_argument("--epochs", type=int, default=50)
