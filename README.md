@@ -151,6 +151,32 @@ By fine-tuning these pre-trained models, we rank #1 in these classification task
 
 The pre-training instruction is in [PRETRAIN.md](PRETRAIN.md).
 
+### MAE + YOLO detection
+
+Use the utilities under `ultralytics_mae/tools` to compose and train a YOLO detector with MAE features:
+
+1. Export the encoder weights from a Lightning checkpoint (if you do not already have a `.pt` state dict):
+   ```bash
+   python ultralytics_mae/tools/load_mae_backbone.py \
+     --ckpt path/to/mae.ckpt \
+     --out model_weights/mae_encoder.pt
+   ```
+2. Build a full YOLO checkpoint that embeds the MAE backbone and FPN:
+   ```bash
+   python ultralytics_mae/tools/build_mae_yolo.py \
+     --ckpt model_weights/mae_encoder.pt \
+     --out model_weights/mae_yolov8n_full.pt
+   ```
+3. Launch Ultralytics training directly from the saved `.pt` file:
+   ```bash
+   python ultralytics_mae/tools/train_mae_yolov8.py \
+     --model model_weights/mae_yolov8n_full.pt \
+     --data ultralytics_mae/cfgs/orbitgen_yolov8.yaml \
+     --img 1024 --epochs 50 --batch 16 --device 0,1,2,3 --orbitgen
+   ```
+
+The `.pt` checkpoint contains the full model definition, so the standard Ultralytics training CLI works without any custom YAML parsing or monkey-patching.
+
 ### License
 
 This project is under the CC-BY-NC 4.0 license. See [LICENSE](LICENSE) for details.
