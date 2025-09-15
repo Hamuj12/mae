@@ -20,13 +20,19 @@ class OrbitGenDataset(Dataset):
     returned as ``[x, y, v]`` triplets also normalized to ``[0, 1]``.
     """
 
-    def __init__(self, root_dir: str | Path, img_size: int = 640) -> None:
+    def __init__(self, root_dir: str | Path, split: str = "train", img_size: int = 640) -> None:
         self.root = Path(root_dir)
+        self.split = split
         self.img_size = img_size
-        self.img_dir = self.root / "images"
-        self.mask_dir = self.root / "masks"
-        self.meta_dir = self.root / "meta"
+
+        # e.g. root/images/train, root/masks/train, root/meta/train
+        self.img_dir = self.root / "images" / split
+        self.mask_dir = self.root / "masks" / split
+        self.meta_dir = self.root / "meta" / split
+
         self.images = sorted(self.img_dir.glob("*.png"))
+        if not self.images:
+            raise RuntimeError(f"No images found in {self.img_dir}. Check dataset path and split.")
 
     def __len__(self) -> int:  # noqa: D401 - standard Dataset API
         return len(self.images)

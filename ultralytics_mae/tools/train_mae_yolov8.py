@@ -6,15 +6,30 @@ from pathlib import Path
 from ultralytics import YOLO
 
 
-def _orbitgen_loader(data_path, img_size, batch_size):
-    """Create a DataLoader for OrbitGen datasets."""
+def _orbitgen_loader(data_yaml, img_size, batch_size):
+    """Create DataLoaders for OrbitGen datasets using train/val/test splits."""
+    import yaml
     from torch.utils.data import DataLoader
+    from ultralytics_mae.nn.datasets.orbitgen_dataset import OrbitGenDataset
+    from ultralytics_mae.nn.utils.collate import orbitgen_collate_fn
 
-    from ultralytics.nn.datasets.orbitgen_dataset import OrbitGenDataset
-    from ultralytics.nn.utils.collate import orbitgen_collate_fn
+    with open(data_yaml, "r") as f:
+        cfg = yaml.safe_load(f)
 
-    dataset = OrbitGenDataset(data_path, img_size=img_size)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=orbitgen_collate_fn)
+    root = Path(cfg["path"])
+    loaders = {}
+
+    for split in ["train", "val", "test"]:
+        if split in cfg and cfg[split]:
+            dataset = OrbitGenDataset(root, split=split, img_size=img_size)
+            loaders[split] = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=(split == "train"),
+                collate_fn=orbitgen_collate_fn,
+            )
+
+    return loaders
 
 
 def main(opt: argparse.Namespace) -> None:
@@ -25,7 +40,20 @@ def main(opt: argparse.Namespace) -> None:
     model = YOLO(model_path)
     if opt.orbitgen:
         train_loader = _orbitgen_loader(opt.data, opt.img, opt.batch)
-        model.train(dataloader=train_loader, imgsz=opt.img, epochs=opt.epochs, device=opt.device)
+        val_loader = _orbitgen_loader(opt.data, opt.img, opt.batch)
+        test_loader = _orbitgen_loader(opt.data, opt.img, opt.batch)
+
+        # YOLO.train only takes train/val dataloaders; test is usually separate
+        model.train(
+            dataloader=train_loader,
+            val_dataloader=val_loader,
+            imgsz=opt.img,
+            epochs=opt.epochs,
+            device=opt.device,
+        )
+        # Optionally evaluate on test set
+        if len(test_loader.dataset) > 0:
+            model.val(dataloader=test_loader, imgsz=opt.img, device=opt.device)
     else:
         model.train(
             data=opt.data,
