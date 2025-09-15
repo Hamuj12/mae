@@ -167,12 +167,13 @@ Use the utilities under `ultralytics_mae/tools` to compose and train a YOLO dete
      --ckpt model_weights/mae_encoder.pt \
      --out model_weights/mae_yolov8n_full.pt
    ```
-3. Launch Ultralytics training directly from the saved `.pt` file:
+3. Run `python tools/json_to_yolo.py --data_yaml ultralytics_mae/cfgs/orbitgen_yolov8.yaml --output /datasets/outdir` before training to materialize YOLO label files (adjust the `--output` path to your dataset root).
+4. Launch Ultralytics training directly from the saved `.pt` file:
    ```bash
    python ultralytics_mae/tools/train_mae_yolov8.py \
      --model model_weights/mae_yolov8n_full.pt \
      --data ultralytics_mae/cfgs/orbitgen_yolov8.yaml \
-     --img 1024 --epochs 50 --batch 16 --device 0,1,2,3 --orbitgen
+     --img 1024 --epochs 50 --batch 16 --device 0,1,2,3
    ```
 
 The `.pt` checkpoint contains the full model definition, so the standard Ultralytics training CLI works without any custom YAML parsing or monkey-patching.
