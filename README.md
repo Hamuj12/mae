@@ -180,4 +180,58 @@ The repository ships a lightweight wrapper around the pip `ultralytics` package 
 
 ### License
 
+## Dual YOLO + MAE Minimal Pipeline
+
+The repository now includes a standalone reference implementation under `dual_yolo_mae/` that avoids the Ultralytics registry and YAML overrides used elsewhere in the project. The code is intentionally compact and keeps the detector definition, utilities, and training scripts in a single directory.
+
+### File Layout
+
+```
+dual_yolo_mae/
+├── config.yaml      # Example configuration with dataset + training defaults
+├── infer.py         # CLI for loading checkpoints and running image inference
+├── model.py         # DualBackboneYOLO definition (MAE + YOLO backbones + detection head)
+├── train.py         # PyTorch Lightning training loop
+└── utils.py         # Dataset helpers, logging utilities, Ultralytics loader shim
+```
+
+### Dataset Expectations
+
+The training script consumes datasets stored in the canonical YOLO format:
+
+```
+data_root/
+├── images/
+│   ├── train/
+│   └── val/
+└── labels/
+    ├── train/
+    └── val/
+```
+
+Each label file should follow the `class x_center y_center width height` convention with normalized coordinates. Update `dual_yolo_mae/config.yaml` to point `dataset.path` at your dataset root and to list the class names you intend to train on.
+
+### Training
+
+```bash
+python dual_yolo_mae/train.py --config dual_yolo_mae/config.yaml
+```
+
+* `config.yaml` controls model hyperparameters, optimizer settings, and checkpoint locations.
+* The training loop uses PyTorch Lightning for multi-GPU support; install dependencies with `pip install -r requirements.txt` or manually (`torch`, `pytorch-lightning`, `ultralytics`, and `opencv-python-headless`).
+* Checkpoints (including a lightweight `model.pt` containing only the fused weights) are written to `training.checkpoint_dir` (defaults to `checkpoints/`).
+
+### Inference
+
+```bash
+python dual_yolo_mae/infer.py --config dual_yolo_mae/config.yaml \
+    --weights checkpoints/model.pt --input path/to/image_or_folder
+```
+
+The inference script restores the fused model, runs detection on one or more images, and writes annotated visualisations to `predictions/` (override with `--output`). Confidence and IoU thresholds are exposed via `--conf` and `--iou` flags.
+
+### Checkpoints
+
+The configuration expects a YOLOv8 backbone weight file (default `yolov8n.pt`) and optionally an MAE encoder checkpoint. Place the files anywhere on disk and update `model.yolo.weights` or `model.mae.checkpoint` accordingly. If the MAE checkpoint is omitted, the encoder starts from the default MAE initialization.
+
 This project is under the CC-BY-NC 4.0 license. See [LICENSE](LICENSE) for details.
