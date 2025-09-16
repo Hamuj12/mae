@@ -1,0 +1,44 @@
+model:
+  num_classes: 2
+  input_size: 640
+  loss_weights:
+    box: 5.0
+    obj: 1.0
+    cls: 1.0
+  scale_ranges:
+    - [0.0, 0.08]
+    - [0.08, 0.2]
+    - [0.2, 1.0]
+  mae:
+    checkpoint: ""
+    output_dims: [144, 144, 144]
+    freeze: true
+  yolo:
+    weights: yolov8n.pt
+    freeze: true
+  fusion:
+    channels: [160, 160, 160]
+
+dataset:
+  path: data/sample_dataset
+  train_split: train
+  val_split: val
+  class_names: ["class0", "class1"]
+  augment: false
+
+training:
+  epochs: 10
+  batch_size: 2
+  lr: 0.0001
+  weight_decay: 0.0005
+  num_workers: 2
+  precision: 32
+  accelerator: auto
+  devices: auto
+  checkpoint_dir: checkpoints
+  gradient_clip_val: 1.0
+  seed: 42
+
+inference:
+  conf_threshold: 0.25
+  iou_threshold: 0.45
