@@ -1,8 +1,0 @@
-# OrbitGen dataset configuration for YOLOv8
-path: /home/hm25936/datasets_for_yolo/midLighting_rmag_5m_to_100m
-train: images/train
-val: images/val
-test: images/test
-keypoints: 128
-nc: 1
-mask: true

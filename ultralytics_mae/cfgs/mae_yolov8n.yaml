@@ -1,7 +1,0 @@
-# MAE-initialized YOLOv8 nano model definition.
-nc: 1
-backbone:
-  - [-1, 1, MaeViTBackbone, [null, 768, 16, false]]
-head:
-  - [-1, 1, MaeSimpleFPN, [768, 256]]
-  - [-1, 1, MaeDetect, [1, [256, 256, 256], [8, 16, 32]]]

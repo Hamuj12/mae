@@ -1,6 +1,6 @@
 model:
-  num_classes: 2
-  input_size: 640
+  num_classes: 1
+  input_size: 1024
   loss_weights:
     box: 5.0
     obj: 1.0
@@ -10,25 +10,25 @@ model:
     - [0.08, 0.2]
     - [0.2, 1.0]
   mae:
-    checkpoint: ""
+    checkpoint: /home/hm25936/mae/mae/lightning/outputs/mae_runs/lightning_logs/version_1/checkpoints/epoch=199-step=6200.ckpt
     output_dims: [160, 160, 160]
     freeze: true
   yolo:
     weights: yolov8n.pt
-    freeze: true
+    freeze: false
   fusion:
     channels: [160, 160, 160]
 
 dataset:
-  path: data/sample_dataset
+  path: /home/hm25936/datasets_for_yolo/midLighting_rmag_5m_to_100m
   train_split: train
   val_split: val
-  class_names: ["class0", "class1"]
+  class_names: ["soho"]
   augment: false
 
 training:
-  epochs: 10
-  batch_size: 2
+  epochs: 100
+  batch_size: 8
   lr: 0.0001
   weight_decay: 0.0005
   num_workers: 2

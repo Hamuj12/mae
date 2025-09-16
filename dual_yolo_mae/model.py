@@ -13,6 +13,10 @@ from torchvision.ops import nms
 from models_mae import mae_vit_base_patch16_dec512d8b
 from dual_yolo_mae.utils import load_ultralytics_model
 
+# Fix for numpy issue with recent versions
+import numpy as np
+if not hasattr(np, "float"):
+    np.float = float
 
 class MAEBackbone(nn.Module):
     """Wrapper around the MAE encoder that exposes convolutional feature maps."""
@@ -25,10 +29,22 @@ class MAEBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder = mae_vit_base_patch16_dec512d8b()
+        
+        # Infer the MAE encoder's native input size (e.g., 224x224 for ViT-B/16)
+        enc_size = getattr(self.encoder.patch_embed, "img_size", 224)
+        if isinstance(enc_size, (list, tuple)):
+            self.mae_in_size = (int(enc_size[0]), int(enc_size[1]))
+        else:
+            self.mae_in_size = (int(enc_size), int(enc_size))
+            
         if checkpoint:
             state = torch.load(checkpoint, map_location="cpu")
-            key = "model" if "model" in state else "state_dict"
-            missing, unexpected = self.encoder.load_state_dict(state[key], strict=False)
+            if "state_dict" in state:
+                state = {k.replace("model.", "", 1): v for k, v in state["state_dict"].items()}
+            elif "model" in state:
+                state = state["model"]
+            # else assume it's already a plain state_dict
+            missing, unexpected = self.encoder.load_state_dict(state, strict=False)
             if missing:
                 print(f"[MAEBackbone] Missing keys while loading checkpoint: {missing}")
             if unexpected:
@@ -64,19 +80,33 @@ class MAEBackbone(nn.Module):
 
     @torch.no_grad()
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        x = self.encoder.patch_embed(x)
-        x = x + self.encoder.pos_embed[:, 1:, :]
+        """
+        Encode an image batch with the MAE encoder, resizing to the encoder's native
+        input size if necessary (e.g., 224x224 for ViT-B/16). Returns a CxHxW feature map.
+        """
+        # Resize ONLY for MAE, keep YOLO path at original resolution
+        if x.shape[-2:] != self.mae_in_size:
+            x_in = F.interpolate(x, size=self.mae_in_size, mode="bilinear", align_corners=False)
+        else:
+            x_in = x
+
+        B = x_in.shape[0]
+        # Standard MAE forward up to the encoder outputs
+        x_tokens = self.encoder.patch_embed(x_in)                 # [B, N, C]
+        x_tokens = x_tokens + self.encoder.pos_embed[:, 1:, :]    # add pos to patch tokens
         cls_token = self.encoder.cls_token + self.encoder.pos_embed[:, :1, :]
-        cls_tokens = cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        cls_tokens = cls_token.expand(B, -1, -1)                  # [B, 1, C]
+        x_tokens = torch.cat((cls_tokens, x_tokens), dim=1)       # [B, 1+N, C]
+
         for blk in self.encoder.blocks:
-            x = blk(x)
-        x = self.encoder.norm(x)
-        x = x[:, 1:, :]
-        side = int(math.sqrt(x.shape[1]))
-        x = x.transpose(1, 2).contiguous().view(B, self.embed_dim, side, side)
-        return x
+            x_tokens = blk(x_tokens)
+        x_tokens = self.encoder.norm(x_tokens)                    # [B, 1+N, C]
+
+        # drop cls token, reshape patches to 2D feature map
+        x_tokens = x_tokens[:, 1:, :]                             # [B, N, C]
+        side = int(math.sqrt(x_tokens.shape[1]))                  # N should be a perfect square
+        x_feat = x_tokens.transpose(1, 2).contiguous().view(B, self.embed_dim, side, side)  # [B, C, H, W]
+        return x_feat
 
 
 class YOLOBackbone(nn.Module):
