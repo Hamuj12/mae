@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import torch
 from PIL import Image, ImageDraw
@@ -11,6 +11,26 @@ from torchvision import transforms
 
 from dual_yolo_mae.model import DualBackboneYOLO
 from dual_yolo_mae import utils
+
+
+def resolve_device(requested: Optional[str]) -> torch.device:
+    """Resolve the runtime device, respecting CUDA availability."""
+
+    if requested is None or requested.lower() == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    try:
+        device = torch.device(requested)
+    except (TypeError, RuntimeError) as exc:  # pragma: no cover - defensive
+        raise ValueError(f"Invalid device specification: {requested}") from exc
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        utils.LOGGER.warning(
+            "CUDA requested for inference but is unavailable. Falling back to CPU."
+        )
+        return torch.device("cpu")
+
+    return device
 
 
 def load_image(path: Path, img_size: int) -> tuple[torch.Tensor, Image.Image, tuple[int, int]]:
@@ -42,8 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", type=str, required=True, help="Path to model checkpoint (.pt or .ckpt)")
     parser.add_argument("--input", type=str, required=True, help="Image file or directory")
     parser.add_argument("--output", type=str, default="predictions", help="Directory to store annotated results")
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
-    parser.add_argument("--iou", type=float, default=0.45, help="IoU threshold for NMS")
+    parser.add_argument("--conf", type=float, default=None, help="Confidence threshold override")
+    parser.add_argument("--iou", type=float, default=None, help="IoU threshold override for NMS")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for inference (e.g. 'cuda:0', 'cpu', or leave unset for auto)",
+    )
     return parser.parse_args()
 
 
@@ -70,11 +96,30 @@ def main() -> None:
     utils.setup_logging()
     config = utils.load_config(args.config)
 
+    inference_cfg = config.get("inference", {})
+
     model = DualBackboneYOLO(config)
     load_weights(model, Path(args.weights))
     model.eval()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    conf_threshold = (
+        float(args.conf)
+        if args.conf is not None
+        else float(inference_cfg.get("conf_threshold", 0.25))
+    )
+    iou_threshold = (
+        float(args.iou)
+        if args.iou is not None
+        else float(inference_cfg.get("iou_threshold", 0.45))
+    )
+
+    device = resolve_device(args.device or inference_cfg.get("device"))
+    utils.LOGGER.info(
+        "Running inference on device %s with conf=%.2f, iou=%.2f",
+        device,
+        conf_threshold,
+        iou_threshold,
+    )
     model.to(device)
 
     img_size = int(config.get("model", {}).get("input_size", 640))
@@ -93,8 +138,8 @@ def main() -> None:
             detections = model.decode_predictions(
                 preds,
                 image_sizes=[original_hw],
-                conf_threshold=args.conf,
-                iou_threshold=args.iou,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
             )[0]
 
             annotated = draw_detections(original_image.copy(), detections, class_names)

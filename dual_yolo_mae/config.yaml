@@ -11,7 +11,7 @@ model:
     - [0.2, 1.0]
   mae:
     checkpoint: ""
-    output_dims: [144, 144, 144]
+    output_dims: [160, 160, 160]
     freeze: true
   yolo:
     weights: yolov8n.pt
@@ -42,3 +42,4 @@ training:
 inference:
   conf_threshold: 0.25
   iou_threshold: 0.45
+  device: cuda:0
