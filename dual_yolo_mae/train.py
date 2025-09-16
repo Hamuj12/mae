@@ -135,6 +135,14 @@ def main() -> None:
     pl.seed_everything(int(config.get("training", {}).get("seed", 42)))
 
     train_loader, val_loader = create_dataloaders(config)
+    if val_loader is None:
+        utils.LOGGER.info(
+            "No validation split configured. Only training metrics will be logged."
+        )
+    else:
+        utils.LOGGER.info(
+            "Validation split active with %d batches per epoch.", len(val_loader)
+        )
     module = DualYoloMaeModule(config)
 
     checkpoint_dir = utils.ensure_dir(config.get("training", {}).get("checkpoint_dir", "checkpoints"))

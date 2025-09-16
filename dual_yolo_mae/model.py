@@ -38,6 +38,7 @@ class MAEBackbone(nn.Module):
                 param.requires_grad = False
             self.encoder.eval()
         self.embed_dim = self.encoder.patch_embed.proj.out_channels
+        self.output_dims = list(output_dims)
         self.projections = nn.ModuleList(
             [
                 nn.Sequential(
@@ -52,6 +53,10 @@ class MAEBackbone(nn.Module):
     def forward(self, x: torch.Tensor, target_shapes: Sequence[Tuple[int, int]]) -> List[torch.Tensor]:
         base = self._encode(x)
         outputs: List[torch.Tensor] = []
+        if len(target_shapes) != len(self.projections):
+            raise ValueError(
+                "Number of target feature shapes must match MAE projection layers."
+            )
         for proj, shape in zip(self.projections, target_shapes):
             resized = base if base.shape[-2:] == shape else F.interpolate(base, size=shape, mode="bilinear", align_corners=False)
             outputs.append(proj(resized))
@@ -142,17 +147,7 @@ class DualBackboneYOLO(nn.Module):
         fusion_cfg = model_cfg.get("fusion", {})
 
         self.num_classes = int(model_cfg.get("num_classes", 80))
-        self.scale_ranges = model_cfg.get(
-            "scale_ranges", [[0.0, 0.07], [0.07, 0.15], [0.15, 1.0]]
-        )
         self.loss_weights = LossWeights(**model_cfg.get("loss_weights", {}))
-
-        mae_output_dims = mae_cfg.get("output_dims", [144, 144, 144])
-        self.mae_backbone = MAEBackbone(
-            checkpoint=mae_cfg.get("checkpoint"),
-            output_dims=mae_output_dims,
-            freeze=mae_cfg.get("freeze", True),
-        )
 
         self.yolo_backbone = YOLOBackbone(
             weights=yolo_cfg.get("weights", "yolov8n.pt"),
@@ -160,9 +155,36 @@ class DualBackboneYOLO(nn.Module):
             dummy_input=model_cfg.get("input_size", 640),
         )
 
-        fusion_dims = fusion_cfg.get("channels", self.yolo_backbone.output_channels)
+        fusion_dims_cfg = fusion_cfg.get("channels")
+        if fusion_dims_cfg is None:
+            fusion_dims = list(self.yolo_backbone.output_channels)
+        else:
+            fusion_dims = [int(dim) for dim in fusion_dims_cfg]
         if len(fusion_dims) != self.yolo_backbone.num_scales:
             raise ValueError("Fusion channel list must match number of feature scales from YOLO.")
+
+        mae_output_dims_cfg = mae_cfg.get("output_dims")
+        if mae_output_dims_cfg is None:
+            mae_output_dims = list(fusion_dims)
+        else:
+            mae_output_dims = [int(dim) for dim in mae_output_dims_cfg]
+        if len(mae_output_dims) != self.yolo_backbone.num_scales:
+            raise ValueError("MAE output dims must match number of feature scales from YOLO.")
+
+        self.mae_backbone = MAEBackbone(
+            checkpoint=mae_cfg.get("checkpoint"),
+            output_dims=mae_output_dims,
+            freeze=mae_cfg.get("freeze", True),
+        )
+
+        self.scale_ranges = [tuple(map(float, r)) for r in model_cfg.get(
+            "scale_ranges", [[0.0, 0.07], [0.07, 0.15], [0.15, 1.0]]
+        )]
+        if len(self.scale_ranges) != self.yolo_backbone.num_scales:
+            raise ValueError("scale_ranges length must match number of detection scales.")
+        for low, high in self.scale_ranges:
+            if high <= low:
+                raise ValueError("Each scale range must have high > low.")
 
         self.fusion_layers = nn.ModuleList()
         for yolo_ch, mae_ch, fused_ch in zip(
@@ -176,7 +198,8 @@ class DualBackboneYOLO(nn.Module):
                 )
             )
 
-        self.detection_head = DetectionHead(fusion_dims, self.num_classes)
+        self.fusion_channels = [layer[0].out_channels for layer in self.fusion_layers]
+        self.detection_head = DetectionHead(self.fusion_channels, self.num_classes)
         self.bce = nn.BCEWithLogitsLoss()
         self.reg_loss = nn.SmoothL1Loss()
 
@@ -184,6 +207,8 @@ class DualBackboneYOLO(nn.Module):
         yolo_feats = self.yolo_backbone(x)
         spatial_shapes = [feat.shape[-2:] for feat in yolo_feats]
         mae_feats = self.mae_backbone(x, spatial_shapes)
+        if len(mae_feats) != len(yolo_feats):
+            raise RuntimeError("MAE and YOLO backbones returned mismatched feature scales.")
         fused_feats = [
             fusion(torch.cat([y, m], dim=1))
             for fusion, y, m in zip(self.fusion_layers, yolo_feats, mae_feats)

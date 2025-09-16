@@ -103,6 +103,22 @@ class YOLODataset(Dataset):
             raise RuntimeError(f"No images found in {image_dir}")
 
         self.label_dir = self.root / "labels" / split
+        if not self.label_dir.exists():
+            raise FileNotFoundError(
+                f"Label directory not found: {self.label_dir}. Expected YOLO-format .txt files."
+            )
+        available_labels = {p.stem for p in self.label_dir.rglob("*.txt")}
+        if not available_labels:
+            raise RuntimeError(
+                f"No annotation files found in {self.label_dir}. Expected YOLO-format .txt files."
+            )
+        missing = [p.stem for p in self.image_paths if p.stem not in available_labels]
+        if missing:
+            sample = ", ".join(missing[:5])
+            raise FileNotFoundError(
+                "Missing label files for images: "
+                f"{sample}{'...' if len(missing) > 5 else ''}."
+            )
         self.to_tensor = transforms.ToTensor()
 
     def __len__(self) -> int:
@@ -111,22 +127,30 @@ class YOLODataset(Dataset):
     def _load_labels(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
         label_path = self.label_dir / f"{path.stem}.txt"
         if not label_path.exists():
-            return torch.zeros((0, 4), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
+            raise FileNotFoundError(
+                f"Label file not found for image '{path.name}'. Expected {label_path.name} in {self.label_dir}."
+            )
 
         boxes: List[List[float]] = []
         labels: List[int] = []
         with label_path.open("r", encoding="utf-8") as f:
-            for line in f:
+            for line_num, line in enumerate(f, start=1):
                 parts = line.strip().split()
-                if len(parts) != 5:
+                if not parts:
                     continue
+                if len(parts) != 5:
+                    raise ValueError(
+                        f"Malformed label in {label_path} on line {line_num}: expected 5 values, got {len(parts)}."
+                    )
                 cls_id = int(float(parts[0]))
                 x_c, y_c, w, h = map(float, parts[1:])
                 boxes.append([x_c, y_c, w, h])
                 labels.append(cls_id)
 
         if not boxes:
-            return torch.zeros((0, 4), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
+            raise ValueError(
+                f"Label file {label_path} contains no annotations. Ensure YOLO-format boxes are provided."
+            )
 
         return torch.tensor(boxes, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
 
