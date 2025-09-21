@@ -17,6 +17,41 @@ from dual_yolo_mae.utils import load_ultralytics_model
 import numpy as np
 if not hasattr(np, "float"):
     np.float = float
+    
+# add near top of model.py
+def _interpolate_pos_embed_2d(pos_embed: torch.Tensor, new_hw: tuple[int,int]) -> torch.Tensor:
+    # pos_embed: [1, 1+N, C] (with cls at index 0). We’ll return same shape for new grid.
+    cls_pos = pos_embed[:, :1, :]          # [1, 1, C]
+    patch_pos = pos_embed[:, 1:, :]        # [1, N, C]
+    C = patch_pos.shape[-1]
+    N = patch_pos.shape[1]
+    old_side = int(round(N ** 0.5))
+    patch_pos_2d = patch_pos.reshape(1, old_side, old_side, C).permute(0, 3, 1, 2)  # [1,C,H,W]
+    new_h, new_w = new_hw
+    patch_pos_2d_resized = torch.nn.functional.interpolate(
+        patch_pos_2d, size=(new_h, new_w), mode="bicubic", align_corners=False
+    )
+    patch_pos_new = patch_pos_2d_resized.permute(0, 2, 3, 1).reshape(1, new_h * new_w, C)  # [1, Nnew, C]
+    return torch.cat([cls_pos, patch_pos_new], dim=1)
+
+class GatedFusion(nn.Module):
+    def __init__(self, yolo_ch: int, mae_ch: int, fused_ch: int) -> None:
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Conv2d(yolo_ch + mae_ch, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.proj = nn.Sequential(
+            nn.Conv2d(yolo_ch + mae_ch, fused_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(fused_ch),
+            nn.SiLU(inplace=True),
+        )
+        self.out_channels = fused_ch   # <--- Expose this
+
+    def forward(self, yolo_f, mae_f):
+        g = self.gate(torch.cat([yolo_f, mae_f], dim=1))
+        fused = torch.cat([yolo_f, g * mae_f], dim=1)
+        return self.proj(fused)
 
 class MAEBackbone(nn.Module):
     """Wrapper around the MAE encoder that exposes convolutional feature maps."""
@@ -80,33 +115,34 @@ class MAEBackbone(nn.Module):
 
     @torch.no_grad()
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encode an image batch with the MAE encoder, resizing to the encoder's native
-        input size if necessary (e.g., 224x224 for ViT-B/16). Returns a CxHxW feature map.
-        """
-        # Resize ONLY for MAE, keep YOLO path at original resolution
-        if x.shape[-2:] != self.mae_in_size:
-            x_in = F.interpolate(x, size=self.mae_in_size, mode="bilinear", align_corners=False)
-        else:
-            x_in = x
+        B, _, H, W = x.shape
 
-        B = x_in.shape[0]
-        # Standard MAE forward up to the encoder outputs
-        x_tokens = self.encoder.patch_embed(x_in)                 # [B, N, C]
-        x_tokens = x_tokens + self.encoder.pos_embed[:, 1:, :]    # add pos to patch tokens
-        cls_token = self.encoder.cls_token + self.encoder.pos_embed[:, :1, :]
-        cls_tokens = cls_token.expand(B, -1, -1)                  # [B, 1, C]
-        x_tokens = torch.cat((cls_tokens, x_tokens), dim=1)       # [B, 1+N, C]
+        # Dynamically reset timm's internal img_size so the assertion passes
+        self.encoder.patch_embed.img_size = (H, W)
 
+        # Compute patch embeddings (shape: [B, N, C])
+        x = self.encoder.patch_embed(x)
+        side_h = H // self.encoder.patch_embed.patch_size[0]
+        side_w = W // self.encoder.patch_embed.patch_size[1]
+
+        # Interpolate positional embeddings to the new grid
+        pos_embed = _interpolate_pos_embed_2d(self.encoder.pos_embed, (side_h, side_w))  # [1, 1+Nnew, C]
+
+        # Add pos embeddings and cls token
+        x = x + pos_embed[:, 1:, :]
+        cls_tokens = (self.encoder.cls_token + pos_embed[:, :1, :]).expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        # Standard ViT forward through transformer blocks
         for blk in self.encoder.blocks:
-            x_tokens = blk(x_tokens)
-        x_tokens = self.encoder.norm(x_tokens)                    # [B, 1+N, C]
+            x = blk(x)
+        x = self.encoder.norm(x)
 
-        # drop cls token, reshape patches to 2D feature map
-        x_tokens = x_tokens[:, 1:, :]                             # [B, N, C]
-        side = int(math.sqrt(x_tokens.shape[1]))                  # N should be a perfect square
-        x_feat = x_tokens.transpose(1, 2).contiguous().view(B, self.embed_dim, side, side)  # [B, C, H, W]
-        return x_feat
+        # Drop cls token and reshape to [B, C, H/patch, W/patch]
+        x = x[:, 1:, :]
+        x = x.transpose(1, 2).contiguous().view(B, self.embed_dim, side_h, side_w)
+
+        return x
 
 
 class YOLOBackbone(nn.Module):
@@ -216,19 +252,13 @@ class DualBackboneYOLO(nn.Module):
             if high <= low:
                 raise ValueError("Each scale range must have high > low.")
 
-        self.fusion_layers = nn.ModuleList()
-        for yolo_ch, mae_ch, fused_ch in zip(
-            self.yolo_backbone.output_channels, mae_output_dims, fusion_dims
-        ):
-            self.fusion_layers.append(
-                nn.Sequential(
-                    nn.Conv2d(yolo_ch + mae_ch, fused_ch, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(fused_ch),
-                    nn.SiLU(inplace=True),
-                )
-            )
+        self.fusion_layers = nn.ModuleList(
+            [GatedFusion(yolo_ch, mae_ch, fused_ch)
+            for yolo_ch, mae_ch, fused_ch in zip(
+                self.yolo_backbone.output_channels, mae_output_dims, fusion_dims)]
+        )
 
-        self.fusion_channels = [layer[0].out_channels for layer in self.fusion_layers]
+        self.fusion_channels = [layer.out_channels for layer in self.fusion_layers]
         self.detection_head = DetectionHead(self.fusion_channels, self.num_classes)
         self.bce = nn.BCEWithLogitsLoss()
         self.reg_loss = nn.SmoothL1Loss()
@@ -239,10 +269,7 @@ class DualBackboneYOLO(nn.Module):
         mae_feats = self.mae_backbone(x, spatial_shapes)
         if len(mae_feats) != len(yolo_feats):
             raise RuntimeError("MAE and YOLO backbones returned mismatched feature scales.")
-        fused_feats = [
-            fusion(torch.cat([y, m], dim=1))
-            for fusion, y, m in zip(self.fusion_layers, yolo_feats, mae_feats)
-        ]
+        fused_feats = [fusion(y, m) for fusion, y, m in zip(self.fusion_layers, yolo_feats, mae_feats)]
         return self.detection_head(fused_feats)
 
     def select_scale(self, box_size: float) -> int:

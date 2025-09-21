@@ -1,0 +1,2 @@
+Baseline YOLOv8n MSE: 0.001162
+Dual-backbone MSE: 0.072483

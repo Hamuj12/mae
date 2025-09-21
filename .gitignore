@@ -3,3 +3,4 @@ outputs/
 checkpoints/
 model_weights/
 yolov8n.pt
+runs/

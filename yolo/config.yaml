@@ -1,0 +1,9 @@
+# Paths to the training and validation sets
+path: /home/hm25936/datasets_for_yolo/midLighting_rmag_5m_to_100m   # root dir of your dataset
+train: images/train         # relative to 'path'
+val: images/val             # relative to 'path'
+test: images/test           # optional
+
+# Class information
+nc: 1                       # number of classes
+names: ["soho"] # class names
