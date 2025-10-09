@@ -151,6 +151,28 @@ By fine-tuning these pre-trained models, we rank #1 in these classification task
 
 The pre-training instruction is in [PRETRAIN.md](PRETRAIN.md).
 
+### Quick experiment setup & monitoring
+
+1. Configure experiment defaults (override as needed):
+   ```bash
+   export WANDB_PROJECT="mae-space"
+   export WANDB_MODE="online"    # or "offline" for air-gapped runs
+   export DATA_ROOT="/path/to/imagenet_like_corpus"
+   export PROBE_DATA_PATH="${DATA_ROOT}/probes_mini"  # used for auto linear probes
+   ```
+2. Run the end-to-end smoke suite (W&B dry-run, 1-epoch MAE pretrain, tiny linear probe, and a 50-step YOLO+MAE fusion run):
+   ```bash
+   bash scripts/sanity_checks.sh
+   ```
+   The script fabricates a toy dataset from `test_imgs/` so it can run anywhere and exits non-zero on failure.
+3. Launch three concurrent 200-epoch MAE sweeps with automatic probes at epochs 50/100:
+   ```bash
+   bash scripts/launch_short_runs.sh
+   ```
+   Each run writes checkpoints every 50 epochs and logs probe metrics as `lin_probe_acc@50` / `lin_probe_acc@100` in W&B alongside `val_rec_loss@50` / `val_rec_loss@100`.
+
+W&B dashboards surface the gate statistics under `gate/scale*_mean` and `gate/scale*_std` during dual-backbone training, while detection quality is tracked with `val/mAP50`.
+
 ### MAE + YOLO detection
 
 Use the utilities under `ultralytics_mae/tools` to compose and train a YOLO detector with MAE features:

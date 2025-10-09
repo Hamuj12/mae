@@ -13,6 +13,9 @@ import datetime
 import json
 import numpy as np
 import os
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -21,6 +24,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 from util.datasets import build_dataset
+from utils.wandb_utils import init_wandb, log_metrics
 
 import timm
 
@@ -33,6 +37,54 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 import models_mae
 
 from engine_pretrain import train_one_epoch
+
+
+def _run_auto_linprobe(epoch, ckpt_path, args):
+    """Launch a tiny linear-probe job and return the top-1 accuracy."""
+    if args.no_auto_probe:
+        return None
+    if not args.probe_data_path:
+        return None
+    if not os.path.exists(args.probe_data_path):
+        print(f"[auto-probe] Skipping – dataset not found: {args.probe_data_path}")
+        return None
+
+    probe_dir = Path(args.output_dir) / "auto_probe" / f"epoch{epoch:03d}"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "main_linprobe.py",
+        "--eval",
+        "--finetune", str(ckpt_path),
+        "--data_path", str(args.probe_data_path),
+        "--epochs", str(args.probe_epochs),
+        "--batch_size", str(args.probe_batch_size),
+        "--output_dir", str(probe_dir),
+        "--log_dir", str(probe_dir / "logs"),
+    ]
+    if args.wandb_project:
+        cmd.extend(["--wandb_project", args.wandb_project])
+    if args.run_name:
+        cmd.extend(["--run_name", f"{args.run_name}-probe@{epoch}"])
+    env = os.environ.copy()
+    env.setdefault("WANDB_MODE", env.get("WANDB_MODE", "offline"))
+    try:
+        completed = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        print(f"[auto-probe] Linear probe failed at epoch {epoch}: {exc}")
+        if exc.stdout:
+            print(exc.stdout)
+        if exc.stderr:
+            print(exc.stderr)
+        return None
+
+    pattern = re.compile(r"Acc@1\\s+([0-9]+\.?[0-9]*)")
+    match = pattern.search(completed.stdout + "\n" + completed.stderr)
+    if not match:
+        print(f"[auto-probe] Unable to parse accuracy from output at epoch {epoch}.")
+        return None
+    return float(match.group(1))
 
 
 def get_args_parser():
@@ -103,6 +155,23 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # Logging & diagnostics
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='Optional W&B project for experiment tracking.')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Friendly name for the W&B run.')
+    parser.add_argument('--wandb_resume', type=str, default='auto',
+                        choices=['auto', 'allow', 'never'],
+                        help='Resume behaviour passed to wandb.init.')
+    parser.add_argument('--probe_data_path', type=str, default=None,
+                        help='Optional dataset for auto linear-probe evaluation.')
+    parser.add_argument('--probe_batch_size', type=int, default=128,
+                        help='Batch size for the auto linear-probe runs.')
+    parser.add_argument('--probe_epochs', type=int, default=2,
+                        help='Number of epochs for the auto linear-probe runs.')
+    parser.add_argument('--no_auto_probe', action='store_true',
+                        help='Disable automatic linear probing at epochs 50/100.')
+
     return parser
 
 
@@ -111,6 +180,11 @@ def main(args):
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
+
+    if args.wandb_project is None and os.environ.get("WANDB_PROJECT"):
+        args.wandb_project = os.environ["WANDB_PROJECT"]
+    if args.run_name is None and os.environ.get("WANDB_RUN_NAME"):
+        args.run_name = os.environ["WANDB_RUN_NAME"]
 
     device = torch.device(args.device)
 
@@ -162,7 +236,7 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -171,6 +245,36 @@ def main(args):
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
+
+    patch_size = getattr(model_without_ddp.patch_embed, "patch_size", (args.input_size,))
+    if isinstance(patch_size, (list, tuple)):
+        patch_size = patch_size[0]
+    decoder_depth = len(getattr(model_without_ddp, "decoder_blocks", []))
+    decoder_width = getattr(getattr(model_without_ddp, "decoder_embed", None), "out_features", None)
+    wandb_config = {
+        "mask_ratio": args.mask_ratio,
+        "patch_size": patch_size,
+        "decoder_depth": decoder_depth,
+        "decoder_width": decoder_width,
+        "norm_pix_loss": args.norm_pix_loss,
+        "batch_size": args.batch_size,
+        "base_lr": args.blr,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "epochs": args.epochs,
+        "accum_iter": args.accum_iter,
+        "amp": True,
+        "seed": args.seed,
+        "world_size": args.world_size,
+        "probe_data_path": args.probe_data_path,
+    }
+    init_wandb(
+        args.wandb_project,
+        args.run_name,
+        wandb_config,
+        resume=args.wandb_resume,
+    )
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
@@ -195,13 +299,36 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
+        ckpt_path = None
+        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs or (epoch + 1) in {50, 100}):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
+            candidate = Path(args.output_dir) / f"checkpoint-{epoch}.pth"
+            if candidate.exists():
+                ckpt_path = candidate
+
+        probe_acc = None
+        if misc.is_main_process() and (epoch + 1) in {50, 100} and ckpt_path is not None:
+            probe_acc = _run_auto_linprobe(epoch + 1, ckpt_path, args)
+
+        if misc.is_main_process():
+            metrics = {
+                "train/loss": train_stats.get('loss'),
+                "train/lr": train_stats.get('lr'),
+            }
+            if (epoch + 1) in {50, 100}:
+                metrics[f"val_rec_loss@{epoch + 1}"] = train_stats.get('loss')
+            if probe_acc is not None:
+                metrics[f"lin_probe_acc@{epoch + 1}"] = probe_acc
+            log_metrics(step=epoch + 1, **metrics)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'epoch': epoch,}
+        if (epoch + 1) in {50, 100}:
+            log_stats[f'val_rec_loss@{epoch + 1}'] = train_stats.get('loss')
+        if probe_acc is not None:
+            log_stats[f'lin_probe_acc@{epoch + 1}'] = probe_acc
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:

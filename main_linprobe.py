@@ -22,6 +22,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 from util.datasets import build_dataset
+from utils.wandb_utils import init_wandb, log_metrics
 
 import timm
 
@@ -112,6 +113,15 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # Logging & experiment tracking
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='Optional W&B project name.')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional W&B run name.')
+    parser.add_argument('--wandb_resume', type=str, default='auto',
+                        choices=['auto', 'allow', 'never'],
+                        help='Resume behaviour passed to wandb.init.')
+
     return parser
 
 
@@ -120,6 +130,11 @@ def main(args):
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
+
+    if args.wandb_project is None and os.environ.get("WANDB_PROJECT"):
+        args.wandb_project = os.environ["WANDB_PROJECT"]
+    if args.run_name is None and os.environ.get("WANDB_RUN_NAME"):
+        args.run_name = os.environ["WANDB_RUN_NAME"]
 
     device = torch.device(args.device)
 
@@ -245,6 +260,29 @@ def main(args):
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
 
+    wandb_config = {
+        "model": args.model,
+        "batch_size": args.batch_size,
+        "blr": args.blr,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "epochs": args.epochs,
+        "accum_iter": args.accum_iter,
+        "finetune": args.finetune,
+        "resume": args.resume,
+        "eval_only": args.eval,
+        "data_path": args.data_path,
+    }
+    init_wandb(
+        args.wandb_project,
+        args.run_name,
+        wandb_config,
+        resume=args.wandb_resume,
+    )
+    if misc.is_main_process():
+        log_metrics(step=0, checkpoint=args.finetune or args.resume)
+
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
@@ -262,7 +300,16 @@ def main(args):
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        exit(0)
+        if misc.is_main_process():
+            log_metrics(
+                step=args.start_epoch,
+                **{
+                    "val/acc1": test_stats.get('acc1'),
+                    "val/acc5": test_stats.get('acc5'),
+                    "val/loss": test_stats.get('loss'),
+                },
+            )
+        return
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -286,6 +333,19 @@ def main(args):
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
+
+        if misc.is_main_process():
+            log_metrics(
+                step=epoch + 1,
+                **{
+                    "train/acc1": train_stats.get('acc1'),
+                    "train/loss": train_stats.get('loss'),
+                    "train/lr": train_stats.get('lr'),
+                    "val/acc1": test_stats.get('acc1'),
+                    "val/acc5": test_stats.get('acc5'),
+                    "val/loss": test_stats.get('loss'),
+                },
+            )
 
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)

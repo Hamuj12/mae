@@ -37,6 +37,7 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
+from utils.wandb_utils import init_wandb, log_metrics
 
 
 def get_args_parser():
@@ -154,6 +155,21 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # Partial fine-tuning controls
+    parser.add_argument('--ft_last_n_blocks', type=int, default=0,
+                        help='Train only the last N transformer blocks (0 = freeze all).')
+    parser.add_argument('--ft_train_layernorms', action='store_true',
+                        help='Keep LayerNorm parameters trainable when freezing blocks.')
+
+    # Logging & experiment tracking
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='Optional W&B project for run tracking.')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional W&B run name.')
+    parser.add_argument('--wandb_resume', type=str, default='auto',
+                        choices=['auto', 'allow', 'never'],
+                        help='Resume behaviour passed to wandb.init.')
+
     return parser
 
 
@@ -162,6 +178,11 @@ def main(args):
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
+
+    if args.wandb_project is None and os.environ.get("WANDB_PROJECT"):
+        args.wandb_project = os.environ["WANDB_PROJECT"]
+    if args.run_name is None and os.environ.get("WANDB_RUN_NAME"):
+        args.run_name = os.environ["WANDB_RUN_NAME"]
 
     device = torch.device(args.device)
 
@@ -258,6 +279,23 @@ def main(args):
         # manually initialize fc layer
         trunc_normal_(model.head.weight, std=2e-5)
 
+    if args.ft_last_n_blocks > 0:
+        blocks = getattr(model, 'blocks', None)
+        if blocks is None:
+            print('Warning: --ft_last_n_blocks requested but model has no transformer blocks.')
+        else:
+            total_blocks = len(blocks)
+            keep = max(0, min(args.ft_last_n_blocks, total_blocks))
+            for idx, block in enumerate(blocks):
+                trainable = idx >= total_blocks - keep
+                for param in block.parameters():
+                    param.requires_grad = trainable
+            if args.ft_train_layernorms:
+                for module in model.modules():
+                    if isinstance(module, torch.nn.LayerNorm):
+                        for param in module.parameters():
+                            param.requires_grad = True
+
     model.to(device)
 
     model_without_ddp = model
@@ -276,6 +314,39 @@ def main(args):
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
+
+    wandb_config = {
+        "model": args.model,
+        "batch_size": args.batch_size,
+        "blr": args.blr,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "epochs": args.epochs,
+        "accum_iter": args.accum_iter,
+        "layer_decay": args.layer_decay,
+        "drop_path": args.drop_path,
+        "mixup": args.mixup,
+        "cutmix": args.cutmix,
+        "mixup_prob": args.mixup_prob,
+        "mixup_mode": args.mixup_mode,
+        "smoothing": args.smoothing,
+        "reprob": args.reprob,
+        "remode": args.remode,
+        "ft_last_n_blocks": args.ft_last_n_blocks,
+        "ft_train_layernorms": args.ft_train_layernorms,
+        "finetune": args.finetune,
+        "resume": args.resume,
+        "data_path": args.data_path,
+    }
+    init_wandb(
+        args.wandb_project,
+        args.run_name,
+        wandb_config,
+        resume=args.wandb_resume,
+    )
+    if misc.is_main_process():
+        log_metrics(step=0, checkpoint=args.finetune or args.resume)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -304,7 +375,16 @@ def main(args):
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        exit(0)
+        if misc.is_main_process():
+            log_metrics(
+                step=args.start_epoch,
+                **{
+                    "val/acc1": test_stats.get('acc1'),
+                    "val/acc5": test_stats.get('acc5'),
+                    "val/loss": test_stats.get('loss'),
+                },
+            )
+        return
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -328,6 +408,19 @@ def main(args):
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
+
+        if misc.is_main_process():
+            log_metrics(
+                step=epoch + 1,
+                **{
+                    "train/acc1": train_stats.get('acc1'),
+                    "train/loss": train_stats.get('loss'),
+                    "train/lr": train_stats.get('lr'),
+                    "val/acc1": test_stats.get('acc1'),
+                    "val/acc5": test_stats.get('acc5'),
+                    "val/loss": test_stats.get('loss'),
+                },
+            )
 
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
