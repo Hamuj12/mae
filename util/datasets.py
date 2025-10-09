@@ -19,7 +19,7 @@ from torch.utils.data import random_split
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
-def build_dataset(is_train, args):
+def build_dataset(is_train, args, transform=None):
     """Create a dataset for training or validation.
 
     If ``data_path`` contains ``train`` and ``val`` subdirectories, the
@@ -28,7 +28,10 @@ def build_dataset(is_train, args):
     subsets using ``args.val_split`` (a fraction between 0 and 1) and
     ``args.seed`` for reproducibility.
     """
-    transform = build_transform(is_train, args)
+    # ``transform`` can be supplied to bypass the default augmentation so that
+    # callers like linear probes can plug in a custom pipeline without
+    # modifying ``args`` in-place.
+    transform = transform or build_transform(is_train, args)
 
     train_dir = os.path.join(args.data_path, 'train')
     val_dir = os.path.join(args.data_path, 'val')

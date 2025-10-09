@@ -47,9 +47,16 @@ class GatedFusion(nn.Module):
             nn.SiLU(inplace=True),
         )
         self.out_channels = fused_ch   # <--- Expose this
+        self.last_gate_stats: Dict[str, torch.Tensor] = {}
 
     def forward(self, yolo_f, mae_f):
-        g = self.gate(torch.cat([yolo_f, mae_f], dim=1))
+        gate_in = torch.cat([yolo_f, mae_f], dim=1)
+        g = self.gate(gate_in)
+        with torch.no_grad():
+            self.last_gate_stats = {
+                "mean": g.mean().detach(),
+                "std": g.std(unbiased=False).detach(),
+            }
         fused = torch.cat([yolo_f, g * mae_f], dim=1)
         return self.proj(fused)
 
@@ -262,6 +269,7 @@ class DualBackboneYOLO(nn.Module):
         self.detection_head = DetectionHead(self.fusion_channels, self.num_classes)
         self.bce = nn.BCEWithLogitsLoss()
         self.reg_loss = nn.SmoothL1Loss()
+        self._last_gate_statistics: List[Dict[str, torch.Tensor]] = []
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         yolo_feats = self.yolo_backbone(x)
@@ -269,8 +277,20 @@ class DualBackboneYOLO(nn.Module):
         mae_feats = self.mae_backbone(x, spatial_shapes)
         if len(mae_feats) != len(yolo_feats):
             raise RuntimeError("MAE and YOLO backbones returned mismatched feature scales.")
-        fused_feats = [fusion(y, m) for fusion, y, m in zip(self.fusion_layers, yolo_feats, mae_feats)]
+        self._last_gate_statistics = []
+        fused_feats = []
+        for fusion, y_feat, m_feat in zip(self.fusion_layers, yolo_feats, mae_feats):
+            fused_feats.append(fusion(y_feat, m_feat))
+            stats = getattr(fusion, "last_gate_stats", None)
+            if stats:
+                self._last_gate_statistics.append({
+                    "mean": stats.get("mean"),
+                    "std": stats.get("std"),
+                })
         return self.detection_head(fused_feats)
+
+    def get_gate_statistics(self) -> List[Dict[str, torch.Tensor]]:
+        return self._last_gate_statistics
 
     def select_scale(self, box_size: float) -> int:
         for idx, (low, high) in enumerate(self.scale_ranges):
