@@ -35,6 +35,9 @@ def init_wandb(
     run_name: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
     resume: str = "auto",
+    group: Optional[str] = None,
+    job_type: Optional[str] = None,
+    tags: Optional[list] = None,
 ) -> Optional["wandb.sdk.wandb_run.Run"]:
     """Initialise a global W&B run if ``project`` is provided."""
     global _WANDB_RUN
@@ -44,6 +47,10 @@ def init_wandb(
     if not _should_enable(project):
         return None
 
+    # allow parent->child hints via env
+    env_group = os.environ.get("WANDB_GROUP") or os.environ.get("WANDB_PARENT_GROUP")
+    env_job   = os.environ.get("WANDB_JOB_TYPE")
+
     wandb_kwargs: Dict[str, Any] = {
         "project": project,
         "resume": resume,
@@ -52,9 +59,20 @@ def init_wandb(
         wandb_kwargs["name"] = run_name
     if config is not None:
         wandb_kwargs["config"] = config
+    if group or env_group:
+        wandb_kwargs["group"] = group or env_group
+    if job_type or env_job:
+        wandb_kwargs["job_type"] = job_type or env_job
+    if tags:
+        wandb_kwargs["tags"] = list(tags)
 
     try:
         _WANDB_RUN = wandb.init(**wandb_kwargs)
+        # expose parent id to children if helpful
+        try:
+            os.environ["WANDB_PARENT_ID"] = getattr(_WANDB_RUN, "id", "")
+        except Exception:
+            pass
         logger.info(
             "Initialised W&B run '%s' in project '%s' (mode=%s)",
             _WANDB_RUN.name,

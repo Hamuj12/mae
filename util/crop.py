@@ -11,6 +11,15 @@ import torch
 from torchvision import transforms
 from torchvision.transforms import functional as F
 
+# ---- compatibility shim for torchvision API change ----
+try:
+    # torchvision >= 0.15
+    from torchvision.transforms.functional import get_image_size as _tv_get_image_size  # type: ignore
+except Exception:
+    # older torchvision used a private function
+    from torchvision.transforms.functional import _get_image_size as _tv_get_image_size  # type: ignore
+# -------------------------------------------------------
+
 
 class RandomResizedCrop(transforms.RandomResizedCrop):
     """
@@ -21,7 +30,7 @@ class RandomResizedCrop(transforms.RandomResizedCrop):
     """
     @staticmethod
     def get_params(img, scale, ratio):
-        width, height = F._get_image_size(img)
+        width, height = _tv_get_image_size(img)
         area = height * width
 
         target_area = area * torch.empty(1).uniform_(scale[0], scale[1]).item()

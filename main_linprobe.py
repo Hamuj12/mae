@@ -13,6 +13,8 @@ import argparse
 import datetime
 import json
 import numpy as np
+if not hasattr(np, "float"):
+    np.float = float
 import os
 import time
 from pathlib import Path
@@ -26,7 +28,8 @@ from utils.wandb_utils import init_wandb, log_metrics
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
+# assert timm.__version__ == "0.3.2" # version check
+print("Using timm", timm.__version__)
 from timm.models.layers import trunc_normal_
 
 import util.misc as misc
@@ -39,6 +42,35 @@ import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
 
+from collections import OrderedDict
+try:
+    # available on torch>=2.6
+    from torch.serialization import add_safe_globals  # type: ignore
+except Exception:
+    add_safe_globals = None
+    
+def load_checkpoint_any(path: str):
+    """
+    Robust torch.load that works with PyTorch>=2.6 (weights_only default)
+    and older checkpoints that pickle argparse.Namespace, etc.
+    """
+    # First try the new API explicitly
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        return ckpt
+    except TypeError:
+        # Older torch without weights_only kwarg
+        return torch.load(path, map_location='cpu')
+    except Exception:
+        # Allowlist argparse.Namespace and retry if available
+        if add_safe_globals is not None:
+            try:
+                add_safe_globals([argparse.Namespace])
+                ckpt = torch.load(path, map_location='cpu', weights_only=False)
+                return ckpt
+            except Exception as e:
+                raise e
+        raise
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE linear probing for image classification', add_help=False)
@@ -207,10 +239,20 @@ def main(args):
     )
 
     if args.finetune and not args.eval:
-        checkpoint = torch.load(args.finetune, map_location='cpu')
+        checkpoint = load_checkpoint_any(args.finetune)
 
-        print("Load pre-trained checkpoint from: %s" % args.finetune)
-        checkpoint_model = checkpoint['model']
+        print(f"Load pre-trained checkpoint from: {args.finetune}")
+
+        # Handle different checkpoint layouts: {'model': ...} or {'state_dict': ...} or plain state dict
+        checkpoint_model = checkpoint.get('model', checkpoint.get('state_dict', checkpoint))
+
+        # Strip DDP 'module.' prefixes if present
+        clean_sd = OrderedDict()
+        for k, v in checkpoint_model.items():
+            nk = k[7:] if k.startswith('module.') else k
+            clean_sd[nk] = v
+        checkpoint_model = clean_sd
+
         state_dict = model.state_dict()
         for k in ['head.weight', 'head.bias']:
             if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
@@ -274,12 +316,25 @@ def main(args):
         "eval_only": args.eval,
         "data_path": args.data_path,
     }
+    
+    group = os.environ.get("WANDB_GROUP") or os.environ.get("WANDB_PARENT_GROUP") or "mae-pretrain"
+    tags = ["auto_probe"]
+    extra_tag = os.environ.get("WANDB_TAGS")
+    if extra_tag:
+        tags.append(extra_tag)
+
     init_wandb(
         args.wandb_project,
         args.run_name,
-        wandb_config,
+        {
+            **(wandb_config or {}),
+        },
         resume=args.wandb_resume,
+        group=group,
+        job_type="auto_probe",
+        tags=tags,
     )
+    
     if misc.is_main_process():
         log_metrics(step=0, checkpoint=args.finetune or args.resume)
 
@@ -304,9 +359,9 @@ def main(args):
             log_metrics(
                 step=args.start_epoch,
                 **{
-                    "val/acc1": test_stats.get('acc1'),
-                    "val/acc5": test_stats.get('acc5'),
-                    "val/loss": test_stats.get('loss'),
+                    "probe/val/acc1": test_stats.get('acc1'),
+                    "probe/val/acc5": test_stats.get('acc5'),
+                    "probe/val/loss": test_stats.get('loss'),
                 },
             )
         return
@@ -338,12 +393,12 @@ def main(args):
             log_metrics(
                 step=epoch + 1,
                 **{
-                    "train/acc1": train_stats.get('acc1'),
-                    "train/loss": train_stats.get('loss'),
-                    "train/lr": train_stats.get('lr'),
-                    "val/acc1": test_stats.get('acc1'),
-                    "val/acc5": test_stats.get('acc5'),
-                    "val/loss": test_stats.get('loss'),
+                    "probe/train/acc1": train_stats.get('acc1'),
+                    "probe/train/loss": train_stats.get('loss'),
+                    "probe/train/lr":   train_stats.get('lr'),
+                    "probe/val/acc1":   test_stats.get('acc1'),
+                    "probe/val/acc5":   test_stats.get('acc5'),
+                    "probe/val/loss":   test_stats.get('loss'),
                 },
             )
 

@@ -11,7 +11,10 @@
 import argparse
 import datetime
 import json
+# Fix for numpy issue with recent versions
 import numpy as np
+if not hasattr(np, "float"):
+    np.float = float
 import os
 import re
 import subprocess
@@ -28,7 +31,8 @@ from utils.wandb_utils import init_wandb, log_metrics
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
+print("Using timm", timm.__version__)
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -38,12 +42,29 @@ import models_mae
 
 from engine_pretrain import train_one_epoch
 
+import torch.distributed as dist
+
+def ddp_barrier():
+    if dist.is_available() and dist.is_initialized():
+        # device_ids kwarg is optional; basic barrier is enough
+        dist.barrier()
+        
+def parse_probe_epochs(s: str):
+    if not s:
+        return set()
+    return {int(x.strip()) for x in s.split(',') if x.strip().isdigit()}
+
+def should_probe(epoch1_based: int, every_k: int, explicit: set[int]) -> bool:
+    if epoch1_based in explicit:
+        return True
+    if every_k and epoch1_based % every_k == 0:
+        return True
+    return False
+
 
 def _run_auto_linprobe(epoch, ckpt_path, args):
-    """Launch a tiny linear-probe job and return the top-1 accuracy."""
-    if args.no_auto_probe:
-        return None
-    if not args.probe_data_path:
+    """Launch a tiny linear-probe job and return top-1 accuracy, or None."""
+    if args.no_auto_probe or not args.probe_data_path:
         return None
     if not os.path.exists(args.probe_data_path):
         print(f"[auto-probe] Skipping – dataset not found: {args.probe_data_path}")
@@ -53,9 +74,9 @@ def _run_auto_linprobe(epoch, ckpt_path, args):
     probe_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        sys.executable,
-        "main_linprobe.py",
-        "--eval",
+        sys.executable, "main_linprobe.py",
+        # IMPORTANT: train the head (no --eval), and match the MAE backbone size
+        "--model", "vit_base_patch16",
         "--finetune", str(ckpt_path),
         "--data_path", str(args.probe_data_path),
         "--epochs", str(args.probe_epochs),
@@ -63,28 +84,95 @@ def _run_auto_linprobe(epoch, ckpt_path, args):
         "--output_dir", str(probe_dir),
         "--log_dir", str(probe_dir / "logs"),
     ]
-    if args.wandb_project:
-        cmd.extend(["--wandb_project", args.wandb_project])
-    if args.run_name:
-        cmd.extend(["--run_name", f"{args.run_name}-probe@{epoch}"])
+    # if args.wandb_project:
+    #     cmd += ["--wandb_project", args.wandb_project]
+    # if args.run_name:
+    #     cmd += ["--run_name", f"{args.run_name}-probe@{epoch}"]
+
+    # --- child env: strip DDP/elastic, force single-process, CPU-only ---
     env = os.environ.copy()
+
+    # Strip DDP/elastic noise so the child is single-process.
+    for k in ["RANK","LOCAL_RANK","WORLD_SIZE","MASTER_ADDR","MASTER_PORT",
+            "GROUP_RANK","LOCAL_WORLD_SIZE","TORCHELASTIC_RESTART_COUNT",
+            "TORCHELASTIC_MAX_RESTARTS","TORCHELASTIC_RUN_ID"]:
+        env.pop(k, None)
+
+    # Force NO wandb in the child.
+    env["WANDB_MODE"] = "disabled"       # <-- key line
+    env["WANDB_SILENT"] = "true"
+    env.setdefault("OMP_NUM_THREADS", "1")
+
+    # Stick to rank-0’s GPU (or GPU 0) for the probe.
+    if hasattr(args, "gpu") and isinstance(args.gpu, int) and args.gpu >= 0:
+        env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        
+    env.setdefault("OMP_NUM_THREADS", "1")
     env.setdefault("WANDB_MODE", env.get("WANDB_MODE", "offline"))
+    env.setdefault("WANDB_SILENT", "true")
+
+    # Add ultra-safe dataloader settings to the probe
+    cmd += ["--num_workers", "0", "--no_pin_mem"]
+    # Also avoid accidental W&B resume collisions
+    # cmd += ["--wandb_resume", "never", "--run_name", f"{args.run_name}-probe@{epoch}-{int(time.time())}"]
+
+    # Drop simple markers for debugging
+    start_mark = probe_dir / "_STARTED"
+    done_mark  = probe_dir / "_DONE"
+    fail_mark  = probe_dir / "_FAILED"
+    stdout_file = probe_dir / "stdout.txt"
+    stderr_file = probe_dir / "stderr.txt"
+    start_mark.write_text("")
+
     try:
-        completed = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+        completed = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, env=env, timeout=300  # 5 min cap
+        )
+        stdout_file.write_text(completed.stdout or "")
+        stderr_file.write_text(completed.stderr or "")
+        done_mark.write_text("")
+    except subprocess.TimeoutExpired as exc:
+        stdout_file.write_text((exc.stdout or ""))
+        stderr_file.write_text((exc.stderr or ""))
+        fail_mark.write_text("TIMEOUT")
+        print(f"[auto-probe] Timeout at epoch {epoch} after {exc.timeout}s.")
+        return None
     except subprocess.CalledProcessError as exc:
+        stdout_file.write_text(exc.stdout or "")
+        stderr_file.write_text(exc.stderr or "")
+        fail_mark.write_text("CALLED_PROCESS_ERROR")
         print(f"[auto-probe] Linear probe failed at epoch {epoch}: {exc}")
-        if exc.stdout:
-            print(exc.stdout)
-        if exc.stderr:
-            print(exc.stderr)
         return None
 
-    pattern = re.compile(r"Acc@1\\s+([0-9]+\.?[0-9]*)")
-    match = pattern.search(completed.stdout + "\n" + completed.stderr)
-    if not match:
-        print(f"[auto-probe] Unable to parse accuracy from output at epoch {epoch}.")
-        return None
-    return float(match.group(1))
+    # --- Parse validation metrics from child stdout ---
+    out_text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+
+    acc1 = acc5 = valloss = None
+
+    # First try the common single-line summary: "* Acc@1 68.7 Acc@5 95.7 loss 6.78"
+    m_all = re.search(
+        r"\*?\s*Acc@1\s+([0-9.]+)\s+Acc@5\s+([0-9.]+)\s+loss\s+([0-9.]+)",
+        out_text, flags=re.IGNORECASE
+    )
+    if m_all:
+        acc1   = float(m_all.group(1))
+        acc5   = float(m_all.group(2))
+        valloss = float(m_all.group(3))
+    else:
+        # Fall back to individual matches
+        m1    = re.search(r"Acc@1\s+([0-9.]+)", out_text, flags=re.IGNORECASE)
+        m5    = re.search(r"Acc@5\s+([0-9.]+)", out_text, flags=re.IGNORECASE)
+        mloss = re.search(r"\bloss\b\s*[:=]?\s*([0-9.]+)", out_text, flags=re.IGNORECASE)
+        if m1:    acc1 = float(m1.group(1))
+        if m5:    acc5 = float(m5.group(1))
+        if mloss: valloss = float(mloss.group(1))
+
+    if acc1 is None:
+        print(f"[auto-probe] Warning: could not parse Acc@1 for epoch {epoch}")
+
+    return {"acc1": acc1, "acc5": acc5, "val_loss": valloss}
 
 
 def get_args_parser():
@@ -171,6 +259,12 @@ def get_args_parser():
                         help='Number of epochs for the auto linear-probe runs.')
     parser.add_argument('--no_auto_probe', action='store_true',
                         help='Disable automatic linear probing at epochs 50/100.')
+    parser.add_argument('--probe_every_k', type=int, default=50,
+                        help='Run auto linear probe every K epochs (1-based). 0 disables.')
+    parser.add_argument('--probe_at_epochs', type=str, default='',
+                        help='Comma-separated list of 1-based epochs to probe (e.g., "50,100,150,200").')
+    parser.add_argument('--probe_on_resume', action='store_true',
+                        help='Run one-off probe immediately after resume on latest checkpoint.')
 
     return parser
 
@@ -269,24 +363,67 @@ def main(args):
         "world_size": args.world_size,
         "probe_data_path": args.probe_data_path,
     }
-    init_wandb(
-        args.wandb_project,
-        args.run_name,
-        wandb_config,
-        resume=args.wandb_resume,
-    )
+    
+    # rank-0 creates the *only* parent run
+    if misc.is_main_process():
+        parent = init_wandb(
+            args.wandb_project,
+            args.run_name,
+            wandb_config,
+            resume=args.wandb_resume,
+            # parent has no group; children will join its group name
+        )
+        # let children (probes) know how to group themselves
+        os.environ["WANDB_PARENT_GROUP"] = args.run_name or "mae-pretrain"
+    else:
+        # hard-disable W&B on non-main ranks
+        os.environ.setdefault("WANDB_MODE", "disabled")
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    try:
+        # timm >= 0.6/0.9
+        from timm.optim.optim_factory import param_groups_weight_decay
+        param_groups = param_groups_weight_decay(model_without_ddp, args.weight_decay)
+    except Exception:
+        # Fallback compatible with torch>=1.10 and 2.x
+        def add_weight_decay_fallback(model, weight_decay=0.05, skip_list=()):
+            decay, no_decay = [], []
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.ndim < 2 or name.endswith(".bias") or name in skip_list:
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
+            return [
+                {'params': no_decay, 'weight_decay': 0.0},
+                {'params': decay, 'weight_decay': weight_decay},
+            ]
+        param_groups = add_weight_decay_fallback(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+
+    # Parse explicit probe epochs once
+    explicit_epochs = parse_probe_epochs(args.probe_at_epochs)
+
+    # Optional: one-off probe on the latest checkpoint immediately after resume.
+    if args.resume and args.probe_on_resume and misc.is_main_process() and args.probe_data_path:
+        outs = Path(args.output_dir)
+        latest = max(outs.glob("checkpoint-*.pth"), key=lambda p: p.stat().st_mtime, default=None)
+        if latest is not None:
+            print(f"[auto-probe] One-off probe after resume on: {latest.name}")
+            ddp_barrier()
+            acc = _run_auto_linprobe(args.start_epoch, latest, args)
+            ddp_barrier()
+            if acc is not None:
+                log_metrics(step=args.start_epoch, **{"probe/acc1": acc})
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -299,41 +436,66 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        ckpt_path = None
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs or (epoch + 1) in {50, 100}):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
-            candidate = Path(args.output_dir) / f"checkpoint-{epoch}.pth"
-            if candidate.exists():
-                ckpt_path = candidate
+        epoch1 = epoch + 1
+        probe_now = should_probe(epoch1, args.probe_every_k, explicit_epochs)
 
-        probe_acc = None
-        if misc.is_main_process() and (epoch + 1) in {50, 100} and ckpt_path is not None:
-            probe_acc = _run_auto_linprobe(epoch + 1, ckpt_path, args)
+        probe_metrics = None
+        if probe_now:
+            if misc.is_main_process() and args.output_dir:
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp,
+                    optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch,
+                )
+            ddp_barrier()
 
+            ckpt_path = None
+            if misc.is_main_process():
+                candidate = Path(args.output_dir) / f"checkpoint-{epoch}.pth"
+                if candidate.exists():
+                    ckpt_path = candidate
+                else:
+                    outs = Path(args.output_dir)
+                    ckpt_path = max(outs.glob("checkpoint-*.pth"),
+                                    key=lambda p: p.stat().st_mtime, default=None)
+            ddp_barrier()
+
+            if misc.is_main_process() and ckpt_path is not None:
+                probe_metrics = _run_auto_linprobe(epoch1, ckpt_path, args)
+            ddp_barrier()
+
+        # ---- W&B logging (parent run only) ----
         if misc.is_main_process():
             metrics = {
                 "train/loss": train_stats.get('loss'),
-                "train/lr": train_stats.get('lr'),
+                "train/lr":   train_stats.get('lr'),
+                "epoch":      epoch1,  # optional, handy for panels
             }
-            if (epoch + 1) in {50, 100}:
-                metrics[f"val_rec_loss@{epoch + 1}"] = train_stats.get('loss')
-            if probe_acc is not None:
-                metrics[f"lin_probe_acc@{epoch + 1}"] = probe_acc
-            log_metrics(step=epoch + 1, **metrics)
+            if probe_now and probe_metrics:
+                # LOG THE SAME KEYS EVERY TIME A PROBE HAPPENS
+                if probe_metrics.get("val_loss") is not None:
+                    metrics["probe/val_loss"] = probe_metrics["val_loss"]
+                if probe_metrics.get("acc1") is not None:
+                    metrics["probe/acc1"] = probe_metrics["acc1"]
+                if probe_metrics.get("acc5") is not None:
+                    metrics["probe/acc5"] = probe_metrics["acc5"]
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch,}
-        if (epoch + 1) in {50, 100}:
-            log_stats[f'val_rec_loss@{epoch + 1}'] = train_stats.get('loss')
-        if probe_acc is not None:
-            log_stats[f'lin_probe_acc@{epoch + 1}'] = probe_acc
+            # one series per key; x-axis is the step (epoch1)
+            log_metrics(step=epoch1, **metrics)
+
+        # ---- text log (keep it aligned with W&B keys) ----
+        log_stats = {**{f"train_{k}": v for k, v in train_stats.items()}, "epoch": epoch}
+        if probe_now and probe_metrics:
+            if probe_metrics.get("val_loss") is not None:
+                log_stats["probe_val_loss"] = probe_metrics["val_loss"]
+            if probe_metrics.get("acc1") is not None:
+                log_stats["probe_acc1"] = probe_metrics["acc1"]
+            if probe_metrics.get("acc5") is not None:
+                log_stats["probe_acc5"] = probe_metrics["acc5"]
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
                 log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+            with open(os.path.join(args.output_dir, "log.txt"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
