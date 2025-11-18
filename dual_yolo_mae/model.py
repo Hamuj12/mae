@@ -1,6 +1,9 @@
 """Dual-backbone YOLO detector that fuses MAE and YOLOv8 features."""
 from __future__ import annotations
 
+
+import argparse
+import torch.serialization
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -71,26 +74,15 @@ class MAEBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder = mae_vit_base_patch16_dec512d8b()
-        
+
         # Infer the MAE encoder's native input size (e.g., 224x224 for ViT-B/16)
         enc_size = getattr(self.encoder.patch_embed, "img_size", 224)
         if isinstance(enc_size, (list, tuple)):
             self.mae_in_size = (int(enc_size[0]), int(enc_size[1]))
         else:
             self.mae_in_size = (int(enc_size), int(enc_size))
-            
-        if checkpoint:
-            state = torch.load(checkpoint, map_location="cpu")
-            if "state_dict" in state:
-                state = {k.replace("model.", "", 1): v for k, v in state["state_dict"].items()}
-            elif "model" in state:
-                state = state["model"]
-            # else assume it's already a plain state_dict
-            missing, unexpected = self.encoder.load_state_dict(state, strict=False)
-            if missing:
-                print(f"[MAEBackbone] Missing keys while loading checkpoint: {missing}")
-            if unexpected:
-                print(f"[MAEBackbone] Unexpected keys while loading checkpoint: {unexpected}")
+
+        self.load_pretrained(checkpoint)
         if freeze:
             for param in self.encoder.parameters():
                 param.requires_grad = False
@@ -107,6 +99,126 @@ class MAEBackbone(nn.Module):
                 for dim in output_dims
             ]
         )
+
+    def load_pretrained(self, checkpoint: Optional[str]) -> None:
+        if not checkpoint:
+            print("[MAEBackbone] No checkpoint provided; using default initialization.")
+            return
+
+        try:
+            # Allow argparse.Namespace stored inside the checkpoint (we trust our own runs).
+            torch.serialization.add_safe_globals([argparse.Namespace])
+
+            # PyTorch 2.6+: default weights_only=True breaks older-style checkpoints.
+            # Explicitly disable weights_only, with a fallback for older torch versions.
+            try:
+                state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            except TypeError:
+                # Older PyTorch that doesn’t know weights_only
+                state = torch.load(checkpoint, map_location="cpu")
+
+        except FileNotFoundError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Unable to load MAE checkpoint from {checkpoint}: {exc}") from exc
+
+        if "state_dict" in state:
+            state = {k.replace("model.", "", 1): v for k, v in state["state_dict"].items()}
+        elif "model" in state:
+            state = state["model"]
+        if not isinstance(state, dict):
+            raise RuntimeError(f"Checkpoint at {checkpoint} does not contain a state_dict-compatible mapping.")
+
+        adaptation_notes: List[str] = []
+        self._adapt_pos_embed(state, adaptation_notes)
+        self._adapt_patch_embed(state, adaptation_notes)
+
+        try:
+            missing, unexpected = self.encoder.load_state_dict(state, strict=False)
+        except RuntimeError as exc:  # noqa: BLE001
+            print(f"[MAEBackbone] Warning: encountered issue while loading checkpoint: {exc}")
+            missing, unexpected = (), ()
+
+        if adaptation_notes:
+            print("[MAEBackbone] Applied checkpoint adaptations:")
+            for note in adaptation_notes:
+                print(f"- {note}")
+
+        print("----- MAE Checkpoint Diagnostics -----")
+        print("Missing keys:")
+        if missing:
+            for key in missing:
+                print(f"- {key}")
+        else:
+            print("- (none)")
+
+        print("Unexpected keys:")
+        if unexpected:
+            for key in unexpected:
+                print(f"- {key}")
+        else:
+            print("- (none)")
+        print("-------------------------------------")
+
+    def _adapt_pos_embed(self, state: Dict[str, torch.Tensor], notes: List[str]) -> None:
+        if "pos_embed" not in state:
+            return
+
+        ckpt_pos = state["pos_embed"]
+        target_pos = self.encoder.pos_embed
+        if ckpt_pos.shape == target_pos.shape:
+            return
+
+        num_extra = ckpt_pos.shape[1] - 1
+        target_num_extra = target_pos.shape[1] - 1
+        old_side = int(round(math.sqrt(num_extra)))
+        new_side = int(round(math.sqrt(target_num_extra)))
+        if old_side * old_side != num_extra or new_side * new_side != target_num_extra:
+            notes.append(
+                f"pos_embed shape {tuple(ckpt_pos.shape)} incompatible with target {tuple(target_pos.shape)}; key dropped."
+            )
+            state.pop("pos_embed")
+            return
+
+        cls_pos = ckpt_pos[:, :1, :]
+        patch_pos = ckpt_pos[:, 1:, :].reshape(1, old_side, old_side, -1).permute(0, 3, 1, 2)
+        resized = F.interpolate(patch_pos, size=(new_side, new_side), mode="bicubic", align_corners=False)
+        patch_pos_new = resized.permute(0, 2, 3, 1).reshape(1, new_side * new_side, -1)
+        state["pos_embed"] = torch.cat([cls_pos, patch_pos_new], dim=1)
+        notes.append(f"Interpolated pos_embed from {old_side}x{old_side} to {new_side}x{new_side}.")
+
+    def _adapt_patch_embed(self, state: Dict[str, torch.Tensor], notes: List[str]) -> None:
+        weight_key = "patch_embed.proj.weight"
+        if weight_key not in state:
+            return
+
+        ckpt_weight = state[weight_key]
+        target_weight = self.encoder.patch_embed.proj.weight
+        if ckpt_weight.shape == target_weight.shape:
+            return
+
+        same_out_in = (
+            ckpt_weight.shape[0] == target_weight.shape[0]
+            and ckpt_weight.shape[1] == target_weight.shape[1]
+        )
+        if same_out_in:
+            resized = F.interpolate(
+                ckpt_weight,
+                size=target_weight.shape[2:],
+                mode="bicubic",
+                align_corners=False,
+            )
+            state[weight_key] = resized
+            notes.append(
+                "Resized patch_embed.proj.weight from "
+                f"{tuple(ckpt_weight.shape[2:])} to {tuple(target_weight.shape[2:])}."
+            )
+        else:
+            notes.append(
+                "Removed patch_embed.proj.weight due to incompatible channel dimensions: "
+                f"{tuple(ckpt_weight.shape)} -> {tuple(target_weight.shape)}."
+            )
+            state.pop(weight_key)
 
     def forward(self, x: torch.Tensor, target_shapes: Sequence[Tuple[int, int]]) -> List[torch.Tensor]:
         base = self._encode(x)

@@ -10,7 +10,10 @@ model:
     - [0.08, 0.2]
     - [0.2, 1.0]
   mae:
-    checkpoint: /home/hm25936/mae/mae/lightning/outputs/mae_runs/lightning_logs/version_1/checkpoints/epoch=199-step=6200.ckpt
+    # Paste the absolute path to the Phase-B best MAE checkpoint (.pth or .ckpt).
+    # The file should correspond to the lowest probe/val_loss epoch from Phase-B.
+    # Example: /path/to/lightning_logs/version_X/checkpoints/epoch=YYY-step=ZZZ.ckpt
+    checkpoint: /home/hm25936/mae/outputs/phaseB_top3/A2_mr85_blr0p0016_wd010_wu20/checkpoint-349.pth
     output_dims: [160, 160, 160]
     freeze: true
   yolo:

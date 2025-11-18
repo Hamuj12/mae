@@ -256,4 +256,17 @@ The inference script restores the fused model, runs detection on one or more ima
 
 The configuration expects a YOLOv8 backbone weight file (default `yolov8n.pt`) and optionally an MAE encoder checkpoint. Place the files anywhere on disk and update `model.yolo.weights` or `model.mae.checkpoint` accordingly. If the MAE checkpoint is omitted, the encoder starts from the default MAE initialization.
 
+## Phase 0: MAE checkpoint load test
+
+Before running any YOLO training, validate that the Phase-B best MAE checkpoint loads cleanly:
+
+1. Paste the absolute path to the Phase-B best `.pth`/`.ckpt` file into `dual_yolo_mae/config.yaml` under `model.mae.checkpoint`.
+2. Run the validation script (CUDA recommended):
+   ```bash
+   python tools/validate_mae_checkpoint.py --config dual_yolo_mae/config.yaml --device cuda
+   ```
+3. Inspect the printed diagnostics for missing/unexpected keys and confirm the reported feature map shapes.
+
+You are responsible for selecting the correct Phase-B checkpoint; the script only verifies that it loads and forwards without errors.
+
 This project is under the CC-BY-NC 4.0 license. See [LICENSE](LICENSE) for details.
