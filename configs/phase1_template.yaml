@@ -10,7 +10,7 @@ model:
     - [0.08, 0.2]
     - [0.2, 1.0]
   mae:
-    checkpoint: /path/to/phaseB_best_mae.ckpt
+    checkpoint: /home/hm25936/mae/outputs/phaseB_top3/A2_mr85_blr0p0016_wd010_wu20/checkpoint-349.pth
     output_dims: [160, 160, 160]
     freeze: true
   yolo:
@@ -20,7 +20,7 @@ model:
     channels: [160, 160, 160]
 
 dataset:
-  path: /datasets/synthetic_space_objects_10k
+  path: /home/hm25936/datasets_for_yolo/midLighting_rmag_5m_to_100m
   train_split: train
   val_split: val
   class_names: ["object"]
@@ -34,7 +34,7 @@ training:
   num_workers: 4
   precision: 32
   accelerator: auto
-  devices: auto
+  devices: 4
   gradient_clip_val: 1.0
   seed: 42
 

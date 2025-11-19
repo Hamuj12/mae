@@ -41,23 +41,36 @@ class DualYoloPhase1Module(pl.LightningModule):
         preds = self.model(images)
         loss_dict = self.model.compute_loss(preds, targets)
 
-        metrics = {
-            "train/loss": loss_dict["loss"],
-            "train/obj": loss_dict["loss_obj"],
-            "train/cls": loss_dict["loss_cls"],
-            "train/box": loss_dict["loss_box"],
-        }
-        gate_stats = self.model.get_gate_statistics()
-        for idx, stats in enumerate(gate_stats):
-            metrics[f"gate/scale{idx}_mean"] = stats.get("mean")
-            metrics[f"gate/scale{idx}_std"] = stats.get("std")
-
-        self.log("train/loss", loss_dict["loss"], on_step=True, on_epoch=True, prog_bar=True, batch_size=images.size(0))
+        # Keep Lightning metrics for progress bar / epoch aggregation
+        self.log(
+            "train/loss",
+            loss_dict["loss"],
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=images.size(0),
+        )
         self.log("train/obj", loss_dict["loss_obj"], on_step=False, on_epoch=True, batch_size=images.size(0))
         self.log("train/cls", loss_dict["loss_cls"], on_step=False, on_epoch=True, batch_size=images.size(0))
         self.log("train/box", loss_dict["loss_box"], on_step=False, on_epoch=True, batch_size=images.size(0))
-        log_metrics(metrics, step=int(self.global_step))
+
+        # No direct W&B logging here; we'll log once per epoch instead
         return loss_dict["loss"]
+    
+    def on_train_epoch_end(self) -> None:
+        """Log epoch-aggregated training metrics to W&B."""
+        if self.trainer is None:
+            return
+        cbm = self.trainer.callback_metrics
+        payload = {"epoch": int(self.current_epoch)}
+        for key in ["train/loss", "train/obj", "train/cls", "train/box"]:
+            if key in cbm:
+                try:
+                    payload[key] = float(cbm[key])
+                except Exception:
+                    pass
+        if len(payload) > 1:
+            log_metrics(payload, step=int(self.current_epoch))
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -65,18 +78,11 @@ class DualYoloPhase1Module(pl.LightningModule):
         targets = utils.move_targets_to_device(targets, self.device)
         preds = self.model(images)
         loss_dict = self.model.compute_loss(preds, targets)
+        
         self.log("val/loss", loss_dict["loss"], prog_bar=True, batch_size=images.size(0))
         self.log("val/box", loss_dict["loss_box"], batch_size=images.size(0))
         self.log("val/obj", loss_dict["loss_obj"], batch_size=images.size(0))
         self.log("val/cls", loss_dict["loss_cls"], batch_size=images.size(0))
-
-        metrics = {
-            "val/loss": loss_dict["loss"],
-            "val/obj": loss_dict["loss_obj"],
-            "val/cls": loss_dict["loss_cls"],
-            "val/box": loss_dict["loss_box"],
-        }
-        log_metrics(metrics, step=int(self.global_step))
 
         image_sizes = [tuple(map(int, t["orig_size"].detach().cpu().flip(0).tolist())) for t in targets]
         detections = self.model.decode_predictions(preds, image_sizes, conf_threshold=self.conf_threshold)
@@ -204,8 +210,17 @@ class DualYoloPhase1Module(pl.LightningModule):
             log_payload["val/mAP50"] = map50
         if box_mse == box_mse:  # not NaN
             log_payload["val/box_mse"] = box_mse
+        if self.trainer is not None:
+            cbm = self.trainer.callback_metrics
+            for key in ["val/loss", "val/box", "val/obj", "val/cls"]:
+                if key in cbm:
+                    try:
+                        log_payload[key] = float(cbm[key])
+                    except Exception:
+                        pass
+            log_payload["epoch"] = int(self.current_epoch)
         if log_payload:
-            log_metrics(log_payload, step=int(self.global_step))
+            log_metrics(log_payload, step=int(self.current_epoch))
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -331,7 +346,7 @@ def main() -> None:
         monitor="val/mAP50",
         mode="max",
     )
-    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    # lr_monitor = LearningRateMonitor(logging_interval="epoch")
     best_tracker = BestCheckpointCallback(monitor="val/mAP50", mode="max")
     gate_hist = GateHistogramCallback(interval=max(1, int(config.get("logging", {}).get("gate_interval", 200))))
 
@@ -343,7 +358,7 @@ def main() -> None:
         default_root_dir=str(output_dir),
         gradient_clip_val=float(config.get("training", {}).get("gradient_clip_val", 0.0)),
         logger=False,
-        callbacks=[checkpoint_callback, lr_monitor, best_tracker, gate_hist],
+        callbacks=[checkpoint_callback, best_tracker, gate_hist],
     )
 
     trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=args.resume)

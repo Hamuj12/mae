@@ -48,7 +48,10 @@ class GateHistogramCallback(pl.Callback):
             if hist.size:
                 metrics[f"gate_hist/scale{idx}"] = hist
         if metrics:
-            log_metrics(metrics, step=int(trainer.global_step))
+            # Log gate histograms keyed by epoch to keep the x-axis consistent
+            metrics["epoch"] = int(trainer.current_epoch)
+            log_metrics(metrics, step=int(trainer.current_epoch))
+            
         self._gate_buffers.clear()
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -87,5 +90,11 @@ class BestCheckpointCallback(pl.Callback):
         if self._is_better(current_value, self.best_value):
             self.best_value = current_value
             self.best_epoch = trainer.current_epoch
-            log_metrics({f"best/{self.monitor}": current_value, "best/epoch": trainer.current_epoch})
+            log_metrics(
+                {
+                    f"best/{self.monitor}": current_value,
+                    "best/epoch": int(trainer.current_epoch),
+                },
+                step=int(trainer.current_epoch),
+            )
 
