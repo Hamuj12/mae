@@ -293,6 +293,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None, help="Override number of epochs")
     parser.add_argument("--batch", type=int, default=None, help="Override batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--weight_decay", type=float, default=None, help="Override weight decay")  # <---
     parser.add_argument("--freeze_mae", type=lambda x: str(x).lower() in {"1", "true", "yes"}, default=True, help="Freeze MAE encoder")
     parser.add_argument("--run_name", type=str, default=None, help="Optional W&B run name")
     parser.add_argument("--output", type=str, default="outputs/phase1", help="Output directory")
@@ -312,6 +313,8 @@ def apply_overrides(config: Dict, args: argparse.Namespace) -> Dict:
         cfg["training"]["batch_size"] = args.batch
     if args.lr is not None:
         cfg["training"]["lr"] = args.lr
+    if args.weight_decay is not None:
+        cfg["training"]["weight_decay"] = args.weight_decay   # <---
     cfg["model"]["mae"]["freeze"] = bool(args.freeze_mae)
     cfg["model"]["yolo"]["freeze"] = False
     return cfg
