@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torchvision.ops import nms
 
 from models_mae import mae_vit_base_patch16_dec512d8b
+from dual_yolo_mae.metrics import bbox_iou
 from dual_yolo_mae.utils import load_ultralytics_model
 
 # Fix for numpy issue with recent versions
@@ -36,6 +37,15 @@ def _interpolate_pos_embed_2d(pos_embed: torch.Tensor, new_hw: tuple[int,int]) -
     )
     patch_pos_new = patch_pos_2d_resized.permute(0, 2, 3, 1).reshape(1, new_h * new_w, C)  # [1, Nnew, C]
     return torch.cat([cls_pos, patch_pos_new], dim=1)
+
+
+def _xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    x_c, y_c, w, h = boxes.unbind(-1)
+    x1 = x_c - w / 2
+    y1 = y_c - h / 2
+    x2 = x_c + w / 2
+    y2 = y_c + h / 2
+    return torch.stack([x1, y1, x2, y2], dim=-1)
 
 class GatedFusion(nn.Module):
     """Per-scale fusion of YOLO and MAE features with a temperature-controlled gate.
@@ -100,6 +110,7 @@ class MAEBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder = mae_vit_base_patch16_dec512d8b()
+        self.freeze = bool(freeze)
 
         # Infer the MAE encoder's native input size (e.g., 224x224 for ViT-B/16)
         enc_size = getattr(self.encoder.patch_embed, "img_size", 224)
@@ -109,7 +120,7 @@ class MAEBackbone(nn.Module):
             self.mae_in_size = (int(enc_size), int(enc_size))
 
         self.load_pretrained(checkpoint)
-        if freeze:
+        if self.freeze:
             for param in self.encoder.parameters():
                 param.requires_grad = False
             self.encoder.eval()
@@ -247,7 +258,11 @@ class MAEBackbone(nn.Module):
             state.pop(weight_key)
 
     def forward(self, x: torch.Tensor, target_shapes: Sequence[Tuple[int, int]]) -> List[torch.Tensor]:
-        base = self._encode(x)
+        if self.freeze:
+            with torch.no_grad():
+                base = self._encode(x)
+        else:
+            base = self._encode(x)
         outputs: List[torch.Tensor] = []
         if len(target_shapes) != len(self.projections):
             raise ValueError(
@@ -258,7 +273,6 @@ class MAEBackbone(nn.Module):
             outputs.append(proj(resized))
         return outputs
 
-    @torch.no_grad()
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         B, _, H, W = x.shape
 
@@ -365,6 +379,7 @@ class DualBackboneYOLO(nn.Module):
             freeze=yolo_cfg.get("freeze", True),
             dummy_input=model_cfg.get("input_size", 640),
         )
+        self.strides = list(self.yolo_backbone.strides)
 
         fusion_dims_cfg = fusion_cfg.get("channels")
         if fusion_dims_cfg is None:
@@ -430,7 +445,6 @@ class DualBackboneYOLO(nn.Module):
         self.fusion_channels = [layer.out_channels for layer in self.fusion_layers]
         self.detection_head = DetectionHead(self.fusion_channels, self.num_classes)
         self.bce = nn.BCEWithLogitsLoss()
-        self.reg_loss = nn.SmoothL1Loss()
         self._last_gate_statistics: List[Dict[str, torch.Tensor]] = []
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
@@ -459,6 +473,48 @@ class DualBackboneYOLO(nn.Module):
             if low <= box_size < high:
                 return idx
         return len(self.scale_ranges) - 1
+
+    def _decode_boxes_from_logits(
+        self, pred: torch.Tensor, scale_idx: int, normalized: bool = True
+    ) -> torch.Tensor:
+        """Decode raw head predictions into bounding boxes.
+
+        Args:
+            pred: Tensor of shape ``[H, W, C]`` with raw logits.
+            scale_idx: Index of the detection scale (for stride selection).
+            normalized: If ``True`` return boxes in ``[0, 1]`` relative coordinates;
+                otherwise return boxes in image-space pixels using the scale stride.
+        """
+
+        H, W, _ = pred.shape
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=pred.device, dtype=pred.dtype),
+            torch.arange(W, device=pred.device, dtype=pred.dtype),
+            indexing="ij",
+        )
+
+        tx, ty, tw, th = pred[..., 1:5].unbind(-1)
+        x_center = (torch.sigmoid(tx) + grid_x) / W
+        y_center = (torch.sigmoid(ty) + grid_y) / H
+        w = (torch.sigmoid(tw).pow(2) * 4.0) / W
+        h = (torch.sigmoid(th).pow(2) * 4.0) / H
+
+        x1 = x_center - w / 2
+        y1 = y_center - h / 2
+        x2 = x_center + w / 2
+        y2 = y_center + h / 2
+        boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+
+        if normalized:
+            return boxes
+
+        stride = float(self.strides[scale_idx])
+        scale = torch.tensor(
+            [W * stride, H * stride, W * stride, H * stride],
+            device=boxes.device,
+            dtype=boxes.dtype,
+        )
+        return boxes * scale
 
     def build_targets(
         self, preds: Sequence[torch.Tensor], targets: List[Dict]
@@ -501,18 +557,26 @@ class DualBackboneYOLO(nn.Module):
         loss_box = torch.tensor(0.0, device=preds[0].device)
         loss_cls = torch.tensor(0.0, device=preds[0].device)
 
-        for pred, obj_t, box_t, cls_t in zip(preds, obj_targets, box_targets, cls_targets):
+        for scale_idx, (pred, obj_t, box_t, cls_t) in enumerate(
+            zip(preds, obj_targets, box_targets, cls_targets)
+        ):
             pred = pred.permute(0, 2, 3, 1)
             obj_logit = pred[..., 0]
-            box_logit = pred[..., 1:5]
             cls_logit = pred[..., 5:]
 
+            decoded_boxes = self._decode_boxes_from_logits(pred, scale_idx, normalized=True)
             loss_obj = loss_obj + self.bce(obj_logit, obj_t)
 
             positive = obj_t > 0.5
             if positive.any():
-                box_pred = torch.sigmoid(box_logit[positive])
-                loss_box = loss_box + self.reg_loss(box_pred, box_t[positive])
+                pred_boxes = decoded_boxes[positive]
+                target_boxes = _xywh_to_xyxy(box_t[positive])
+                iou_matrix = bbox_iou(pred_boxes, target_boxes, mode="giou")
+                if iou_matrix.shape[1] == pred_boxes.shape[0]:
+                    ious = torch.diag(iou_matrix)
+                else:
+                    ious = iou_matrix.max(dim=1).values
+                loss_box = loss_box + (1.0 - ious).mean()
                 loss_cls = loss_cls + self.bce(cls_logit[positive], cls_t[positive])
 
         total = (
@@ -540,35 +604,32 @@ class DualBackboneYOLO(nn.Module):
             boxes_accum: List[torch.Tensor] = []
             scores_accum: List[torch.Tensor] = []
             labels_accum: List[torch.Tensor] = []
-            for scale_pred in preds:
+            for scale_idx, scale_pred in enumerate(preds):
                 logits = scale_pred[batch_idx].permute(1, 2, 0)
-                probs = torch.sigmoid(logits)
-                obj = probs[..., 0]
-                box = probs[..., 1:5]
-                cls_probs = probs[..., 5:]
+                obj_logit = logits[..., 0]
+                cls_logit = logits[..., 5:]
+                boxes_norm = self._decode_boxes_from_logits(logits, scale_idx, normalized=True)
+
+                obj = torch.sigmoid(obj_logit)
+                cls_probs = torch.sigmoid(cls_logit)
                 cls_scores, cls_idx = torch.max(cls_probs, dim=-1)
                 conf = cls_scores * obj
                 mask = conf > conf_threshold
                 if mask.sum() == 0:
                     continue
-                h_img, w_img = image_sizes[batch_idx]
-                selected_box = box[mask]
-                selected_conf = conf[mask]
-                selected_cls = cls_idx[mask]
 
-                x_c = selected_box[:, 0] * w_img
-                y_c = selected_box[:, 1] * h_img
-                widths = selected_box[:, 2] * w_img
-                heights = selected_box[:, 3] * h_img
-                x1 = x_c - widths / 2
-                y1 = y_c - heights / 2
-                x2 = x_c + widths / 2
-                y2 = y_c + heights / 2
-                boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+                img_h, img_w = image_sizes[batch_idx]
+                selected_box = boxes_norm[mask]
+                scale = torch.tensor(
+                    [img_w, img_h, img_w, img_h],
+                    device=selected_box.device,
+                    dtype=selected_box.dtype,
+                )
+                boxes = selected_box * scale
 
                 boxes_accum.append(boxes)
-                scores_accum.append(selected_conf)
-                labels_accum.append(selected_cls)
+                scores_accum.append(conf[mask])
+                labels_accum.append(cls_idx[mask])
 
             if not boxes_accum:
                 results.append([])

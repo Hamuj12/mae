@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Sequence, Tuple
 
+import math
 import numpy as np
 import torch
 
@@ -67,15 +68,26 @@ def outputs_to_boxes(
         boxes: List[torch.Tensor] = []
         for scale_pred in preds:
             logits = scale_pred[batch_idx].permute(1, 2, 0)
-            probs = torch.sigmoid(logits)
-            obj = probs[..., 0]
-            xywh = probs[..., 1:5]
-            cls_scores, _ = torch.max(probs[..., 5:], dim=-1)
+            H, W, _ = logits.shape
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(H, device=logits.device, dtype=logits.dtype),
+                torch.arange(W, device=logits.device, dtype=logits.dtype),
+                indexing="ij",
+            )
+            obj = torch.sigmoid(logits[..., 0])
+            cls_scores, _ = torch.max(torch.sigmoid(logits[..., 5:]), dim=-1)
             conf = cls_scores * obj
             mask = conf > conf_threshold
             if mask.sum() == 0:
                 continue
-            boxes.append(xywh[mask])
+
+            tx, ty, tw, th = logits[..., 1:5].unbind(-1)
+            x_center = (torch.sigmoid(tx) + grid_x) / W
+            y_center = (torch.sigmoid(ty) + grid_y) / H
+            w = (torch.sigmoid(tw).pow(2) * 4.0) / W
+            h = (torch.sigmoid(th).pow(2) * 4.0) / H
+
+            boxes.append(torch.stack([x_center, y_center, w, h], dim=-1)[mask])
         if boxes:
             outputs.append(torch.cat(boxes, dim=0).to(device) if device is not None else torch.cat(boxes, dim=0))
         else:
@@ -105,4 +117,68 @@ def _box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     return inter / (union + 1e-6)
 
 
-__all__ = ["compute_box_mse", "compute_gate_histograms", "outputs_to_boxes"]
+def bbox_iou(
+    pred_boxes_xyxy: torch.Tensor,
+    target_boxes_xyxy: torch.Tensor,
+    mode: str = "giou",
+) -> torch.Tensor:
+    """Compute IoU/GIoU/CIoU between sets of boxes in ``xyxy`` format."""
+
+    if pred_boxes_xyxy.numel() == 0 or target_boxes_xyxy.numel() == 0:
+        return torch.zeros(
+            (pred_boxes_xyxy.shape[0], target_boxes_xyxy.shape[0]),
+            device=pred_boxes_xyxy.device,
+        )
+
+    # Intersection and union
+    lt = torch.maximum(pred_boxes_xyxy[:, None, :2], target_boxes_xyxy[None, :, :2])
+    rb = torch.minimum(pred_boxes_xyxy[:, None, 2:], target_boxes_xyxy[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    area1 = (pred_boxes_xyxy[:, 2] - pred_boxes_xyxy[:, 0]) * (
+        pred_boxes_xyxy[:, 3] - pred_boxes_xyxy[:, 1]
+    )
+    area2 = (target_boxes_xyxy[:, 2] - target_boxes_xyxy[:, 0]) * (
+        target_boxes_xyxy[:, 3] - target_boxes_xyxy[:, 1]
+    )
+    union = area1[:, None] + area2[None, :] - inter
+    iou = inter / (union + 1e-7)
+
+    if mode == "iou":
+        return iou
+
+    # Enclosing box for GIoU/CIoU
+    enclose_lt = torch.minimum(pred_boxes_xyxy[:, None, :2], target_boxes_xyxy[None, :, :2])
+    enclose_rb = torch.maximum(pred_boxes_xyxy[:, None, 2:], target_boxes_xyxy[None, :, 2:])
+    enclose_wh = (enclose_rb - enclose_lt).clamp(min=0)
+    enclose_area = enclose_wh[..., 0] * enclose_wh[..., 1] + 1e-7
+
+    if mode == "giou":
+        giou = iou - (enclose_area - union) / enclose_area
+        return giou
+
+    if mode == "ciou":
+        pred_ctr = (pred_boxes_xyxy[..., :2] + pred_boxes_xyxy[..., 2:]) / 2
+        target_ctr = (target_boxes_xyxy[..., :2] + target_boxes_xyxy[..., 2:]) / 2
+        center_dist = ((pred_ctr[:, None, :] - target_ctr[None, :, :]) ** 2).sum(-1)
+
+        c2 = (enclose_wh[..., 0] ** 2 + enclose_wh[..., 1] ** 2) + 1e-7
+        aspect_ratio = torch.atan(
+            (pred_boxes_xyxy[:, 2] - pred_boxes_xyxy[:, 0])
+            / torch.clamp(pred_boxes_xyxy[:, 3] - pred_boxes_xyxy[:, 1], min=1e-7)
+        )
+        target_ratio = torch.atan(
+            (target_boxes_xyxy[:, 2] - target_boxes_xyxy[:, 0])
+            / torch.clamp(target_boxes_xyxy[:, 3] - target_boxes_xyxy[:, 1], min=1e-7)
+        )
+        v = (4 / (math.pi**2)) * (aspect_ratio[:, None] - target_ratio[None, :]) ** 2
+        with torch.no_grad():
+            alpha = v / torch.clamp(1 - iou + v, min=1e-7)
+        ciou = iou - (center_dist / c2 + alpha * v)
+        return ciou
+
+    raise ValueError(f"Unsupported IoU mode: {mode}")
+
+
+__all__ = ["compute_box_mse", "compute_gate_histograms", "outputs_to_boxes", "bbox_iou"]
