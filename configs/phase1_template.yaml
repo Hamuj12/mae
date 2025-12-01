@@ -12,7 +12,7 @@ model:
   mae:
     checkpoint: /home/hm25936/mae/outputs/phaseB_top3/A2_mr85_blr0p0016_wd010_wu20/checkpoint-349.pth
     output_dims: [160, 160, 160]
-    freeze: true
+    freeze: false
   yolo:
     weights: yolov8n.pt
     freeze: false
