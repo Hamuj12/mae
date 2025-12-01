@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 from torch.utils.data import DataLoader
 
 from dual_yolo_mae import utils
@@ -293,8 +293,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None, help="Override number of epochs")
     parser.add_argument("--batch", type=int, default=None, help="Override batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=None,
+        help="Early stopping patience in epochs (disabled if None)",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum improvement in val/mAP50 to count as progress",
+    )
+    parser.add_argument(
+        "--fusion_temp",
+        type=float,
+        default=None,
+        help="Override fusion gate temperature (scalar)",
+    )
     parser.add_argument("--weight_decay", type=float, default=None, help="Override weight decay")  # <---
-    parser.add_argument("--freeze_mae", type=lambda x: str(x).lower() in {"1", "true", "yes"}, default=True, help="Freeze MAE encoder")
+    parser.add_argument(
+        "--freeze_mae",
+        type=lambda x: str(x).lower() in {"1", "true", "yes"},
+        default=True,
+        help="Freeze MAE encoder",
+    )
     parser.add_argument("--run_name", type=str, default=None, help="Optional W&B run name")
     parser.add_argument("--output", type=str, default="outputs/phase1", help="Output directory")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
@@ -307,14 +330,19 @@ def apply_overrides(config: Dict, args: argparse.Namespace) -> Dict:
     cfg.setdefault("model", {})
     cfg["model"].setdefault("mae", {})
     cfg["model"].setdefault("yolo", {})
+    cfg["model"].setdefault("fusion", {})
+
     if args.epochs is not None:
         cfg["training"]["epochs"] = args.epochs
     if args.batch is not None:
         cfg["training"]["batch_size"] = args.batch
     if args.lr is not None:
         cfg["training"]["lr"] = args.lr
+    if args.fusion_temp is not None:
+        cfg["model"]["fusion"]["temperature"] = float(args.fusion_temp)
     if args.weight_decay is not None:
         cfg["training"]["weight_decay"] = args.weight_decay   # <---
+
     cfg["model"]["mae"]["freeze"] = bool(args.freeze_mae)
     cfg["model"]["yolo"]["freeze"] = False
     return cfg
@@ -334,7 +362,15 @@ def main() -> None:
 
     wandb_run = init_wandb(config, args.run_name, output_dir)
     if wandb_run:
-        log_metrics({"phase": "phase1", "resume": bool(args.resume)}, step=0)
+        fusion_temp = (
+            config.get("model", {})
+            .get("fusion", {})
+            .get("temperature", None)
+        )
+        payload = {"phase": "phase1", "resume": bool(args.resume)}
+        if fusion_temp is not None:
+            payload["fusion/temperature"] = fusion_temp
+        log_metrics(payload, step=0)
 
     train_loader, val_loader = create_dataloaders(config)
     module = DualYoloPhase1Module(config)
@@ -349,9 +385,24 @@ def main() -> None:
         monitor="val/mAP50",
         mode="max",
     )
-    # lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
     best_tracker = BestCheckpointCallback(monitor="val/mAP50", mode="max")
-    gate_hist = GateHistogramCallback(interval=max(1, int(config.get("logging", {}).get("gate_interval", 200))))
+    gate_hist = GateHistogramCallback(
+        interval=max(1, int(config.get("logging", {}).get("gate_interval", 200)))
+    )
+
+    callbacks = [checkpoint_callback, lr_monitor, best_tracker, gate_hist]
+
+    # Optional early stopping on val/mAP50
+    if args.early_stop_patience is not None and args.early_stop_patience > 0:
+        early_stop_cb = EarlyStopping(
+            monitor="val/mAP50",
+            mode="max",
+            patience=int(args.early_stop_patience),
+            min_delta=float(args.early_stop_min_delta),
+            verbose=True,
+        )
+        callbacks.append(early_stop_cb)
 
     trainer = pl.Trainer(
         max_epochs=int(config.get("training", {}).get("epochs", 20)),
@@ -360,8 +411,8 @@ def main() -> None:
         precision=config.get("training", {}).get("precision", 32),
         default_root_dir=str(output_dir),
         gradient_clip_val=float(config.get("training", {}).get("gradient_clip_val", 0.0)),
-        logger=False,
-        callbacks=[checkpoint_callback, best_tracker, gate_hist],
+        logger=True,
+        callbacks=callbacks,
     )
 
     trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=args.resume)

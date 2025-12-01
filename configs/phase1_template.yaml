@@ -18,6 +18,7 @@ model:
     freeze: false
   fusion:
     channels: [160, 160, 160]
+    temperature: 1.0  # fusion gate temperature (scalar or [t0, t1, t2])
 
 dataset:
   path: /home/hm25936/datasets_for_yolo/midLighting_rmag_5m_to_100m

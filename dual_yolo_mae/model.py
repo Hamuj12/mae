@@ -38,28 +38,54 @@ def _interpolate_pos_embed_2d(pos_embed: torch.Tensor, new_hw: tuple[int,int]) -
     return torch.cat([cls_pos, patch_pos_new], dim=1)
 
 class GatedFusion(nn.Module):
-    def __init__(self, yolo_ch: int, mae_ch: int, fused_ch: int) -> None:
+    """Per-scale fusion of YOLO and MAE features with a temperature-controlled gate.
+
+    gate = sigmoid( conv([yolo || mae]) / T )
+
+    - T=1.0 reproduces the original behaviour.
+    - T<1.0 makes the sigmoid sharper (more binary gating).
+    - T>1.0 makes the sigmoid softer (more linear gating).
+    """
+
+    def __init__(
+        self,
+        yolo_ch: int,
+        mae_ch: int,
+        fused_ch: int,
+        temperature: float = 1.0,
+    ) -> None:
         super().__init__()
-        self.gate = nn.Sequential(
-            nn.Conv2d(yolo_ch + mae_ch, 1, kernel_size=1),
-            nn.Sigmoid(),
-        )
+
+        # Raw conv to produce gate logits
+        self.gate_conv = nn.Conv2d(yolo_ch + mae_ch, 1, kernel_size=1)
+
+        # Projection after fusion
         self.proj = nn.Sequential(
             nn.Conv2d(yolo_ch + mae_ch, fused_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(fused_ch),
             nn.SiLU(inplace=True),
         )
-        self.out_channels = fused_ch   # <--- Expose this
+
+        # Keep temperature as a buffer so it moves with .to(device) but is not trainable.
+        self.register_buffer("temperature", torch.tensor(float(temperature)), persistent=False)
+
+        self.out_channels = fused_ch
         self.last_gate_stats: Dict[str, torch.Tensor] = {}
 
-    def forward(self, yolo_f, mae_f):
+    def forward(self, yolo_f: torch.Tensor, mae_f: torch.Tensor) -> torch.Tensor:
         gate_in = torch.cat([yolo_f, mae_f], dim=1)
-        g = self.gate(gate_in)
+
+        raw = self.gate_conv(gate_in)
+        # Avoid division by zero; clamp to a small minimum.
+        temp = self.temperature.clamp_min(1e-6)
+        g = torch.sigmoid(raw / temp)
+
         with torch.no_grad():
             self.last_gate_stats = {
                 "mean": g.mean().detach(),
                 "std": g.std(unbiased=False).detach(),
             }
+
         fused = torch.cat([yolo_f, g * mae_f], dim=1)
         return self.proj(fused)
 
@@ -356,6 +382,24 @@ class DualBackboneYOLO(nn.Module):
         if len(mae_output_dims) != self.yolo_backbone.num_scales:
             raise ValueError("MAE output dims must match number of feature scales from YOLO.")
 
+        # --- Fusion temperature configuration ---------------------------------
+        # Accept either:
+        #   fusion.temperature: float         -> same T for all scales
+        #   fusion.temperature: [t0, t1, t2] -> per-scale temperatures
+        temp_cfg = fusion_cfg.get("temperature", 1.0)
+        if isinstance(temp_cfg, (list, tuple)):
+            if len(temp_cfg) != self.yolo_backbone.num_scales:
+                raise ValueError(
+                    "If 'fusion.temperature' is a list/tuple, its length must "
+                    "match the number of detection scales."
+                )
+            fusion_temps = [float(t) for t in temp_cfg]
+        else:
+            fusion_temps = [float(temp_cfg)] * self.yolo_backbone.num_scales
+
+        # Store for introspection/logging if needed
+        self.fusion_temperatures: List[float] = fusion_temps
+
         self.mae_backbone = MAEBackbone(
             checkpoint=mae_cfg.get("checkpoint"),
             output_dims=mae_output_dims,
@@ -372,9 +416,15 @@ class DualBackboneYOLO(nn.Module):
                 raise ValueError("Each scale range must have high > low.")
 
         self.fusion_layers = nn.ModuleList(
-            [GatedFusion(yolo_ch, mae_ch, fused_ch)
-            for yolo_ch, mae_ch, fused_ch in zip(
-                self.yolo_backbone.output_channels, mae_output_dims, fusion_dims)]
+            [
+                GatedFusion(yolo_ch, mae_ch, fused_ch, temperature=temp)
+                for yolo_ch, mae_ch, fused_ch, temp in zip(
+                    self.yolo_backbone.output_channels,
+                    mae_output_dims,
+                    fusion_dims,
+                    self.fusion_temperatures,
+                )
+            ]
         )
 
         self.fusion_channels = [layer.out_channels for layer in self.fusion_layers]
