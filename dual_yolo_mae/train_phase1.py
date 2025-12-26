@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Dict, List, Optional
 
 import pytorch_lightning as pl
@@ -30,9 +31,179 @@ class DualYoloPhase1Module(pl.LightningModule):
         self._val_batches: list[tuple[list[Dict], list[Dict]]] = []
         self._val_box_mses: List[float] = []
         self._val_image_index = 0
+        debug_cfg = config.get("debug", {})
+        self.debug_train_dynamics = self._parse_debug_flag(
+            debug_cfg.get("train_dynamics", False),
+            env_var="DEBUG_TRAIN_DYNAMICS",
+        )
+        self.debug_every_n_steps = self._parse_debug_int(
+            debug_cfg.get("every_n_steps", 0),
+            env_var="DEBUG_EVERY_N_STEPS",
+        )
+        self._debug_params: Dict[str, tuple[str, torch.nn.Parameter]] = {}
+        self._debug_param_snapshots: Dict[str, torch.Tensor] = {}
+        self._debug_logged_startup = False
 
     def forward(self, x: torch.Tensor):
         return self.model(x)
+
+    @staticmethod
+    def _parse_debug_flag(config_value: bool, env_var: str) -> bool:
+        env_value = os.getenv(env_var)
+        if env_value is None:
+            return bool(config_value)
+        return env_value.strip().lower() in {"1", "true", "yes", "y"}
+
+    @staticmethod
+    def _parse_debug_int(config_value: int, env_var: str) -> int:
+        env_value = os.getenv(env_var)
+        if env_value is None:
+            return int(config_value)
+        try:
+            return int(env_value)
+        except ValueError:
+            return int(config_value)
+
+    def _should_debug_step(self) -> bool:
+        if not self.debug_train_dynamics:
+            return False
+        every_n = int(self.debug_every_n_steps)
+        if every_n > 0:
+            return self.global_step % every_n == 0
+        return self.global_step == 0
+
+    def _log_debug(self, message: str, *args) -> None:
+        if not self.trainer or not self.trainer.is_global_zero:
+            return
+        utils.LOGGER.info(message, *args)
+
+    def _summarize_module_params(self, module: torch.nn.Module) -> tuple[int, int]:
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+    def _setup_debug_params(self) -> None:
+        if self._debug_params:
+            return
+
+        def pick_first_param(module: torch.nn.Module) -> Optional[tuple[str, torch.nn.Parameter]]:
+            for name, param in module.named_parameters():
+                return name, param
+            return None
+
+        candidates = {
+            "mae_encoder": self.model.mae_backbone.encoder,
+            "mae_proj": self.model.mae_backbone.projections,
+            "fusion": self.model.fusion_layers,
+            "head": self.model.detection_head,
+        }
+        for label, module in candidates.items():
+            picked = pick_first_param(module)
+            if picked is None:
+                continue
+            name, param = picked
+            self._debug_params[label] = (name, param)
+
+    def on_fit_start(self) -> None:
+        if not self.debug_train_dynamics or self._debug_logged_startup:
+            return
+        self._setup_debug_params()
+        mae_backbone = self.model.mae_backbone
+        self._log_debug(
+            "[debug] MAE freeze=%s | mae_backbone.training=%s | encoder.training=%s",
+            mae_backbone.freeze,
+            mae_backbone.training,
+            mae_backbone.encoder.training,
+        )
+        total_params, total_trainable = self._summarize_module_params(self.model)
+        self._log_debug(
+            "[debug] Params total=%d trainable=%d",
+            total_params,
+            total_trainable,
+        )
+        summaries = {
+            "mae_encoder": mae_backbone.encoder,
+            "mae_proj": mae_backbone.projections,
+            "yolo": self.model.yolo_backbone,
+            "fusion": self.model.fusion_layers,
+            "head": self.model.detection_head,
+        }
+        for name, module in summaries.items():
+            total, trainable = self._summarize_module_params(module)
+            self._log_debug(
+                "[debug] Module %s params total=%d trainable=%d",
+                name,
+                total,
+                trainable,
+            )
+
+        optimizer = None
+        if self.trainer and self.trainer.optimizers:
+            optimizer = self.trainer.optimizers[0]
+        if optimizer is not None:
+            for idx, group in enumerate(optimizer.param_groups):
+                group_total = sum(p.numel() for p in group["params"])
+                group_trainable = sum(p.numel() for p in group["params"] if p.requires_grad)
+                self._log_debug(
+                    "[debug] Optimizer group %d params total=%d trainable=%d lr=%s",
+                    idx,
+                    group_total,
+                    group_trainable,
+                    group.get("lr"),
+                )
+
+        for label, (name, param) in self._debug_params.items():
+            self._log_debug(
+                "[debug] Track param %s: %s requires_grad=%s shape=%s",
+                label,
+                name,
+                param.requires_grad,
+                tuple(param.shape),
+            )
+
+        self._debug_logged_startup = True
+
+    def on_after_backward(self) -> None:
+        if not self._should_debug_step():
+            return
+        self._setup_debug_params()
+        for label, (name, param) in self._debug_params.items():
+            grad = param.grad
+            if grad is None:
+                grad_norm = None
+            else:
+                grad_norm = float(grad.detach().float().norm().item())
+            self._log_debug(
+                "[debug] Grad norm %s (%s): %s",
+                label,
+                name,
+                "None" if grad_norm is None else f"{grad_norm:.6f}",
+            )
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        if not self._should_debug_step():
+            return
+        self._setup_debug_params()
+        self._debug_param_snapshots = {
+            label: param.detach().float().clone()
+            for label, (_, param) in self._debug_params.items()
+        }
+
+    def on_after_optimizer_step(self, optimizer) -> None:
+        if not self._should_debug_step() or not self._debug_param_snapshots:
+            return
+        for label, (name, param) in self._debug_params.items():
+            before = self._debug_param_snapshots.get(label)
+            if before is None:
+                continue
+            delta = (param.detach().float() - before).norm().item()
+            self._log_debug(
+                "[debug] Weight delta %s (%s): %.6f",
+                label,
+                name,
+                float(delta),
+            )
+        self._debug_param_snapshots = {}
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
@@ -314,9 +485,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=None, help="Override weight decay")  # <---
     parser.add_argument(
         "--freeze_mae",
-        type=lambda x: str(x).lower() in {"1", "true", "yes"},
-        default=True,
-        help="Freeze MAE encoder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Freeze MAE encoder (default: respect config)",
+    )
+    parser.add_argument(
+        "--debug_train_dynamics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Log MAE/YOLO parameter, gradient, and update diagnostics.",
+    )
+    parser.add_argument(
+        "--debug_every_n_steps",
+        type=int,
+        default=0,
+        help="Debug logging frequency in steps (0 = only first step).",
     )
     parser.add_argument("--run_name", type=str, default=None, help="Optional W&B run name")
     parser.add_argument("--output", type=str, default="outputs/phase1", help="Output directory")
@@ -331,6 +514,7 @@ def apply_overrides(config: Dict, args: argparse.Namespace) -> Dict:
     cfg["model"].setdefault("mae", {})
     cfg["model"].setdefault("yolo", {})
     cfg["model"].setdefault("fusion", {})
+    cfg.setdefault("debug", {})
 
     if args.epochs is not None:
         cfg["training"]["epochs"] = args.epochs
@@ -343,8 +527,13 @@ def apply_overrides(config: Dict, args: argparse.Namespace) -> Dict:
     if args.weight_decay is not None:
         cfg["training"]["weight_decay"] = args.weight_decay   # <---
 
-    cfg["model"]["mae"]["freeze"] = bool(args.freeze_mae)
+    if args.freeze_mae is not None:
+        cfg["model"]["mae"]["freeze"] = bool(args.freeze_mae)
     cfg["model"]["yolo"]["freeze"] = False
+    if args.debug_train_dynamics is not None:
+        cfg["debug"]["train_dynamics"] = bool(args.debug_train_dynamics)
+    if args.debug_every_n_steps is not None:
+        cfg["debug"]["every_n_steps"] = int(args.debug_every_n_steps)
     return cfg
 
 
