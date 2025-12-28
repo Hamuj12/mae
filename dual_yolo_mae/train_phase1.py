@@ -43,6 +43,7 @@ class DualYoloPhase1Module(pl.LightningModule):
         self._debug_params: Dict[str, tuple[str, torch.nn.Parameter]] = {}
         self._debug_param_snapshots: Dict[str, torch.Tensor] = {}
         self._debug_logged_startup = False
+        self._last_cuda_mem_snapshot: Dict[str, float] = {}
 
     def forward(self, x: torch.Tensor):
         return self.model(x)
@@ -82,6 +83,15 @@ class DualYoloPhase1Module(pl.LightningModule):
         trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
         return total, trainable
 
+    def _count_optimizer_params(self, optimizer: torch.optim.Optimizer, module: torch.nn.Module) -> int:
+        module_param_ids = {id(p) for p in module.parameters()}
+        total = 0
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if id(param) in module_param_ids:
+                    total += param.numel()
+        return total
+
     def _setup_debug_params(self) -> None:
         if self._debug_params:
             return
@@ -91,30 +101,65 @@ class DualYoloPhase1Module(pl.LightningModule):
                 return name, param
             return None
 
+        def get_module(attr: str) -> Optional[torch.nn.Module]:
+            return getattr(self.model, attr, None)
+
         candidates = {
-            "mae_encoder": self.model.mae_backbone.encoder,
-            "mae_proj": self.model.mae_backbone.projections,
-            "fusion": self.model.fusion_layers,
-            "head": self.model.detection_head,
+            "mae_encoder": getattr(get_module("mae_backbone"), "encoder", None),
+            "mae_proj": getattr(get_module("mae_backbone"), "projections", None),
+            "fusion": get_module("fusion_layers"),
+            "head": get_module("detection_head"),
         }
         for label, module in candidates.items():
+            if module is None:
+                continue
             picked = pick_first_param(module)
             if picked is None:
                 continue
             name, param = picked
             self._debug_params[label] = (name, param)
 
+    def _log_cuda_memory(self, tag: str) -> None:
+        if not self.debug_train_dynamics:
+            return
+        if not torch.cuda.is_available():
+            return
+        if not self.trainer or not self.trainer.is_global_zero:
+            return
+        snapshots: Dict[str, float] = {}
+        for device_idx in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(device_idx) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device_idx) / (1024**3)
+            max_allocated = torch.cuda.max_memory_allocated(device_idx) / (1024**3)
+            snapshots[f"cuda:{device_idx}.allocated_gb"] = allocated
+            snapshots[f"cuda:{device_idx}.reserved_gb"] = reserved
+            snapshots[f"cuda:{device_idx}.max_allocated_gb"] = max_allocated
+        self._last_cuda_mem_snapshot = snapshots
+        details = " | ".join(f"{k}={v:.2f}" for k, v in snapshots.items())
+        self._log_debug("[debug] CUDA memory %s: %s", tag, details)
+
     def on_fit_start(self) -> None:
+        self.model.train()
         if not self.debug_train_dynamics or self._debug_logged_startup:
             return
         self._setup_debug_params()
-        mae_backbone = self.model.mae_backbone
-        self._log_debug(
-            "[debug] MAE freeze=%s | mae_backbone.training=%s | encoder.training=%s",
-            mae_backbone.freeze,
-            mae_backbone.training,
-            mae_backbone.encoder.training,
-        )
+        mae_backbone = getattr(self.model, "mae_backbone", None)
+        if mae_backbone is not None and not mae_backbone.freeze:
+            mae_backbone.train()
+        encoder = getattr(mae_backbone, "encoder", None) if mae_backbone is not None else None
+        model_lines = [
+            "[debug] ===== Train Dynamics Summary =====",
+            f"[debug] MAE freeze={getattr(mae_backbone, 'freeze', None)}",
+            f"[debug] Model training={self.model.training}",
+            f"[debug] mae_backbone.training={getattr(mae_backbone, 'training', None)}",
+            f"[debug] mae_encoder.training={getattr(encoder, 'training', None)}",
+            f"[debug] yolo_backbone.training={getattr(getattr(self.model, 'yolo_backbone', None), 'training', None)}",
+            f"[debug] fusion.training={getattr(getattr(self.model, 'fusion_layers', None), 'training', None)}",
+            f"[debug] head.training={getattr(getattr(self.model, 'detection_head', None), 'training', None)}",
+            "[debug] ================================",
+        ]
+        for line in model_lines:
+            self._log_debug("%s", line)
         total_params, total_trainable = self._summarize_module_params(self.model)
         self._log_debug(
             "[debug] Params total=%d trainable=%d",
@@ -122,13 +167,15 @@ class DualYoloPhase1Module(pl.LightningModule):
             total_trainable,
         )
         summaries = {
-            "mae_encoder": mae_backbone.encoder,
-            "mae_proj": mae_backbone.projections,
-            "yolo": self.model.yolo_backbone,
-            "fusion": self.model.fusion_layers,
-            "head": self.model.detection_head,
+            "mae_encoder": encoder,
+            "mae_proj": getattr(mae_backbone, "projections", None),
+            "yolo": getattr(self.model, "yolo_backbone", None),
+            "fusion": getattr(self.model, "fusion_layers", None),
+            "head": getattr(self.model, "detection_head", None),
         }
         for name, module in summaries.items():
+            if module is None:
+                continue
             total, trainable = self._summarize_module_params(module)
             self._log_debug(
                 "[debug] Module %s params total=%d trainable=%d",
@@ -141,6 +188,8 @@ class DualYoloPhase1Module(pl.LightningModule):
         if self.trainer and self.trainer.optimizers:
             optimizer = self.trainer.optimizers[0]
         if optimizer is not None:
+            total_opt_params = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
+            self._log_debug("[debug] Optimizer params total=%d", total_opt_params)
             for idx, group in enumerate(optimizer.param_groups):
                 group_total = sum(p.numel() for p in group["params"])
                 group_trainable = sum(p.numel() for p in group["params"] if p.requires_grad)
@@ -150,6 +199,24 @@ class DualYoloPhase1Module(pl.LightningModule):
                     group_total,
                     group_trainable,
                     group.get("lr"),
+                )
+            if mae_backbone is not None:
+                mae_opt_params = self._count_optimizer_params(optimizer, mae_backbone)
+                self._log_debug("[debug] Optimizer MAE params total=%d", mae_opt_params)
+                if not mae_backbone.freeze and mae_opt_params == 0:
+                    self._log_debug(
+                        "[debug][WARN] MAE is unfrozen but optimizer has 0 MAE params.",
+                    )
+            for name, module in summaries.items():
+                if module is None:
+                    continue
+                module_opt_params = self._count_optimizer_params(optimizer, module)
+                self._log_debug("[debug] Optimizer module %s params total=%d", name, module_opt_params)
+        if mae_backbone is not None:
+            _, mae_trainable = self._summarize_module_params(mae_backbone)
+            if not mae_backbone.freeze and mae_trainable == 0:
+                self._log_debug(
+                    "[debug][WARN] MAE is unfrozen but has 0 trainable params.",
                 )
 
         for label, (name, param) in self._debug_params.items():
@@ -161,6 +228,7 @@ class DualYoloPhase1Module(pl.LightningModule):
                 tuple(param.shape),
             )
 
+        self._log_cuda_memory("fit_start")
         self._debug_logged_startup = True
 
     def on_after_backward(self) -> None:
@@ -206,6 +274,8 @@ class DualYoloPhase1Module(pl.LightningModule):
         self._debug_param_snapshots = {}
 
     def training_step(self, batch, batch_idx):
+        if self.global_step == 0:
+            self._log_cuda_memory("train_step_0")
         images, targets = batch
         images = images.to(self.device)
         targets = utils.move_targets_to_device(targets, self.device)
@@ -320,7 +390,7 @@ class DualYoloPhase1Module(pl.LightningModule):
                     else:
                         gt_boxes[cls_idx][image_id] = box.unsqueeze(0)
                 for det in det_list:
-                    per_class_dets.setdefault(det["label"], []).append((det["score"], torch.tensor(det["box"]), image_id))
+                    per_class_dets.setdefault(det["label"], []).append((det["score"], torch.as_tensor(det["box"]), image_id))
 
         aps: list[float] = []
         for cls_idx, dets in per_class_dets.items():
@@ -332,7 +402,7 @@ class DualYoloPhase1Module(pl.LightningModule):
             tp: List[float] = []
             fp: List[float] = []
             for score, box_list, image_id in dets:
-                box = torch.tensor(box_list, dtype=torch.float32).unsqueeze(0)
+                box = torch.as_tensor(box_list, dtype=torch.float32).unsqueeze(0)
                 class_gts = gt_boxes[cls_idx].get(image_id)
                 if class_gts is None or class_gts.numel() == 0:
                     tp.append(0.0)
@@ -484,6 +554,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--weight_decay", type=float, default=None, help="Override weight decay")  # <---
     parser.add_argument(
+        "--precision_override",
+        type=str,
+        default=None,
+        help="Override trainer precision (e.g. bf16-mixed, 16-mixed, 32-true).",
+    )
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=None,
+        help="Override gradient accumulation steps.",
+    )
+    parser.add_argument(
+        "--gradient_checkpoint_mae",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable gradient checkpointing for MAE backbone.",
+    )
+    parser.add_argument(
+        "--limit_train_batches",
+        type=float,
+        default=None,
+        help="Limit train batches (int for count, float for fraction).",
+    )
+    parser.add_argument(
         "--freeze_mae",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -526,9 +620,17 @@ def apply_overrides(config: Dict, args: argparse.Namespace) -> Dict:
         cfg["model"]["fusion"]["temperature"] = float(args.fusion_temp)
     if args.weight_decay is not None:
         cfg["training"]["weight_decay"] = args.weight_decay   # <---
+    if args.precision_override is not None:
+        cfg["training"]["precision"] = args.precision_override
+    if args.accumulate_grad_batches is not None:
+        cfg["training"]["accumulate_grad_batches"] = int(args.accumulate_grad_batches)
+    if args.limit_train_batches is not None:
+        cfg["training"]["limit_train_batches"] = args.limit_train_batches
 
     if args.freeze_mae is not None:
         cfg["model"]["mae"]["freeze"] = bool(args.freeze_mae)
+    if args.gradient_checkpoint_mae is not None:
+        cfg["model"]["mae"]["gradient_checkpointing"] = bool(args.gradient_checkpoint_mae)
     cfg["model"]["yolo"]["freeze"] = False
     if args.debug_train_dynamics is not None:
         cfg["debug"]["train_dynamics"] = bool(args.debug_train_dynamics)
@@ -600,6 +702,8 @@ def main() -> None:
         precision=config.get("training", {}).get("precision", 32),
         default_root_dir=str(output_dir),
         gradient_clip_val=float(config.get("training", {}).get("gradient_clip_val", 0.0)),
+        accumulate_grad_batches=config.get("training", {}).get("accumulate_grad_batches", 1),
+        limit_train_batches=config.get("training", {}).get("limit_train_batches", 1.0),
         logger=True,
         callbacks=callbacks,
     )

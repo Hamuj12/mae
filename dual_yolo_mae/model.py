@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import nms
+from torch.utils.checkpoint import checkpoint
 
 from models_mae import mae_vit_base_patch16_dec512d8b
 from dual_yolo_mae.utils import load_ultralytics_model
@@ -97,10 +98,12 @@ class MAEBackbone(nn.Module):
         checkpoint: Optional[str] = None,
         output_dims: Sequence[int] = (144, 144, 144),
         freeze: bool = True,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = mae_vit_base_patch16_dec512d8b()
         self.freeze = bool(freeze)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
 
         # Infer the MAE encoder's native input size (e.g., 224x224 for ViT-B/16)
         enc_size = getattr(self.encoder.patch_embed, "img_size", 224)
@@ -283,8 +286,17 @@ class MAEBackbone(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
 
         # Standard ViT forward through transformer blocks
+        use_checkpoint = (
+            self.gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and any(param.requires_grad for param in self.encoder.parameters())
+        )
         for blk in self.encoder.blocks:
-            x = blk(x)
+            if use_checkpoint:
+                x = checkpoint(blk, x)
+            else:
+                x = blk(x)
         x = self.encoder.norm(x)
 
         # Drop cls token and reshape to [B, C, H/patch, W/patch]
@@ -409,6 +421,7 @@ class DualBackboneYOLO(nn.Module):
             checkpoint=mae_cfg.get("checkpoint"),
             output_dims=mae_output_dims,
             freeze=mae_cfg.get("freeze", True),
+            gradient_checkpointing=mae_cfg.get("gradient_checkpointing", False),
         )
 
         self.scale_ranges = [tuple(map(float, r)) for r in model_cfg.get(
