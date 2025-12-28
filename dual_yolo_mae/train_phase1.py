@@ -1,4 +1,7 @@
 """Phase 1 training script: freeze MAE, train YOLO neck/head/fusion."""
+# Debug recipe (rank0-only logging):
+# torchrun --nproc_per_node=2 dual_yolo_mae/train_phase1.py --config <cfg.yaml> \
+#   --no-freeze-mae --debug-train-dynamics --debug-every-n-steps 1 --limit_train_batches 0.01
 from __future__ import annotations
 
 import argparse
@@ -139,13 +142,10 @@ class DualYoloPhase1Module(pl.LightningModule):
         self._log_debug("[debug] CUDA memory %s: %s", tag, details)
 
     def on_fit_start(self) -> None:
-        self.model.train()
         if not self.debug_train_dynamics or self._debug_logged_startup:
             return
         self._setup_debug_params()
         mae_backbone = getattr(self.model, "mae_backbone", None)
-        if mae_backbone is not None and not mae_backbone.freeze:
-            mae_backbone.train()
         encoder = getattr(mae_backbone, "encoder", None) if mae_backbone is not None else None
         model_lines = [
             "[debug] ===== Train Dynamics Summary =====",
@@ -260,6 +260,7 @@ class DualYoloPhase1Module(pl.LightningModule):
     def on_after_optimizer_step(self, optimizer) -> None:
         if not self._should_debug_step() or not self._debug_param_snapshots:
             return
+        mae_backbone = getattr(self.model, "mae_backbone", None)
         for label, (name, param) in self._debug_params.items():
             before = self._debug_param_snapshots.get(label)
             if before is None:
@@ -271,6 +272,20 @@ class DualYoloPhase1Module(pl.LightningModule):
                 name,
                 float(delta),
             )
+            if mae_backbone is not None and label.startswith("mae"):
+                if mae_backbone.freeze and delta > 0:
+                    self._log_debug(
+                        "[debug][WARN] MAE is frozen but %s (%s) changed (delta=%.6f).",
+                        label,
+                        name,
+                        float(delta),
+                    )
+                if not mae_backbone.freeze and param.requires_grad and delta == 0:
+                    self._log_debug(
+                        "[debug][WARN] MAE is unfrozen but %s (%s) had zero delta.",
+                        label,
+                        name,
+                    )
         self._debug_param_snapshots = {}
 
     def training_step(self, batch, batch_idx):
