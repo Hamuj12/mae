@@ -3,8 +3,9 @@ from __future__ import annotations
 
 
 import argparse
-import torch.serialization
 import math
+import os
+import torch.serialization
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -317,6 +318,7 @@ class YOLOBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.yolo = load_ultralytics_model(weights).model
+        self._debug_logged_output = False
         if freeze:
             for param in self.yolo.parameters():
                 param.requires_grad = False
@@ -324,12 +326,66 @@ class YOLOBackbone(nn.Module):
         self.strides = self.yolo.stride.tolist()
         with torch.no_grad():
             dummy = torch.zeros(1, 3, dummy_input, dummy_input)
-            preds, feats = self.yolo(dummy)
+            preds, feats = self._split_yolo_output(self.yolo(dummy))
             self.output_channels = [f.shape[1] for f in feats]
         self.num_scales = len(self.output_channels)
 
+    @staticmethod
+    def _debug_enabled() -> bool:
+        value = os.getenv("DEBUG_TRAIN_DYNAMICS")
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+
+    @staticmethod
+    def _is_rank_zero() -> bool:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
+        return True
+
+    def _split_yolo_output(self, output):
+        preds = None
+        feats = None
+        if isinstance(output, (list, tuple)):
+            if len(output) == 2:
+                preds, feats = output
+            elif len(output) >= 3:
+                preds = output[0]
+                for item in output[1:]:
+                    if isinstance(item, (list, tuple)) and item and torch.is_tensor(item[0]):
+                        feats = item
+                        break
+                    if torch.is_tensor(item):
+                        feats = [item]
+                        break
+            elif len(output) == 1:
+                preds = output[0]
+        else:
+            preds = output
+
+        if feats is None:
+            if hasattr(output, "feats"):
+                feats = output.feats
+            elif hasattr(output, "features"):
+                feats = output.features
+
+        if feats is None:
+            output_type = type(output)
+            length = len(output) if isinstance(output, (list, tuple)) else None
+            raise RuntimeError(
+                "YOLO backbone output did not include features. "
+                f"Got type={output_type}, len={length}. Please adapt _split_yolo_output."
+            )
+        return preds, feats
+
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        _, feats = self.yolo(x)
+        output = self.yolo(x)
+        if self._debug_enabled() and not self._debug_logged_output and self._is_rank_zero():
+            output_type = type(output)
+            length = len(output) if isinstance(output, (list, tuple)) else None
+            print(f"[debug] YOLO forward output type={output_type} len={length}")
+            self._debug_logged_output = True
+        _, feats = self._split_yolo_output(output)
         return feats
 
 
