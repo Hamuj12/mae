@@ -1,10 +1,10 @@
-"""Ablation study comparing YOLOv8 baseline with the dual-backbone variant."""
+"""Ablation study comparing YOLOv8 baseline vs FDA-trained YOLOv8 vs dual-backbone variant."""
 from __future__ import annotations
 
 import argparse
 import random
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional, Callable
 
 import matplotlib
 
@@ -26,14 +26,23 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
         "The 'ultralytics' package is required to run the ablation study. Install it with 'pip install ultralytics'."
     ) from exc
 
+
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 TO_TENSOR = transforms.ToTensor()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare YOLOv8 baseline vs dual-backbone model")
-    parser.add_argument("--baseline", type=str, required=True, help="Path to baseline YOLOv8 weights")
-    parser.add_argument("--modified", type=str, required=True, help="Path to dual-backbone weights")
+    parser = argparse.ArgumentParser(
+        description="Compare YOLOv8 baseline vs FDA-YOLO vs dual-backbone model"
+    )
+    parser.add_argument("--baseline", type=str, required=True, help="Path to baseline YOLOv8 weights (.pt)")
+    parser.add_argument(
+        "--fda",
+        type=str,
+        default=None,
+        help="Optional: Path to YOLOv8 weights trained on synthetic+FDA dataset (.pt)",
+    )
+    parser.add_argument("--modified", type=str, required=True, help="Path to dual-backbone weights (.ckpt/.pt)")
     parser.add_argument("--config", type=str, required=True, help="Dual-backbone configuration YAML")
     parser.add_argument("--dataset", type=str, required=True, help="Root of YOLO-format dataset")
     parser.add_argument("--n", type=int, default=8, help="Number of random test images for visualization")
@@ -60,6 +69,7 @@ def resolve_device(requested: str | None) -> Tuple[torch.device, str]:
         if device.type == "cuda" and not torch.cuda.is_available():
             utils.LOGGER.warning("CUDA requested but is unavailable. Falling back to CPU.")
             device = torch.device("cpu")
+
     if device.type == "cuda":
         index = device.index if device.index is not None else 0
         device_str = f"{device.type}:{index}"
@@ -139,6 +149,7 @@ def match_and_error(preds: List[Dict], gts: List[Dict]) -> Tuple[float, int]:
             if iou > best_iou:
                 best_iou = iou
                 best_idx = idx
+
         if best_idx is not None:
             pred_box = preds[best_idx]["xywh"]
             diff = np.array(gt_box) - np.array(pred_box)
@@ -153,13 +164,17 @@ def match_and_error(preds: List[Dict], gts: List[Dict]) -> Tuple[float, int]:
     return total_sq, components
 
 
-def predict_baseline(
+def predict_yolo(
     model: YOLO,
     image_path: Path,
     conf: float,
     iou: float,
     device_str: str | None,
 ) -> List[Dict]:
+    """
+    Run Ultralytics YOLO predict and return a standardized list of detections.
+    Uses result.boxes.xywhn/conf/cls which are part of Ultralytics Results API.
+    """
     results = model.predict(
         source=str(image_path),
         conf=conf,
@@ -170,10 +185,12 @@ def predict_baseline(
     )
     if not results:
         return []
+
     result = results[0]
     boxes = result.boxes
     if boxes is None or boxes.xyxy is None or boxes.xyxy.shape[0] == 0:
         return []
+
     xyxy = boxes.xyxy.cpu().numpy()
     xywhn = boxes.xywhn.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
@@ -250,7 +267,8 @@ def resolve_class_names(config: Dict, dataset_root: Path) -> List[str]:
     class_names = config.get("dataset", {}).get("class_names")
     if class_names:
         return [str(name) for name in class_names]
-    for candidate in ("data.yaml", "dataset.yaml"):
+
+    for candidate in ("data.yaml", "dataset.yaml", "dataset_fda.yaml"):
         candidate_path = dataset_root / candidate
         if candidate_path.exists():
             data_cfg = utils.load_config(candidate_path)
@@ -263,6 +281,7 @@ def resolve_class_names(config: Dict, dataset_root: Path) -> List[str]:
                 return [str(names[key]) for key in ordered]
             if isinstance(names, (list, tuple)):
                 return [str(name) for name in names]
+
     return []
 
 
@@ -270,12 +289,14 @@ def draw_detections(ax, image_array: np.ndarray, detections: List[Dict], class_n
     ax.imshow(image_array)
     ax.set_title(title)
     ax.axis("off")
+
     for det in detections:
         x1, y1, x2, y2 = det["xyxy"]
         width = x2 - x1
         height = y2 - y1
         rect = Rectangle((x1, y1), width, height, linewidth=2, edgecolor="lime", facecolor="none")
         ax.add_patch(rect)
+
         label_idx = int(det["label"])
         label_name = (
             class_names[label_idx]
@@ -297,16 +318,31 @@ def create_comparison_plot(
     image_path: Path,
     image_array: np.ndarray,
     baseline_preds: List[Dict],
+    fda_preds: Optional[List[Dict]],
     modified_preds: List[Dict],
     class_names: List[str],
     output_dir: Path,
 ) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(image_array)
-    axes[0].set_title("Input")
-    axes[0].axis("off")
-    draw_detections(axes[1], image_array, baseline_preds, class_names, "YOLOv8n Baseline")
-    draw_detections(axes[2], image_array, modified_preds, class_names, "Dual-Backbone YOLO")
+    has_fda = fda_preds is not None
+    ncols = 4 if has_fda else 3
+
+    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 6))
+    if ncols == 3:
+        ax0, ax1, ax2 = axes
+        ax0.imshow(image_array)
+        ax0.set_title("Input")
+        ax0.axis("off")
+        draw_detections(ax1, image_array, baseline_preds, class_names, "YOLOv8 Baseline")
+        draw_detections(ax2, image_array, modified_preds, class_names, "Dual-Backbone YOLO")
+    else:
+        ax0, ax1, ax2, ax3 = axes
+        ax0.imshow(image_array)
+        ax0.set_title("Input")
+        ax0.axis("off")
+        draw_detections(ax1, image_array, baseline_preds, class_names, "YOLOv8 Baseline")
+        draw_detections(ax2, image_array, fda_preds or [], class_names, "YOLOv8 (FDA-trained)")
+        draw_detections(ax3, image_array, modified_preds, class_names, "Dual-Backbone YOLO")
+
     fig.tight_layout()
     save_path = output_dir / f"{image_path.stem}_comparison.png"
     fig.savefig(save_path, dpi=200)
@@ -317,7 +353,7 @@ def create_comparison_plot(
 def evaluate_dataset(
     image_paths: Sequence[Path],
     labels_root: Path,
-    predictor,
+    predictor: Callable[[Path], List[Dict]],
 ) -> Tuple[float, int]:
     total_error = 0.0
     total_components = 0
@@ -341,6 +377,7 @@ def main() -> None:
     dataset_root = Path(args.dataset)
     output_dir = utils.ensure_dir(args.output)
     config = utils.load_config(args.config)
+
     utils.LOGGER.info("Dataset root: %s", dataset_root)
     utils.LOGGER.info("Outputs will be saved to %s", output_dir)
 
@@ -349,9 +386,7 @@ def main() -> None:
     conf_threshold = float(args.conf if args.conf is not None else inference_cfg.get("conf_threshold", 0.25))
     iou_threshold = float(args.iou if args.iou is not None else inference_cfg.get("iou_threshold", 0.45))
 
-    utils.LOGGER.info(
-        "Using device %s with conf=%.2f and iou=%.2f", device, conf_threshold, iou_threshold
-    )
+    utils.LOGGER.info("Using device %s with conf=%.2f and iou=%.2f", device, conf_threshold, iou_threshold)
 
     class_names = resolve_class_names(config, dataset_root)
     if class_names:
@@ -359,11 +394,22 @@ def main() -> None:
     else:
         utils.LOGGER.info("No class names found; falling back to numeric labels")
 
-    utils.LOGGER.info("Loading baseline weights from %s", args.baseline)
+    # ----------------------
+    # Load models
+    # ----------------------
+    utils.LOGGER.info("Loading baseline YOLO weights from %s", args.baseline)
     baseline_model = YOLO(args.baseline)
     if class_names:
         mapping = {idx: name for idx, name in enumerate(class_names)}
         baseline_model.model.names = mapping
+
+    fda_model = None
+    if args.fda:
+        utils.LOGGER.info("Loading FDA YOLO weights from %s", args.fda)
+        fda_model = YOLO(args.fda)
+        if class_names:
+            mapping = {idx: name for idx, name in enumerate(class_names)}
+            fda_model.model.names = mapping
 
     utils.LOGGER.info("Loading dual-backbone weights from %s", args.modified)
     modified_model = DualBackboneYOLO(config)
@@ -373,13 +419,21 @@ def main() -> None:
 
     img_size = int(config.get("model", {}).get("input_size", 640))
     all_images = gather_images(dataset_root)
+
     random.seed(42)
     sample_count = min(int(args.n), len(all_images))
     sampled_images = random.sample(all_images, sample_count)
     utils.LOGGER.info("Generating visual comparisons for %d images", sample_count)
 
+    # ----------------------
+    # Predictor wrappers
+    # ----------------------
     def baseline_predictor(path: Path) -> List[Dict]:
-        return predict_baseline(baseline_model, path, conf_threshold, iou_threshold, device_str)
+        return predict_yolo(baseline_model, path, conf_threshold, iou_threshold, device_str)
+
+    def fda_predictor(path: Path) -> List[Dict]:
+        assert fda_model is not None
+        return predict_yolo(fda_model, path, conf_threshold, iou_threshold, device_str)
 
     def modified_predictor(path: Path, pil_image: Image.Image | None = None) -> List[Dict]:
         return predict_modified(
@@ -392,35 +446,76 @@ def main() -> None:
             pil_image=pil_image,
         )
 
+    # ----------------------
+    # Visualization
+    # ----------------------
     for image_path in sampled_images:
         with Image.open(image_path) as img:
             pil_image = img.convert("RGB")
         image_array = np.array(pil_image)
+
         baseline_preds = baseline_predictor(image_path)
+        fda_preds = fda_predictor(image_path) if fda_model is not None else None
         modified_preds = modified_predictor(image_path, pil_image=pil_image)
-        create_comparison_plot(image_path, image_array, baseline_preds, modified_preds, class_names, output_dir)
+
+        create_comparison_plot(
+            image_path=image_path,
+            image_array=image_array,
+            baseline_preds=baseline_preds,
+            fda_preds=fda_preds,
+            modified_preds=modified_preds,
+            class_names=class_names,
+            output_dir=output_dir,
+        )
         pil_image.close()
 
+    # ----------------------
+    # Metric evaluation
+    # ----------------------
     labels_root = dataset_root / "labels" / "test"
     if not labels_root.exists():
         raise FileNotFoundError(f"Test label directory not found: {labels_root}")
 
     utils.LOGGER.info("Evaluating models across %d test images", len(all_images))
+
     baseline_error, baseline_components = evaluate_dataset(all_images, labels_root, baseline_predictor)
-    modified_error, modified_components = evaluate_dataset(all_images, labels_root, modified_predictor)
-
     baseline_mse = baseline_error / baseline_components if baseline_components else float("nan")
-    modified_mse = modified_error / modified_components if modified_components else float("nan")
+    utils.LOGGER.info("Baseline YOLO average box MSE: %.6f", baseline_mse)
 
-    utils.LOGGER.info("Baseline YOLOv8n average box MSE: %.6f", baseline_mse)
+    fda_mse = None
+    if fda_model is not None:
+        fda_error, fda_components = evaluate_dataset(all_images, labels_root, fda_predictor)
+        fda_mse = fda_error / fda_components if fda_components else float("nan")
+        utils.LOGGER.info("FDA YOLO average box MSE: %.6f", float(fda_mse))
+
+    modified_error, modified_components = evaluate_dataset(
+        all_images, labels_root, lambda p: modified_predictor(p, pil_image=None)
+    )
+    modified_mse = modified_error / modified_components if modified_components else float("nan")
     utils.LOGGER.info("Dual-backbone average box MSE: %.6f", modified_mse)
 
     summary_path = output_dir / "mse_summary.txt"
     with summary_path.open("w", encoding="utf-8") as f:
-        f.write(f"Baseline YOLOv8n MSE: {baseline_mse:.6f}\n")
+        f.write(f"Baseline YOLO MSE: {baseline_mse:.6f}\n")
+        if fda_mse is not None:
+            f.write(f"FDA YOLO MSE: {float(fda_mse):.6f}\n")
         f.write(f"Dual-backbone MSE: {modified_mse:.6f}\n")
+
     utils.LOGGER.info("Wrote MSE summary to %s", summary_path)
 
 
 if __name__ == "__main__":
     main()
+
+
+# PYTHONPATH=. python tools/ablation.py --baseline /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt --modified /home/hm25936/mae/outputs/sweeps/phase1_v2/p1v2_e100_b24_lr0p0005_wd0010_T1p0/checkpoints/phase1-epoch=49.ckpt --config /home/hm25936/mae/configs/phase1_template.yaml --dataset /home/hm25936/datasets_for_yolo/midLighting_rmag_5m_to_100m --n 15 --output /home/hm25936/mae/ablation_results --device 'cuda:0'
+# PYTHONPATH=. python tools/ablation.py --baseline /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt --modified /home/hm25936/mae/outputs/sweeps/phase1_v2/p1v2_e100_b24_lr0p0005_wd0010_T1p0/checkpoints/phase1-epoch=49.ckpt --config /home/hm25936/mae/configs/phase1_template.yaml --dataset /home/hm25936/datasets_for_yolo/run_K --n 15 --output /home/hm25936/mae/ablation_results_real --device 'cuda:0'
+# PYTHONPATH=. python tools/ablation.py \
+#   --baseline /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
+#   --fda /home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
+#   --modified /home/hm25936/mae/outputs/sweeps/phase1_v2/p1v2_e100_b24_lr0p0005_wd0010_T1p0/checkpoints/phase1-epoch=49.ckpt \
+#   --config /home/hm25936/mae/configs/phase1_template.yaml \
+#   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
+#   --n 15 \
+#   --output /home/hm25936/mae/ablation_results_fda \
+#   --device cuda:0

@@ -1,0 +1,3 @@
+Baseline YOLO MSE: 0.001162
+FDA YOLO MSE: 0.000162
+Dual-backbone MSE: 0.043746
