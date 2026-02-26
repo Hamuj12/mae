@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>theo_perception</name>
+  <version>0.1.0</version>
+  <description>YOLOv8-based ROS2 perception node for 2D detections with letterbox/inverse bbox mapping.</description>
+  <maintainer email="maintainer@example.com">theodwyn</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>vision_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>builtin_interfaces</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

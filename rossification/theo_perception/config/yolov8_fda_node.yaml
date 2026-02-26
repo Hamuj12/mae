@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    model_path: ""
+    device: "cuda:0"
+    imgsz: 1024
+    conf: 0.25
+    iou: 0.45
+    max_det: 300
+    topic_in: "/camera/color/image_raw"
+    topic_out: "/perception/yolov8_fda/detections"
+    overlay_topic: "/perception/yolov8_fda/overlay"
+    publish_overlay: false
+    use_trt_engine: false
+    qos_reliability: "best_effort"
+    qos_history_depth: 5
+    qos_durability: "volatile"
+    frame_id_override: ""
