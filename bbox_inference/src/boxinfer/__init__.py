@@ -1,4 +1,4 @@
-"""Public package interface for mae_bbox_inference"""
+"""Public package interface for boxinfer"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from .detector import YoloBBoxDetector
     from .export import export_tensorrt_engine
     from .offline_test import run_offline_bbox_test
+    from .offline_test import OfflineTestConfig
     from .timing import TimingSummary
     from .timing import summarize_latencies
     from .types import DetectionResult
@@ -17,11 +18,13 @@ if TYPE_CHECKING:
     from .visualization import write_detections_json
 
 
+
 __all__ = [
-            # runtime detector + model export
+            # runtime detector + model export + offline test API
             'YoloBBoxDetector',
             'export_tensorrt_engine',
             'run_offline_bbox_test',
+            'OfflineTestConfig', 
 
             # timing + typed result payload
             'TimingSummary',

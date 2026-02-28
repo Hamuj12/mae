@@ -28,7 +28,7 @@ python -m pip install -e . --no-deps
 
 ## Runtime uses CLI entry points for export/test/visualization
 This means we use aliases for running specifics scripts. 
-Example:  `mae-bbox-export-trt ...` instead of `python -m mae_bbox_inference.offline_test ...`.
+Example:  `boxinfer-export-trt ...` instead of `python -m boxinfer.offline_test ...`.
 
 ## Export TensorRT Engine
 
@@ -36,7 +36,7 @@ From `.pt`:
 
 ```bash
 # export TRT engine from Ultralytics .pt
-mae-bbox-export-trt \
+boxinfer-export-trt \
   --model-path /path/to/model.pt \
   --engine-out /path/to/model.engine \
   --imgsz 1024 \
@@ -48,7 +48,7 @@ mae-bbox-export-trt \
 
 ```bash
 # ONNX backend
-mae-bbox-offline-test \
+boxinfer-offline-test \
   --backend onnx \
   --dataset-dir /path/to/dataset \
   --model-path /path/to/model.onnx \
@@ -64,7 +64,7 @@ TensorRT backend:
 
 ```bash
 # TensorRT backend with engine file
-mae-bbox-offline-test \
+boxinfer-offline-test \
   --backend tensorrt \
   --dataset-dir /path/to/dataset \
   --model-path /path/to/model.engine \
@@ -78,7 +78,7 @@ mae-bbox-offline-test \
 
 ```bash
 # generate overlay images and top-k panel from csv log
-mae-bbox-visualize-csv \
+boxinfer-visualize-csv \
   --csv-path /path/to/bbox_detections.csv \
   --output-dir /path/to/bbox_viz \
   --top-k 3

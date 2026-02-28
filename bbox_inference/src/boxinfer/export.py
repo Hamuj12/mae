@@ -51,6 +51,8 @@ def export_tensorrt_engine(
     """
     Export TensorRT engine from YOLO model path
 
+    # half precision is typically desired for edge inference, but can be disabled for compatibility with older GPUs that lack FP16 support
+    # dynamic shape export is typically desired for flexibility, but can be disabled for maximum compatibility
     Supports .pt directly
     """
 
@@ -118,18 +120,17 @@ if __name__ == '__main__':
 
 
 # converting .pt to .engine with ultralytics export helper
-# mae-bbox-export-trt \
+# boxinfer-export-trt \
 #   --model-path /path/to/model.pt \
 #   --engine-out /path/to/model.engine \
 #   --imgsz 1024 \
 #   --device 0 \
 #   --half
 # example:
-# mae-bbox-export-trt \
+# boxinfer-export-trt \
 #   --model-path /home/saa4743/agnc_repos/mae/bbox_inference/test_artifacts/best_fda.pt \
 #   --engine-out /home/saa4743/agnc_repos/mae/bbox_inference/test_results/best_fda.engine \
 #   --imgsz 1024 \
 #   --device 0 \
 #   --half
-
 

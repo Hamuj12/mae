@@ -210,21 +210,21 @@ if __name__ == '__main__':
 
 
 # runtime:
-# mae-bbox-offline-test \
+# boxinfer-offline-test \
 #   --backend onnx \
 #   --dataset-dir /path/to/dataset \
 #   --model-path /path/to/model.onnx \
 #   --output-dir /path/to/output
 
 # # example 1 with ONNX backend
-# mae-bbox-offline-test \
+# boxinfer-offline-test \
 #   --backend onnx \
 #   --dataset-dir /home/saa4743/agnc_repos/mae/bbox_inference/test_artifacts/subset_midLighting_scaled_jpsmooth2_trajectory \
 #   --model-path /home/saa4743/agnc_repos/mae/bbox_inference/test_artifacts/best_fda.onnx \
 #   --output-dir /home/saa4743/agnc_repos/mae/bbox_inference/test_results/offline_test_output
 
 # # example 2 with TensorRT engine
-#   mae-bbox-offline-test \
+#   boxinfer-offline-test \
 #   --backend tensorrt \
 #   --dataset-dir /home/saa4743/agnc_repos/mae/bbox_inference/test_artifacts/subset_midLighting_scaled_jpsmooth2_trajectory \
 #   --model-path /home/saa4743/agnc_repos/mae/bbox_inference/test_artifacts/best_fda.engine \
