@@ -55,6 +55,10 @@ def __getattr__(name: str):
         from .offline_test import run_offline_bbox_test
         return run_offline_bbox_test
 
+    if name == 'OfflineTestConfig':
+        from .offline_test import OfflineTestConfig
+        return OfflineTestConfig
+
     if name == 'TimingSummary':
         from .timing import TimingSummary
         return TimingSummary
