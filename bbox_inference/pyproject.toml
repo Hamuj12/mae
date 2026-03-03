@@ -1,0 +1,42 @@
+# Build backend used by pip/uv editable install
+[build-system]
+requires        = ["setuptools>=64", "wheel"]
+build-backend   = "setuptools.build_meta"
+
+# Inference-only package metadata
+[project]
+name            = "boxinfer"
+version         = "0.1.0"
+description     = "Standalone YOLO bbox inference utilities for ONNX and TensorRT"
+readme          = "README.md"
+requires-python = ">=3.10"
+dependencies    = [
+                    "numpy",
+                    "opencv-python",
+                    "onnxruntime",
+                    "ultralytics",
+                    "matplotlib",
+                ]
+
+# optional GPU runtime extras
+[project.optional-dependencies]
+tensorrt        = [
+                    "tensorrt",
+                    "pycuda",
+                ]
+
+# CLI entry points for export/test/visualization
+# this avoids doing the following in the terminal
+# python -m boxinfer.offline_test ...
+# python -m boxinfer.export ...
+# python -m boxinfer.visualization ...
+
+[project.scripts]
+boxinfer-offline-test   = "boxinfer.offline_test:main"
+boxinfer-export-trt     = "boxinfer.export:main"
+boxinfer-visualize-csv  = "boxinfer.visualization:main"
+
+# src/ layout package discovery
+[tool.setuptools.packages.find]
+where           = ["src"]
+include         = ["boxinfer*"]
