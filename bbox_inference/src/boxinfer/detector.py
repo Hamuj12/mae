@@ -157,8 +157,8 @@ class YoloBBoxDetector:
         if YOLO is None:
             raise ImportError('ultralytics is required for TensorRT backend')
 
-        # ultralytics AutoBackend wraps TensorRT runtime details
-        self._model = YOLO(self._model_path)
+        # set task explicitly to avoid warning when metadata is not embedded in engine
+        self._model = YOLO(self._model_path, task = 'detect')
         if not self._prefer_cuda:
             self._device = 'cpu'
 
