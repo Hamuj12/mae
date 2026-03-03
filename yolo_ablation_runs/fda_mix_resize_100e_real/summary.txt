@@ -1,0 +1,28 @@
+YOLO Ablation (Unlabeled Confidence Stats)
+dataset=/home/hm25936/datasets_for_yolo/soho
+conf=0.250 iou=0.450
+eval_images=500  hist_bins=30
+
+[baseline]
+  images:              500
+  det_rate (max_conf>0): 43.4%
+  mean dets/image:     0.510
+  max_conf mean/med:   0.216 / 0.000
+  max_conf p90/p99:    0.646 / 0.785
+  hist:               hist_maxconf_baseline.png
+
+[fda]
+  images:              500
+  det_rate (max_conf>0): 16.4%
+  mean dets/image:     0.196
+  max_conf mean/med:   0.087 / 0.000
+  max_conf p90/p99:    0.440 / 0.819
+  hist:               hist_maxconf_fda.png
+
+[fda_mix]
+  images:              500
+  det_rate (max_conf>0): 35.4%
+  mean dets/image:     0.440
+  max_conf mean/med:   0.202 / 0.000
+  max_conf p90/p99:    0.687 / 0.900
+  hist:               hist_maxconf_fda_mix.png

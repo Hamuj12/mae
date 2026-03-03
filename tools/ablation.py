@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-from PIL import Image  # noqa: E402
+from PIL import Image  # noqa: E402cd
 from torchvision import transforms  # noqa: E402
 
 from dual_yolo_mae import utils  # noqa: E402
@@ -561,3 +561,21 @@ if __name__ == "__main__":
 #   --fda /home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
 #   --n 15 --output /home/hm25936/mae/ablation_results_fda --device cuda:0
+
+# PYTHONPATH=. python tools/ablation.py \
+#   --baseline /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
+#   --fda /home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
+#   --dataset /home/hm25936/datasets_for_yolo/soho \
+#   --n 15 --output /home/hm25936/mae/ablation_results_fda_real --device cuda:0
+
+# PYTHONPATH=. python tools/ablation.py \
+#   --baseline /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
+#   --fda /home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
+#   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
+#   --n 15 --output /home/hm25936/mae/ablation_results_fda --device cuda:0
+
+# PYTHONPATH=. python tools/ablation.py \
+#   --baseline /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
+#   --fda /home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
+#   --dataset /home/hm25936/datasets_for_yolo/soho \
+#   --n 15 --output /home/hm25936/mae/ablation_results_fda_real --device cuda:0
