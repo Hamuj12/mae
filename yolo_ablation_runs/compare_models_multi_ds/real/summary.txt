@@ -1,0 +1,32 @@
+Dataset: real
+root: /home/hm25936/datasets_for_yolo/soho
+eval_images: 500
+conf_threshold (for det_rate): 0.250
+iou: 0.450
+
+[baseline]
+  det_rate@conf:       43.4%  (217/500)
+  top1_conf mean/med:  0.270 / 0.205
+  top1_conf std:       0.236
+  top1_conf p90/p99:   0.647 / 0.775
+  mean ± 2σ:           [-0.201, 0.741]
+  mean ± 3σ:           [-0.436, 0.977]
+  hist:                hist_top1conf_baseline.png
+
+[fda]
+  det_rate@conf:       17.2%  (86/500)
+  top1_conf mean/med:  0.118 / 0.018
+  top1_conf std:       0.197
+  top1_conf p90/p99:   0.427 / 0.817
+  mean ± 2σ:           [-0.275, 0.511]
+  mean ± 3σ:           [-0.472, 0.708]
+  hist:                hist_top1conf_fda.png
+
+[fda_mix]
+  det_rate@conf:       39.2%  (196/500)
+  top1_conf mean/med:  0.254 / 0.106
+  top1_conf std:       0.285
+  top1_conf p90/p99:   0.714 / 0.895
+  mean ± 2σ:           [-0.317, 0.825]
+  mean ± 3σ:           [-0.602, 1.111]
+  hist:                hist_top1conf_fda_mix.png

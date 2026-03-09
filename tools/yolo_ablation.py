@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 """
-YOLO-only ablation script:
-- Compare N YOLO models passed via repeatable --model name=path
-- Create dynamic side-by-side visualization grids (Input + N model panels)
-- Compute unlabeled confidence stats over a configurable number of images
-- Save a confidence histogram per model + summary.txt
+YOLO-only ablation script (multi-model, multi-dataset):
 
-Usage:
-  PYTHONPATH=. python tools/ablation.py \
+- Compare N YOLO models passed via repeatable --model name=path
+- Evaluate M YOLO-root datasets passed via repeatable --dataset name=path
+- Dynamic side-by-side visualization grids: Input + one panel per model
+- Unlabeled confidence stats using TOP-1 detection only:
+    * top1_det_rate@conf  (fraction of images with top1_conf >= conf_threshold)
+    * top1_conf mean/median/p90/p99/std
+    * mean ± 2σ and mean ± 3σ (simple spread summary)
+- Histogram of top1_conf per model per dataset
+- summary.txt written per dataset + a global summary.txt
+
+Optional (for later):
+- If you provide --neg-dataset name=path (background-only frames), the script will
+  also compute "FP proxy rate" as fraction of negatives with top1_conf >= conf.
+
+All datasets are assumed to be YOLO-root style with images/test.
+
+Example:
+  PYTHONPATH=. python tools/yolo_ablation.py \
     --model baseline=/path/best.pt \
     --model fda=/path/fda.pt \
     --model fda_mix=/path/fda_mix.pt \
-    --dataset /path/to/yolo_dataset_root \
+    --dataset lab=/path/to/lab_yolo_root \
+    --dataset real=/path/to/real_yolo_root \
     --output /path/to/outdir \
     --device cuda:0 \
     --conf 0.25 \
@@ -27,7 +40,7 @@ import argparse
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import matplotlib
 
@@ -60,64 +73,88 @@ class ModelSpec:
     path: Path
 
 
-def parse_model_specs(specs: List[str]) -> List[ModelSpec]:
+@dataclass(frozen=True)
+class DatasetSpec:
+    name: str
+    root: Path
+
+
+def _parse_named_path_specs(specs: List[str], flag_name: str) -> List[Tuple[str, Path]]:
     """
-    Parse repeated --model entries of the form:
-      name=/path/to/weights.pt
+    Parse repeated args of the form:
+      name=/path/to/thing
     """
-    out: List[ModelSpec] = []
+    out: List[Tuple[str, Path]] = []
     seen = set()
     for s in specs:
         if "=" not in s:
-            raise ValueError(f"Bad --model '{s}'. Expected name=/path/to/weights.pt")
+            raise ValueError(f"Bad {flag_name} '{s}'. Expected name=/path")
         name, p = s.split("=", 1)
         name = name.strip()
         if not name:
-            raise ValueError(f"Bad --model '{s}': empty name")
+            raise ValueError(f"Bad {flag_name} '{s}': empty name")
         if name in seen:
-            raise ValueError(f"Duplicate model name '{name}'. Names must be unique.")
+            raise ValueError(f"Duplicate name '{name}' in {flag_name}. Names must be unique.")
         path = Path(p).expanduser()
         if not path.exists():
-            raise FileNotFoundError(f"Model path does not exist for '{name}': {path}")
-        out.append(ModelSpec(name=name, path=path))
+            raise FileNotFoundError(f"{flag_name} path does not exist for '{name}': {path}")
+        out.append((name, path))
         seen.add(name)
-    if not out:
-        raise ValueError("At least one --model must be provided.")
     return out
 
 
+def parse_model_specs(specs: List[str]) -> List[ModelSpec]:
+    pairs = _parse_named_path_specs(specs, "--model")
+    if not pairs:
+        raise ValueError("At least one --model must be provided.")
+    return [ModelSpec(name=n, path=p) for n, p in pairs]
+
+
+def parse_dataset_specs(specs: List[str], flag: str) -> List[DatasetSpec]:
+    pairs = _parse_named_path_specs(specs, flag)
+    if not pairs:
+        raise ValueError(f"At least one {flag} must be provided.")
+    return [DatasetSpec(name=n, root=p) for n, p in pairs]
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare multiple YOLO models with unlabeled confidence stats.")
+    parser = argparse.ArgumentParser(description="Compare multiple YOLO models over multiple datasets (unlabeled stats).")
     parser.add_argument(
         "--model",
         action="append",
         required=True,
-        help="Repeatable. Model spec: name=/path/to/weights.pt (e.g., --model baseline=... --model fda=...)",
+        help="Repeatable. Model spec: name=/path/to/weights.pt",
     )
-    parser.add_argument("--dataset", type=str, required=True, help="Root of YOLO-format dataset")
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        required=True,
+        help="Repeatable. Dataset spec: name=/path/to/yolo_root (expects images/test)",
+    )
+    parser.add_argument(
+        "--neg-dataset",
+        action="append",
+        default=None,
+        help="Optional repeatable. Negative/background-only dataset spec: name=/path/to/yolo_root (expects images/test)",
+    )
     parser.add_argument("--output", type=str, default="ablation_outputs", help="Directory to store results")
-    parser.add_argument("--n", type=int, default=8, help="Number of random test images for visualization plots")
+    parser.add_argument("--n", type=int, default=8, help="Number of random test images per dataset for visualization")
     parser.add_argument(
         "--eval-images",
         type=int,
         default=500,
-        help="Number of images to use for confidence statistics (unlabeled eval)",
+        help="Number of images per dataset used for confidence statistics",
     )
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold for predictions")
     parser.add_argument("--iou", type=float, default=0.45, help="IoU threshold for NMS")
-    parser.add_argument("--hist-bins", type=int, default=30, help="Histogram bins for max_conf distribution")
+    parser.add_argument("--hist-bins", type=int, default=30, help="Histogram bins for top1_conf distribution")
     parser.add_argument(
         "--device",
         type=str,
         default=None,
         help="Execution device (e.g. 'cuda:0', 'cpu', or leave unset for auto)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="RNG seed for choosing sample/eval images",
-    )
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed for choosing sample/eval images")
     return parser.parse_args()
 
 
@@ -177,52 +214,50 @@ def predict_yolo(
         return []
 
     xyxy = boxes.xyxy.cpu().numpy()
-    xywhn = boxes.xywhn.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
-    classes = boxes.cls.cpu().numpy().astype(int)
 
     preds: List[Dict] = []
-    for i in range(len(classes)):
-        preds.append(
-            {
-                "label": int(classes[i]),
-                "score": float(confs[i]),
-                "xyxy": xyxy[i].tolist(),
-                "xywh": np.clip(xywhn[i], 0.0, 1.0).tolist(),
-            }
-        )
+    for i in range(len(confs)):
+        preds.append({"score": float(confs[i]), "xyxy": xyxy[i].tolist()})
     return preds
+
+
+def top1_detection(preds: List[Dict]) -> Optional[Dict]:
+    if not preds:
+        return None
+    return max(preds, key=lambda d: float(d["score"]))
 
 
 # -----------------------------
 # Visualization
 # -----------------------------
-def draw_detections(ax, image_array: np.ndarray, detections: List[Dict], title: str) -> None:
+def draw_top1(ax, image_array: np.ndarray, top1: Optional[Dict], title: str) -> None:
     ax.imshow(image_array)
     ax.set_title(title)
     ax.axis("off")
-    for det in detections:
-        x1, y1, x2, y2 = det["xyxy"]
-        rect = Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2, edgecolor="lime", facecolor="none")
-        ax.add_patch(rect)
-        ax.text(
-            x1,
-            max(y1 - 5, 0),
-            f"{det['score']:.2f}",
-            fontsize=9,
-            color="white",
-            bbox=dict(facecolor="black", alpha=0.6, pad=2),
-        )
+    if top1 is None:
+        return
+    x1, y1, x2, y2 = top1["xyxy"]
+    rect = Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2, edgecolor="lime", facecolor="none")
+    ax.add_patch(rect)
+    ax.text(
+        x1,
+        max(y1 - 5, 0),
+        f"{top1['score']:.2f}",
+        fontsize=9,
+        color="white",
+        bbox=dict(facecolor="black", alpha=0.6, pad=2),
+    )
 
 
 def create_comparison_plot(
     image_path: Path,
     image_array: np.ndarray,
-    per_model_preds: List[Tuple[str, List[Dict]]],
+    per_model_top1: List[Tuple[str, Optional[Dict]]],
     output_dir: Path,
 ) -> None:
     # columns: Input + one per model
-    ncols = 1 + len(per_model_preds)
+    ncols = 1 + len(per_model_top1)
     fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 6))
     if ncols == 1:
         axes = [axes]
@@ -231,8 +266,8 @@ def create_comparison_plot(
     axes[0].set_title("Input")
     axes[0].axis("off")
 
-    for idx, (name, preds) in enumerate(per_model_preds, start=1):
-        draw_detections(axes[idx], image_array, preds, title=name)
+    for idx, (name, top1) in enumerate(per_model_top1, start=1):
+        draw_top1(axes[idx], image_array, top1, title=name)
 
     fig.tight_layout()
     save_path = output_dir / f"{image_path.stem}_comparison.png"
@@ -242,64 +277,75 @@ def create_comparison_plot(
 
 
 # -----------------------------
-# Unlabeled confidence stats
+# Confidence stats (unlabeled)
 # -----------------------------
 @dataclass
 class ConfStats:
     n_images: int
-    n_with_det: int
-    mean_dets_per_image: float
-    mean_max_conf: float
-    median_max_conf: float
-    p90_max_conf: float
-    p99_max_conf: float
+    n_top1_ge_conf: int
+    det_rate_at_conf: float
+    mean_top1_conf: float
+    median_top1_conf: float
+    std_top1_conf: float
+    p90_top1_conf: float
+    p99_top1_conf: float
+    mean_minus_2sigma: float
+    mean_plus_2sigma: float
+    mean_minus_3sigma: float
+    mean_plus_3sigma: float
 
 
-def compute_conf_stats(
+def compute_conf_stats_top1(
     model: YOLO,
     image_paths: Sequence[Path],
-    conf: float,
+    conf_threshold: float,
     iou: float,
     device_str: str,
-) -> Tuple[ConfStats, List[float], List[int]]:
+) -> Tuple[ConfStats, List[float]]:
     """
-    Returns:
-      - summary stats
-      - list of max_conf per image (0.0 if no dets)
-      - list of det_count per image
+    Computes TOP-1 confidence stats.
+    For each image:
+      - top1_conf = max detection confidence, or 0.0 if no detections
+    Then:
+      - det_rate_at_conf = fraction with top1_conf >= conf_threshold
     """
-    max_confs: List[float] = []
-    det_counts: List[int] = []
+    top1_confs: List[float] = []
 
     for p in image_paths:
-        preds = predict_yolo(model, p, conf=conf, iou=iou, device_str=device_str)
-        if preds:
-            scores = [d["score"] for d in preds]
-            max_confs.append(float(max(scores)))
-            det_counts.append(len(preds))
-        else:
-            max_confs.append(0.0)
-            det_counts.append(0)
+        preds = predict_yolo(model, p, conf=0.001, iou=iou, device_str=device_str)
+        # ^ Use a tiny conf here so we can compute top1_conf meaningfully; thresholding is applied later.
+        #   This avoids "conf" changing the distribution by truncation.
+        t1 = top1_detection(preds)
+        top1_confs.append(float(t1["score"]) if t1 is not None else 0.0)
 
-    arr = np.array(max_confs, dtype=np.float32)
-    n_with_det = int(np.sum(arr > 0.0))
+    arr = np.array(top1_confs, dtype=np.float32)
+    n = int(arr.size)
+    n_ge = int(np.sum(arr >= float(conf_threshold)))
+    mean_v = float(np.mean(arr)) if n else float("nan")
+    std_v = float(np.std(arr)) if n else float("nan")
+
     stats = ConfStats(
-        n_images=len(image_paths),
-        n_with_det=n_with_det,
-        mean_dets_per_image=float(np.mean(det_counts)),
-        mean_max_conf=float(np.mean(arr)),
-        median_max_conf=float(np.median(arr)),
-        p90_max_conf=float(np.percentile(arr, 90)),
-        p99_max_conf=float(np.percentile(arr, 99)),
+        n_images=n,
+        n_top1_ge_conf=n_ge,
+        det_rate_at_conf=(n_ge / n) if n else float("nan"),
+        mean_top1_conf=mean_v,
+        median_top1_conf=float(np.median(arr)) if n else float("nan"),
+        std_top1_conf=std_v,
+        p90_top1_conf=float(np.percentile(arr, 90)) if n else float("nan"),
+        p99_top1_conf=float(np.percentile(arr, 99)) if n else float("nan"),
+        mean_minus_2sigma=mean_v - 2.0 * std_v if n else float("nan"),
+        mean_plus_2sigma=mean_v + 2.0 * std_v if n else float("nan"),
+        mean_minus_3sigma=mean_v - 3.0 * std_v if n else float("nan"),
+        mean_plus_3sigma=mean_v + 3.0 * std_v if n else float("nan"),
     )
-    return stats, max_confs, det_counts
+    return stats, top1_confs
 
 
 def save_histogram(values: List[float], bins: int, title: str, out_path: Path) -> None:
     fig = plt.figure(figsize=(8, 5))
     plt.hist(values, bins=bins)
     plt.title(title)
-    plt.xlabel("max_conf per image")
+    plt.xlabel("top1_conf per image")
     plt.ylabel("count")
     plt.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -313,117 +359,172 @@ def main() -> None:
     args = parse_args()
     utils.setup_logging()
 
-    dataset_root = Path(args.dataset)
-    output_dir = utils.ensure_dir(args.output)
-
+    output_root = utils.ensure_dir(args.output)
     device, device_str = resolve_device(args.device)
     utils.LOGGER.info("Device: %s (%s)", device, device_str)
-    utils.LOGGER.info("Dataset root: %s", dataset_root)
-    utils.LOGGER.info("Output dir: %s", output_dir)
-    utils.LOGGER.info("conf=%.3f iou=%.3f", float(args.conf), float(args.iou))
 
     model_specs = parse_model_specs(args.model)
-
-    # Load images once
-    all_images = gather_images(dataset_root)
+    dataset_specs = parse_dataset_specs(args.dataset, "--dataset")
+    neg_dataset_specs = parse_dataset_specs(args.neg_dataset, "--neg-dataset") if args.neg_dataset else []
 
     rng = random.Random(int(args.seed))
-    n_vis = min(int(args.n), len(all_images))
-    n_eval = min(int(args.eval_images), len(all_images))
 
-    vis_images = rng.sample(all_images, n_vis) if n_vis > 0 else []
-    eval_images = rng.sample(all_images, n_eval) if n_eval > 0 else []
-
-    utils.LOGGER.info("Loaded %d models", len(model_specs))
-    utils.LOGGER.info("Visualization images: %d | Eval images: %d", len(vis_images), len(eval_images))
-
-    # Load YOLO models
+    # Load YOLO models once
     models: List[Tuple[str, YOLO]] = []
     for spec in model_specs:
         utils.LOGGER.info("Loading model '%s' from %s", spec.name, spec.path)
-        m = YOLO(str(spec.path))
-        models.append((spec.name, m))
+        models.append((spec.name, YOLO(str(spec.path))))
 
-    # ----------------------
-    # Visualization
-    # ----------------------
-    if vis_images:
-        utils.LOGGER.info("Generating dynamic comparison plots...")
-        for image_path in vis_images:
-            with Image.open(image_path) as img:
-                pil_image = img.convert("RGB")
-            image_array = np.array(pil_image)
+    global_lines: List[str] = []
+    global_lines.append("YOLO Ablation (Top-1 Confidence Stats)")
+    global_lines.append(f"device={device_str}")
+    global_lines.append(f"conf_threshold={float(args.conf):.3f} iou={float(args.iou):.3f}")
+    global_lines.append(f"n_vis_per_dataset={int(args.n)} eval_images_per_dataset={int(args.eval_images)} bins={int(args.hist_bins)}")
+    global_lines.append("")
+    global_lines.append("Datasets:")
+    for ds in dataset_specs:
+        global_lines.append(f"  - {ds.name}: {ds.root}")
+    if neg_dataset_specs:
+        global_lines.append("Negative datasets:")
+        for ds in neg_dataset_specs:
+            global_lines.append(f"  - {ds.name}: {ds.root}")
+    global_lines.append("")
 
-            per_model_preds: List[Tuple[str, List[Dict]]] = []
-            for name, m in models:
-                preds = predict_yolo(m, image_path, conf=float(args.conf), iou=float(args.iou), device_str=device_str)
-                per_model_preds.append((name, preds))
+    # Evaluate each dataset independently; write outputs under output_root/<dataset_name>/
+    for ds in dataset_specs:
+        ds_out = output_root / ds.name
+        ds_out.mkdir(parents=True, exist_ok=True)
 
-            create_comparison_plot(
-                image_path=image_path,
-                image_array=image_array,
-                per_model_preds=per_model_preds,
-                output_dir=output_dir,
+        utils.LOGGER.info("==== Dataset: %s (%s) ====", ds.name, ds.root)
+        all_images = gather_images(ds.root)
+        n_vis = min(int(args.n), len(all_images))
+        n_eval = min(int(args.eval_images), len(all_images))
+
+        vis_images = rng.sample(all_images, n_vis) if n_vis > 0 else []
+        eval_images = rng.sample(all_images, n_eval) if n_eval > 0 else []
+
+        # --- Visualization
+        if vis_images:
+            utils.LOGGER.info("Generating comparison plots for dataset '%s' (n=%d)", ds.name, len(vis_images))
+            for image_path in vis_images:
+                with Image.open(image_path) as img:
+                    pil = img.convert("RGB")
+                image_array = np.array(pil)
+
+                per_model_top1: List[Tuple[str, Optional[Dict]]] = []
+                for name, m in models:
+                    preds = predict_yolo(m, image_path, conf=0.001, iou=float(args.iou), device_str=device_str)
+                    per_model_top1.append((name, top1_detection(preds)))
+
+                create_comparison_plot(image_path, image_array, per_model_top1, output_dir=ds_out)
+                pil.close()
+
+        # --- Stats + histograms
+        ds_lines: List[str] = []
+        ds_lines.append(f"Dataset: {ds.name}")
+        ds_lines.append(f"root: {ds.root}")
+        ds_lines.append(f"eval_images: {len(eval_images)}")
+        ds_lines.append(f"conf_threshold (for det_rate): {float(args.conf):.3f}")
+        ds_lines.append(f"iou: {float(args.iou):.3f}")
+        ds_lines.append("")
+
+        for name, m in models:
+            stats, top1_confs = compute_conf_stats_top1(
+                m,
+                eval_images,
+                conf_threshold=float(args.conf),
+                iou=float(args.iou),
+                device_str=device_str,
             )
-            pil_image.close()
 
-    # ----------------------
-    # Unlabeled confidence stats
-    # ----------------------
-    summary_lines: List[str] = []
-    summary_lines.append("YOLO Ablation (Unlabeled Confidence Stats)")
-    summary_lines.append(f"dataset={dataset_root}")
-    summary_lines.append(f"conf={float(args.conf):.3f} iou={float(args.iou):.3f}")
-    summary_lines.append(f"eval_images={len(eval_images)}  hist_bins={int(args.hist_bins)}")
-    summary_lines.append("")
+            hist_path = ds_out / f"hist_top1conf_{name}.png"
+            save_histogram(
+                top1_confs,
+                bins=int(args.hist_bins),
+                title=f"top1_conf distribution ({name}) — {ds.name}",
+                out_path=hist_path,
+            )
 
-    utils.LOGGER.info("Computing confidence stats (unlabeled)...")
-    for name, m in models:
-        stats, max_confs, det_counts = compute_conf_stats(
-            m,
-            eval_images,
-            conf=float(args.conf),
-            iou=float(args.iou),
-            device_str=device_str,
-        )
+            block = [
+                f"[{name}]",
+                f"  det_rate@conf:       {100.0 * stats.det_rate_at_conf:.1f}%  ({stats.n_top1_ge_conf}/{stats.n_images})",
+                f"  top1_conf mean/med:  {stats.mean_top1_conf:.3f} / {stats.median_top1_conf:.3f}",
+                f"  top1_conf std:       {stats.std_top1_conf:.3f}",
+                f"  top1_conf p90/p99:   {stats.p90_top1_conf:.3f} / {stats.p99_top1_conf:.3f}",
+                f"  mean ± 2σ:           [{stats.mean_minus_2sigma:.3f}, {stats.mean_plus_2sigma:.3f}]",
+                f"  mean ± 3σ:           [{stats.mean_minus_3sigma:.3f}, {stats.mean_plus_3sigma:.3f}]",
+                f"  hist:                {hist_path.name}",
+                "",
+            ]
+            ds_lines.extend(block)
 
-        # Save per-model histogram of max_conf
-        hist_path = output_dir / f"hist_maxconf_{name}.png"
-        save_histogram(
-            max_confs,
-            bins=int(args.hist_bins),
-            title=f"max_conf distribution ({name})",
-            out_path=hist_path,
-        )
+        ds_summary_path = ds_out / "summary.txt"
+        ds_summary_path.write_text("\n".join(ds_lines), encoding="utf-8")
+        utils.LOGGER.info("Wrote dataset summary to %s", ds_summary_path)
 
-        # Save quick text block
-        det_rate = 100.0 * stats.n_with_det / max(1, stats.n_images)
-        block = [
-            f"[{name}]",
-            f"  images:              {stats.n_images}",
-            f"  det_rate (max_conf>0): {det_rate:.1f}%",
-            f"  mean dets/image:     {stats.mean_dets_per_image:.3f}",
-            f"  max_conf mean/med:   {stats.mean_max_conf:.3f} / {stats.median_max_conf:.3f}",
-            f"  max_conf p90/p99:    {stats.p90_max_conf:.3f} / {stats.p99_max_conf:.3f}",
-            f"  hist:               {hist_path.name}",
-            "",
-        ]
-        summary_lines.extend(block)
+        # Append to global summary
+        global_lines.append(f"==== {ds.name} ====")
+        global_lines.extend(ds_lines[4:])  # skip repeated header lines for brevity
 
-        utils.LOGGER.info(
-            "%s | det_rate=%.1f%% mean_max=%.3f med_max=%.3f p90=%.3f p99=%.3f",
-            name,
-            det_rate,
-            stats.mean_max_conf,
-            stats.median_max_conf,
-            stats.p90_max_conf,
-            stats.p99_max_conf,
-        )
+    # Optional negative datasets: compute FP proxy rate per model
+    if neg_dataset_specs:
+        global_lines.append("")
+        global_lines.append("==== Negative datasets (FP proxy rates) ====")
+        global_lines.append("Interpretation: fraction of negative images with top1_conf >= conf_threshold")
+        global_lines.append("")
 
-    summary_path = output_dir / "summary.txt"
-    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
-    utils.LOGGER.info("Wrote summary to %s", summary_path)
+        for nds in neg_dataset_specs:
+            nds_out = output_root / f"neg_{nds.name}"
+            nds_out.mkdir(parents=True, exist_ok=True)
 
+            utils.LOGGER.info("==== Negative Dataset: %s (%s) ====", nds.name, nds.root)
+            all_images = gather_images(nds.root)
+            n_eval = min(int(args.eval_images), len(all_images))
+            eval_images = rng.sample(all_images, n_eval) if n_eval > 0 else []
+
+            neg_lines: List[str] = []
+            neg_lines.append(f"Negative dataset: {nds.name}")
+            neg_lines.append(f"root: {nds.root}")
+            neg_lines.append(f"eval_images: {len(eval_images)}")
+            neg_lines.append(f"conf_threshold: {float(args.conf):.3f}")
+            neg_lines.append("")
+
+            for name, m in models:
+                stats, top1_confs = compute_conf_stats_top1(
+                    m,
+                    eval_images,
+                    conf_threshold=float(args.conf),
+                    iou=float(args.iou),
+                    device_str=device_str,
+                )
+                fp_rate = stats.det_rate_at_conf  # on negatives, det_rate is FP proxy
+
+                hist_path = nds_out / f"hist_top1conf_{name}.png"
+                save_histogram(
+                    top1_confs,
+                    bins=int(args.hist_bins),
+                    title=f"top1_conf distribution ({name}) — NEG:{nds.name}",
+                    out_path=hist_path,
+                )
+
+                neg_lines.extend(
+                    [
+                        f"[{name}]",
+                        f"  FP_proxy_rate@conf:  {100.0 * fp_rate:.1f}%  ({stats.n_top1_ge_conf}/{stats.n_images})",
+                        f"  top1_conf mean/med:  {stats.mean_top1_conf:.3f} / {stats.median_top1_conf:.3f}",
+                        f"  top1_conf p90/p99:   {stats.p90_top1_conf:.3f} / {stats.p99_top1_conf:.3f}",
+                        f"  hist:                {hist_path.name}",
+                        "",
+                    ]
+                )
+
+            (nds_out / "summary.txt").write_text("\n".join(neg_lines), encoding="utf-8")
+            global_lines.append(f"---- NEG:{nds.name} ----")
+            global_lines.extend(neg_lines[5:])
+
+    global_summary = output_root / "summary.txt"
+    global_summary.write_text("\n".join(global_lines), encoding="utf-8")
+    utils.LOGGER.info("Wrote global summary to %s", global_summary)
     utils.LOGGER.info("Done.")
 
 
@@ -435,20 +536,15 @@ if __name__ == "__main__":
 #   --model baseline=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --model fda=/home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
 #   --model fda_mix=/home/hm25936/mae/runs/yolov8_fda_mix/baseline/weights/best.pt \
-#   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
+#   --dataset lab=/home/hm25936/datasets_for_yolo/lab_images_6000 \
+#   --dataset real=/home/hm25936/datasets_for_yolo/soho \
+#   --output /home/hm25936/mae/yolo_ablation_runs/compare_models_multi_ds \
+#   --device cuda:0 \
+#   --conf 0.25 \
+#   --iou 0.45 \
 #   --n 12 \
 #   --eval-images 500 \
-#   --hist-bins 30 \
-#   --output /home/hm25936/mae/yolo_ablation_runs/fda_mix_resize_100e_lab \
-#   --device cuda:0
-
-# PYTHONPATH=. python tools/yolo_ablation.py \
-#   --model baseline=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
-#   --model fda=/home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
-#   --model fda_mix=/home/hm25936/mae/runs/yolov8_fda_mix/baseline/weights/best.pt \
-#   --dataset /home/hm25936/datasets_for_yolo/soho \
-#   --n 12 \
-#   --eval-images 500 \
-#   --hist-bins 30 \
-#   --output /home/hm25936/mae/yolo_ablation_runs/fda_mix_resize_100e_real \
-#   --device cuda:0
+#   --hist-bins 30
+#
+# Optional negatives later:
+#   --neg-dataset empty=/home/.../empty_frames_yolo_root

@@ -1,0 +1,68 @@
+YOLO Ablation (Top-1 Confidence Stats)
+device=cuda:0
+conf_threshold=0.250 iou=0.450
+n_vis_per_dataset=12 eval_images_per_dataset=500 bins=30
+
+Datasets:
+  - lab: /home/hm25936/datasets_for_yolo/lab_images_6000
+  - real: /home/hm25936/datasets_for_yolo/soho
+
+==== lab ====
+iou: 0.450
+
+[baseline]
+  det_rate@conf:       88.0%  (440/500)
+  top1_conf mean/med:  0.608 / 0.682
+  top1_conf std:       0.239
+  top1_conf p90/p99:   0.861 / 0.908
+  mean ± 2σ:           [0.129, 1.087]
+  mean ± 3σ:           [-0.110, 1.326]
+  hist:                hist_top1conf_baseline.png
+
+[fda]
+  det_rate@conf:       95.0%  (475/500)
+  top1_conf mean/med:  0.732 / 0.819
+  top1_conf std:       0.217
+  top1_conf p90/p99:   0.921 / 0.954
+  mean ± 2σ:           [0.299, 1.166]
+  mean ± 3σ:           [0.082, 1.383]
+  hist:                hist_top1conf_fda.png
+
+[fda_mix]
+  det_rate@conf:       98.6%  (493/500)
+  top1_conf mean/med:  0.768 / 0.820
+  top1_conf std:       0.169
+  top1_conf p90/p99:   0.921 / 0.950
+  mean ± 2σ:           [0.431, 1.105]
+  mean ± 3σ:           [0.262, 1.274]
+  hist:                hist_top1conf_fda_mix.png
+
+==== real ====
+iou: 0.450
+
+[baseline]
+  det_rate@conf:       43.4%  (217/500)
+  top1_conf mean/med:  0.270 / 0.205
+  top1_conf std:       0.236
+  top1_conf p90/p99:   0.647 / 0.775
+  mean ± 2σ:           [-0.201, 0.741]
+  mean ± 3σ:           [-0.436, 0.977]
+  hist:                hist_top1conf_baseline.png
+
+[fda]
+  det_rate@conf:       17.2%  (86/500)
+  top1_conf mean/med:  0.118 / 0.018
+  top1_conf std:       0.197
+  top1_conf p90/p99:   0.427 / 0.817
+  mean ± 2σ:           [-0.275, 0.511]
+  mean ± 3σ:           [-0.472, 0.708]
+  hist:                hist_top1conf_fda.png
+
+[fda_mix]
+  det_rate@conf:       39.2%  (196/500)
+  top1_conf mean/med:  0.254 / 0.106
+  top1_conf std:       0.285
+  top1_conf p90/p99:   0.714 / 0.895
+  mean ± 2σ:           [-0.317, 0.825]
+  mean ± 3σ:           [-0.602, 1.111]
+  hist:                hist_top1conf_fda_mix.png
