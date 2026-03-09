@@ -90,6 +90,8 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError("Please install ultralytics: pip install ultralytics") from exc
 
+from types import SimpleNamespace
+
 # Loss import varies by ultralytics version
 LOSS_IMPORT_ERROR = None
 LossClass = None
@@ -354,7 +356,7 @@ def strong_augment(img_rgb: Image.Image, rng: random.Random) -> Image.Image:
         arr += np.random.normal(0.0, sigma, size=arr.shape).astype(np.float32)
         arr = np.clip(arr, 0.0, 255.0)
 
-    return Image.fromarray(arr.astype(np.uint8), mode="RGB")
+    return Image.fromarray(arr.astype(np.uint8))
 
 
 def xyxy_original_to_norm_xywh_letterboxed(
@@ -636,6 +638,21 @@ def main() -> None:
         weight_decay=float(args.weight_decay),
     )
 
+    # Ultralytics loss expects model.args / criterion.hyp to have attribute access
+    # and to contain at least box / cls / dfl gains.
+    if isinstance(student_model.args, dict):
+        hyp_dict = dict(student_model.args)
+    elif isinstance(student_model.args, SimpleNamespace):
+        hyp_dict = vars(student_model.args).copy()
+    else:
+        hyp_dict = vars(student_model.args).copy() if hasattr(student_model.args, "__dict__") else {}
+
+    # Set safe defaults if missing
+    hyp_dict.setdefault("box", 7.5)
+    hyp_dict.setdefault("cls", 0.5)
+    hyp_dict.setdefault("dfl", 1.5)
+
+    student_model.args = SimpleNamespace(**hyp_dict)
     criterion = LossClass(student_model)
 
     # Warmup
@@ -723,6 +740,10 @@ def main() -> None:
         loss_dfl = float("nan")
 
         if pseudo_accepted and teacher_top1 is not None:
+            # Ultralytics predict() can force model params to requires_grad=False.
+            # Re-apply head-only trainability before each adaptation step.
+            freeze_for_head_only(student_model)
+
             # Strong appearance-only augmentation on original image
             student_aug_rgb = strong_augment(img_rgb, rng)
             letterboxed, gain, pad_left, pad_top = letterbox_image(student_aug_rgb, int(args.imgsz))
@@ -746,20 +767,73 @@ def main() -> None:
                 "bboxes": torch.tensor([[x_c, y_c, bw, bh]], dtype=torch.float32, device=args.device),
             }
 
-            student_model.train()
-            optimizer.zero_grad(set_to_none=True)
-            preds = student_model(img_tensor)
-            loss, loss_items = criterion(preds, batch)
-            loss.backward()
+            # IMPORTANT: explicitly re-enable grad mode after Ultralytics predict()
+            with torch.inference_mode(False):
+                with torch.enable_grad():
+                    student_model.train()
+                    optimizer.zero_grad(set_to_none=True)
 
-            if float(args.grad_clip) > 0:
-                torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+                    preds = student_model(img_tensor)
 
-            optimizer.step()
+                    # helpful one-time debug if needed
+                    # print("grad enabled:", torch.is_grad_enabled())
+                    # print("student training:", student_model.training)
+                    # if isinstance(preds, (list, tuple)):
+                    #     print("pred types:", [type(p) for p in preds])
+                    #     for i, p in enumerate(preds):
+                    #         if isinstance(p, torch.Tensor):
+                    #             print(f"pred[{i}].requires_grad =", p.requires_grad)
+
+                    def unpack_loss_pair(loss_out_obj):
+                        if not (isinstance(loss_out_obj, (list, tuple)) and len(loss_out_obj) == 2):
+                            raise RuntimeError(f"Unexpected loss output type: {type(loss_out_obj)}")
+                        x, y = loss_out_obj
+                        x_ok = isinstance(x, torch.Tensor) and (x.requires_grad or x.grad_fn is not None)
+                        y_ok = isinstance(y, torch.Tensor) and (y.requires_grad or y.grad_fn is not None)
+                        if x_ok:
+                            return x, y
+                        if y_ok:
+                            return y, x
+                        return None, None
+
+                    # Prefer model-native loss API when available (more version-robust).
+                    if hasattr(student_model, "loss"):
+                        loss_out = student_model.loss(batch, preds=preds)
+                    else:
+                        loss_out = criterion(preds, batch)
+
+                    loss, loss_items = unpack_loss_pair(loss_out)
+
+                    # Fallback: some Ultralytics versions return detached tensors for the direct criterion path.
+                    if loss is None and hasattr(student_model, "loss"):
+                        loss_out = student_model.loss(batch)
+                        loss, loss_items = unpack_loss_pair(loss_out)
+
+                    if loss is None:
+                        if isinstance(loss_out, (list, tuple)) and len(loss_out) == 2:
+                            a, b = loss_out
+                            raise RuntimeError(
+                                "Loss outputs are both detached. "
+                                f"a.requires_grad={getattr(a, 'requires_grad', None)}, "
+                                f"b.requires_grad={getattr(b, 'requires_grad', None)}"
+                            )
+                        raise RuntimeError(f"Unexpected loss output type: {type(loss_out)}")
+
+                    # Some Ultralytics versions return a vector [box, cls, dfl].
+                    # Backprop requires a scalar.
+                    loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
+                    loss_scalar.backward()
+
+                    if float(args.grad_clip) > 0:
+                        torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+
+                    optimizer.step()
+
+            # teacher follows student after successful update
             update_teacher_ema(teacher_model, student_model, decay=float(args.ema_decay))
             update_applied = True
 
-            loss_total = float(loss.detach().cpu())
+            loss_total = float(loss_scalar.detach().cpu())
             loss_dict = safe_loss_items_to_dict(loss_items)
             loss_box = loss_dict["box"]
             loss_cls = loss_dict["cls"]

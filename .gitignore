@@ -7,3 +7,4 @@ runs/
 wandb/
 output_dir/
 odad/baseline_stream_test/
+odad/online_adapt_lab/adapt_overlay.mp4

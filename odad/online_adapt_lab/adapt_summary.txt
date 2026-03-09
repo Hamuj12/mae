@@ -1,0 +1,24 @@
+Online Adaptation Summary (Phase-1)
+weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+frames=6735
+imgsz=1024
+teacher_conf_thresh=0.700
+infer_conf=0.001
+iou=0.450
+lr=1.00e-04
+ema_decay=0.999000
+
+pseudo accepted: 1414/6735 (21.0%)
+updates applied: 1414/6735 (21.0%)
+mean teacher conf:       0.534
+mean student post conf:  0.429
+mean adaptation loss:    2.5792
+mean teacher temporal IoU: 0.809
+mean student temporal IoU: 0.796
+
+Outputs:
+  csv: adapt_log.csv
+  plots: plot_teacher_conf.png, plot_student_pre_conf.png, plot_student_post_conf.png, plot_pseudo_accept.png, plot_update_applied.png, plot_update_rate_roll.png, plot_loss_total.png, plot_teacher_iou_prev.png, plot_student_post_iou_prev.png
+  hists: hist_teacher_conf.png, hist_student_post_conf.png, hist_loss_total.png
+  mp4: adapt_overlay.mp4
