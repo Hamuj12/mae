@@ -156,6 +156,9 @@ class AdaptRecord:
     student_post_x2: float
     student_post_y2: float
     student_post_iou_prev: float
+    student_delta_conf: float
+    student_pre_post_iou: float
+    student_pre_post_center_shift: float
 
     pseudo_accepted: int
     update_applied: int
@@ -857,6 +860,19 @@ def main() -> None:
             else float("nan")
         )
 
+        student_pre_conf_val = float(student_pre_top1.conf) if student_pre_top1 is not None else 0.0
+        student_post_conf_val = float(student_post_top1.conf) if student_post_top1 is not None else 0.0
+        student_delta_conf = student_post_conf_val - student_pre_conf_val
+
+        if student_pre_top1 is not None and student_post_top1 is not None:
+            student_pre_post_iou = xyxy_iou(student_pre_top1.xyxy, student_post_top1.xyxy)
+            pre_cx, pre_cy = box_center(student_pre_top1.xyxy)
+            post_cx, post_cy = box_center(student_post_top1.xyxy)
+            student_pre_post_center_shift = math.sqrt((post_cx - pre_cx) ** 2 + (post_cy - pre_cy) ** 2)
+        else:
+            student_pre_post_iou = float("nan")
+            student_pre_post_center_shift = float("nan")
+
         # Log
         records.append(
             AdaptRecord(
@@ -874,7 +890,7 @@ def main() -> None:
                 teacher_iou_prev=float(teacher_iou_prev),
 
                 student_pre_det=int(student_pre_top1 is not None),
-                student_pre_conf=float(student_pre_top1.conf) if student_pre_top1 is not None else 0.0,
+                student_pre_conf=student_pre_conf_val,
                 student_pre_x1=float(student_pre_top1.xyxy[0]) if student_pre_top1 is not None else float("nan"),
                 student_pre_y1=float(student_pre_top1.xyxy[1]) if student_pre_top1 is not None else float("nan"),
                 student_pre_x2=float(student_pre_top1.xyxy[2]) if student_pre_top1 is not None else float("nan"),
@@ -882,12 +898,15 @@ def main() -> None:
                 student_pre_iou_prev=float(student_pre_iou_prev),
 
                 student_post_det=int(student_post_top1 is not None),
-                student_post_conf=float(student_post_top1.conf) if student_post_top1 is not None else 0.0,
+                student_post_conf=student_post_conf_val,
                 student_post_x1=float(student_post_top1.xyxy[0]) if student_post_top1 is not None else float("nan"),
                 student_post_y1=float(student_post_top1.xyxy[1]) if student_post_top1 is not None else float("nan"),
                 student_post_x2=float(student_post_top1.xyxy[2]) if student_post_top1 is not None else float("nan"),
                 student_post_y2=float(student_post_top1.xyxy[3]) if student_post_top1 is not None else float("nan"),
                 student_post_iou_prev=float(student_post_iou_prev),
+                student_delta_conf=float(student_delta_conf),
+                student_pre_post_iou=float(student_pre_post_iou),
+                student_pre_post_center_shift=float(student_pre_post_center_shift),
 
                 pseudo_accepted=int(pseudo_accepted),
                 update_applied=int(update_applied),
@@ -940,6 +959,7 @@ def main() -> None:
                 "teacher_det", "teacher_conf", "teacher_x1", "teacher_y1", "teacher_x2", "teacher_y2", "teacher_iou_prev",
                 "student_pre_det", "student_pre_conf", "student_pre_x1", "student_pre_y1", "student_pre_x2", "student_pre_y2", "student_pre_iou_prev",
                 "student_post_det", "student_post_conf", "student_post_x1", "student_post_y1", "student_post_x2", "student_post_y2", "student_post_iou_prev",
+                "student_delta_conf", "student_pre_post_iou", "student_pre_post_center_shift",
                 "pseudo_accepted", "update_applied",
                 "loss_total", "loss_box", "loss_cls", "loss_dfl",
                 "latency_teacher_ms", "latency_student_pre_ms", "latency_student_post_ms",
@@ -969,6 +989,9 @@ def main() -> None:
                     f"{r.student_post_x2:.3f}" if not math.isnan(r.student_post_x2) else "",
                     f"{r.student_post_y2:.3f}" if not math.isnan(r.student_post_y2) else "",
                     f"{r.student_post_iou_prev:.6f}" if not math.isnan(r.student_post_iou_prev) else "",
+                    f"{r.student_delta_conf:.6f}",
+                    f"{r.student_pre_post_iou:.6f}" if not math.isnan(r.student_pre_post_iou) else "",
+                    f"{r.student_pre_post_center_shift:.6f}" if not math.isnan(r.student_pre_post_center_shift) else "",
 
                     r.pseudo_accepted, r.update_applied,
                     f"{r.loss_total:.6f}" if not math.isnan(r.loss_total) else "",
@@ -992,6 +1015,9 @@ def main() -> None:
     pseudo_accept = np.array([r.pseudo_accepted for r in records], dtype=np.float32)
     teacher_iou_prev = np.array([r.teacher_iou_prev for r in records], dtype=np.float32)
     student_post_iou_prev = np.array([r.student_post_iou_prev for r in records], dtype=np.float32)
+    student_delta_conf = np.array([r.student_delta_conf for r in records], dtype=np.float32)
+    student_pre_post_iou = np.array([r.student_pre_post_iou for r in records], dtype=np.float32)
+    student_pre_post_center_shift = np.array([r.student_pre_post_center_shift for r in records], dtype=np.float32)
     loss_total = np.array([r.loss_total for r in records], dtype=np.float32)
 
     save_plot_line(frames, teacher_conf, "Teacher top-1 Confidence vs Frame", "frame", "conf", out_dir / "plot_teacher_conf.png")
@@ -1036,6 +1062,24 @@ def main() -> None:
 
     save_plot_hist(teacher_conf, int(args.hist_bins), "Teacher top-1 Confidence Histogram", "conf", out_dir / "hist_teacher_conf.png")
     save_plot_hist(student_post_conf, int(args.hist_bins), "Student POST top-1 Confidence Histogram", "conf", out_dir / "hist_student_post_conf.png")
+    save_plot_line(frames, student_delta_conf, "Student POST-PRE Confidence Delta vs Frame", "frame", "delta_conf", out_dir / "plot_student_delta_conf.png")
+    save_plot_hist(student_delta_conf, int(args.hist_bins), "Student POST-PRE Confidence Delta Histogram", "delta_conf", out_dir / "hist_student_delta_conf.png")
+    save_plot_line(
+        frames,
+        np.where(np.isfinite(student_pre_post_iou), student_pre_post_iou, np.nan),
+        "Student PRE-POST IoU vs Frame",
+        "frame",
+        "IoU",
+        out_dir / "plot_student_pre_post_iou.png",
+    )
+    save_plot_line(
+        frames,
+        np.where(np.isfinite(student_pre_post_center_shift), student_pre_post_center_shift, np.nan),
+        "Student PRE-POST Center Shift vs Frame",
+        "frame",
+        "pixels",
+        out_dir / "plot_student_pre_post_center_shift.png",
+    )
 
     # -------------------------
     # Summary
@@ -1048,6 +1092,18 @@ def main() -> None:
     mean_loss = float(np.nanmean(loss_total)) if np.any(np.isfinite(loss_total)) else float("nan")
     mean_teacher_iou = float(np.nanmean(teacher_iou_prev)) if np.any(np.isfinite(teacher_iou_prev)) else float("nan")
     mean_student_iou = float(np.nanmean(student_post_iou_prev)) if np.any(np.isfinite(student_post_iou_prev)) else float("nan")
+    mean_delta_conf_all = float(np.mean(student_delta_conf)) if n_frames else float("nan")
+    update_mask = updates == 1
+    mean_delta_conf_updated_only = float(np.mean(student_delta_conf[update_mask])) if np.any(update_mask) else float("nan")
+    improved_updated_fraction = (
+        float(np.mean(student_delta_conf[update_mask] > 0.0)) if np.any(update_mask) else float("nan")
+    )
+    mean_pre_post_iou = float(np.nanmean(student_pre_post_iou)) if np.any(np.isfinite(student_pre_post_iou)) else float("nan")
+    mean_pre_post_center_shift = (
+        float(np.nanmean(student_pre_post_center_shift))
+        if np.any(np.isfinite(student_pre_post_center_shift))
+        else float("nan")
+    )
 
     summary_path = out_dir / "adapt_summary.txt"
     summary_lines = [
@@ -1069,11 +1125,16 @@ def main() -> None:
         f"mean adaptation loss:    {mean_loss:.4f}" if not math.isnan(mean_loss) else "mean adaptation loss:    n/a",
         f"mean teacher temporal IoU: {mean_teacher_iou:.3f}" if not math.isnan(mean_teacher_iou) else "mean teacher temporal IoU: n/a",
         f"mean student temporal IoU: {mean_student_iou:.3f}" if not math.isnan(mean_student_iou) else "mean student temporal IoU: n/a",
+        f"mean student delta conf (all frames): {mean_delta_conf_all:.6f}" if not math.isnan(mean_delta_conf_all) else "mean student delta conf (all frames): n/a",
+        f"mean student delta conf (updated frames): {mean_delta_conf_updated_only:.6f}" if not math.isnan(mean_delta_conf_updated_only) else "mean student delta conf (updated frames): n/a",
+        f"fraction updated frames improved: {improved_updated_fraction:.6f}" if not math.isnan(improved_updated_fraction) else "fraction updated frames improved: n/a",
+        f"mean student pre-post IoU: {mean_pre_post_iou:.6f}" if not math.isnan(mean_pre_post_iou) else "mean student pre-post IoU: n/a",
+        f"mean student pre-post center shift: {mean_pre_post_center_shift:.6f}" if not math.isnan(mean_pre_post_center_shift) else "mean student pre-post center shift: n/a",
         "",
         "Outputs:",
         f"  csv: {csv_path.name}",
-        "  plots: plot_teacher_conf.png, plot_student_pre_conf.png, plot_student_post_conf.png, plot_pseudo_accept.png, plot_update_applied.png, plot_update_rate_roll.png, plot_loss_total.png, plot_teacher_iou_prev.png, plot_student_post_iou_prev.png",
-        "  hists: hist_teacher_conf.png, hist_student_post_conf.png, hist_loss_total.png",
+        "  plots: plot_teacher_conf.png, plot_student_pre_conf.png, plot_student_post_conf.png, plot_pseudo_accept.png, plot_update_applied.png, plot_update_rate_roll.png, plot_loss_total.png, plot_teacher_iou_prev.png, plot_student_post_iou_prev.png, plot_student_delta_conf.png, plot_student_pre_post_iou.png, plot_student_pre_post_center_shift.png",
+        "  hists: hist_teacher_conf.png, hist_student_post_conf.png, hist_loss_total.png, hist_student_delta_conf.png",
     ]
     if args.make_mp4:
         summary_lines.append("  mp4: adapt_overlay.mp4")
@@ -1099,13 +1160,13 @@ if __name__ == "__main__":
 # PYTHONPATH=. python odad/online_adapt.py \
 #   --weights /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --output /home/hm25936/mae/odad/online_adapt_lab \
+#   --output /home/hm25936/mae/odad/online_adapt_lab_new_metrics \
 #   --device cuda:0 \
 #   --imgsz 1024 \
 #   --teacher-conf-thresh 0.70 \
 #   --infer-conf 0.001 \
 #   --temporal-iou-gate 0.30 \
-#   --lr 1e-4 \
+#   --lr 3e-4 \
 #   --ema-decay 0.999 \
 #   --make-mp4 \
 #   --mp4-every 2 \

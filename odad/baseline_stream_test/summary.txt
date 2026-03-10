@@ -1,0 +1,17 @@
+Stream Eval Summary (Phase-0)
+model=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+frames=6000
+conf=0.250  iou=0.450
+
+det_rate (top1 exists) = 90.8%
+top1_conf mean/median  = 0.615 / 0.705
+latency mean/p90 (ms)  = 11.79 / 12.72
+temporal IoU mean      = 0.838
+center jitter mean(px) = 75.28
+
+Outputs:
+  csv: stream_eval.csv
+  plots: plot_top1_conf.png, plot_det_rate_roll.png, plot_iou_prev.png, plot_latency_ms.png
+  hists: hist_top1_conf.png, hist_latency_ms.png
+  mp4: stream_overlay.mp4
