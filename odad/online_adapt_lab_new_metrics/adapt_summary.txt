@@ -6,21 +6,21 @@ imgsz=1024
 teacher_conf_thresh=0.700
 infer_conf=0.001
 iou=0.450
-lr=1.00e-04
+lr=3.00e-04
 ema_decay=0.999000
 
-pseudo accepted: 1414/6735 (21.0%)
-updates applied: 1414/6735 (21.0%)
-mean teacher conf:       0.534
-mean student post conf:  0.429
-mean adaptation loss:    2.5792
-mean teacher temporal IoU: 0.809
-mean student temporal IoU: 0.796
-mean student delta conf (all frames): 0.000019
-mean student delta conf (updated frames): 0.000091
-fraction updated frames improved: 0.707921
-mean student pre-post IoU: 0.999849
-mean student pre-post center shift: 0.015318
+pseudo accepted: 1604/6735 (23.8%)
+updates applied: 1604/6735 (23.8%)
+mean teacher conf:       0.519
+mean student post conf:  0.430
+mean adaptation loss:    2.3372
+mean teacher temporal IoU: 0.805
+mean student temporal IoU: 0.777
+mean student delta conf (all frames): 0.000043
+mean student delta conf (updated frames): 0.000181
+fraction updated frames improved: 0.680175
+mean student pre-post IoU: 0.999611
+mean student pre-post center shift: 0.039328
 
 Outputs:
   csv: adapt_log.csv

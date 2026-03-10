@@ -68,7 +68,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -91,6 +91,12 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("Please install ultralytics: pip install ultralytics") from exc
 
 from types import SimpleNamespace
+
+try:
+    from ultralytics.nn.modules import Detect, Segment
+except Exception:  # pragma: no cover
+    Detect = None
+    Segment = None
 
 # Loss import varies by ultralytics version
 LOSS_IMPORT_ERROR = None
@@ -512,13 +518,195 @@ def should_accept_pseudo(
     return True
 
 
-def freeze_for_head_only(student_model: nn.Module) -> None:
+def unwrap_core_and_layers(student_model: nn.Module) -> Tuple[nn.Module, List[nn.Module]]:
+    """
+    Unwrap potential YOLO wrapper/core nesting:
+      - if student_model is a YOLO wrapper, student_model.model is the core DetectionModel
+      - if student_model is already a DetectionModel, its .model is the layer sequence
+    """
+    maybe_core = getattr(student_model, "model", None)
+    core_model = maybe_core if (maybe_core is not None and hasattr(maybe_core, "yaml")) else student_model
+    layer_seq = getattr(core_model, "model", core_model)
+
+    if isinstance(layer_seq, (nn.ModuleList, nn.Sequential, list, tuple)):
+        layers = list(layer_seq)
+    else:
+        layers = list(layer_seq.children()) if isinstance(layer_seq, nn.Module) else []
+
+    if not layers:
+        raise RuntimeError("Unable to locate YOLO module sequence from loaded student model.")
+    return core_model, layers
+
+
+def is_detect_or_segment_module(module: nn.Module) -> bool:
+    if Detect is not None and isinstance(module, Detect):
+        return True
+    if Segment is not None and isinstance(module, Segment):
+        return True
+    return module.__class__.__name__ in {"Detect", "Segment"}
+
+
+def find_head_idx(layers: List[nn.Module]) -> int:
+    head_idx = -1
+    for idx, module in enumerate(layers):
+        if is_detect_or_segment_module(module):
+            head_idx = idx
+    if head_idx < 0:
+        raise RuntimeError("Unable to identify detection head (Detect/Segment) in loaded student model.")
+    return head_idx
+
+
+def resolve_neck_start_idx(core_model: nn.Module, neck_start_idx_override: int) -> Optional[int]:
+    if int(neck_start_idx_override) >= 0:
+        return int(neck_start_idx_override)
+
+    yaml_cfg = getattr(core_model, "yaml", None)
+    if isinstance(yaml_cfg, dict):
+        backbone = yaml_cfg.get("backbone")
+        if isinstance(backbone, (list, tuple)):
+            return len(backbone)
+    return None
+
+
+def compute_unfrozen_indices(
+    update_scope: str,
+    neck_start_idx: Optional[int],
+    head_idx: int,
+    n_layers: int,
+) -> List[int]:
+    if update_scope == "head_only":
+        return [head_idx]
+
+    if neck_start_idx is None:
+        raise RuntimeError(
+            "Unable to infer neck_start_idx from model YAML. "
+            "Pass --neck-start-idx >= 0 to use neck+head updates."
+        )
+    if neck_start_idx < 0 or neck_start_idx >= n_layers:
+        raise RuntimeError(
+            f"Invalid neck_start_idx={neck_start_idx}; expected range [0, {n_layers - 1}] for this model."
+        )
+    if neck_start_idx > head_idx:
+        raise RuntimeError(
+            f"Invalid update region: neck_start_idx={neck_start_idx} is after head_idx={head_idx}."
+        )
+    return list(range(neck_start_idx, head_idx + 1))
+
+
+def apply_freeze_policy(student_model: nn.Module, layers: List[nn.Module], unfrozen_indices: List[int]) -> None:
     for p in student_model.parameters():
         p.requires_grad = False
-    # Ultralytics DetectionModel stores layers in .model
-    detect_module = student_model.model[-1]
-    for p in detect_module.parameters():
-        p.requires_grad = True
+    for idx in unfrozen_indices:
+        for p in layers[idx].parameters():
+            p.requires_grad = True
+
+
+def module_grad_l2_norm(module: nn.Module) -> float:
+    has_params = False
+    sq_sum = 0.0
+    for p in module.parameters():
+        has_params = True
+        if p.grad is not None:
+            g = p.grad.detach().float()
+            sq_sum += float(torch.sum(g * g).item())
+    if not has_params:
+        return 0.0
+    return math.sqrt(sq_sum)
+
+
+def clone_module_params(module: nn.Module) -> List[torch.Tensor]:
+    return [p.detach().clone() for p in module.parameters()]
+
+
+def module_param_delta_l2_norm(module: nn.Module, params_before: List[torch.Tensor]) -> float:
+    params_after = list(module.parameters())
+    if not params_after:
+        return 0.0
+    if len(params_after) != len(params_before):
+        raise RuntimeError("Module parameter structure changed during optimizer step.")
+
+    sq_sum = 0.0
+    for p_before, p_after in zip(params_before, params_after):
+        delta = (p_after.detach() - p_before).float()
+        sq_sum += float(torch.sum(delta * delta).item())
+    return math.sqrt(sq_sum)
+
+
+def tensor_l2_norm(tensor: Optional[torch.Tensor]) -> float:
+    if tensor is None:
+        return 0.0
+    t = tensor.detach().float()
+    return math.sqrt(float(torch.sum(t * t).item()))
+
+
+def params_grad_l2_norm(params: List[torch.nn.Parameter]) -> float:
+    sq_sum = 0.0
+    for p in params:
+        if p.grad is not None:
+            g = p.grad.detach().float()
+            sq_sum += float(torch.sum(g * g).item())
+    return math.sqrt(sq_sum)
+
+
+def retain_grad_tensors(obj: Any, prefix: str, sink: List[Tuple[str, torch.Tensor]]) -> None:
+    if isinstance(obj, torch.Tensor):
+        if obj.requires_grad:
+            obj.retain_grad()
+            sink.append((prefix, obj))
+        return
+
+    if isinstance(obj, (list, tuple)):
+        for i, item in enumerate(obj):
+            retain_grad_tensors(item, f"{prefix}.{i}", sink)
+        return
+
+    if isinstance(obj, dict):
+        for key, item in obj.items():
+            retain_grad_tensors(item, f"{prefix}.{key}", sink)
+
+
+def collect_selected_trainable_params(
+    student_model: nn.Module,
+    layers: List[nn.Module],
+    unfrozen_indices: List[int],
+) -> List[Dict[str, object]]:
+    """
+    Source of truth is student_model.named_parameters() after freeze policy.
+    Map each trainable parameter object back to unfrozen module index via module graph identity.
+    """
+    unfrozen_set = set(int(i) for i in unfrozen_indices)
+    param_to_module_idxs: Dict[int, List[int]] = {}
+    for idx, module in enumerate(layers):
+        for p in module.parameters():
+            pid = id(p)
+            if pid not in param_to_module_idxs:
+                param_to_module_idxs[pid] = []
+            param_to_module_idxs[pid].append(idx)
+
+    selected: List[Dict[str, object]] = []
+    seen_param_ids = set()
+    for name, param in student_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        pid = id(param)
+        if pid in seen_param_ids:
+            continue
+        idx_candidates = [i for i in param_to_module_idxs.get(pid, []) if i in unfrozen_set]
+        if not idx_candidates:
+            continue
+        module_idx = min(idx_candidates)
+        selected.append(
+            {
+                "name": name,
+                "param": param,
+                "module_idx": int(module_idx),
+                "module_name": layers[module_idx].__class__.__name__,
+                "numel": int(param.numel()),
+            }
+        )
+        seen_param_ids.add(pid)
+
+    return selected
 
 
 def update_teacher_ema(teacher_model: nn.Module, student_model: nn.Module, decay: float) -> None:
@@ -576,8 +764,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4, help="Student optimizer learning rate")
     p.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
     p.add_argument("--weight-decay", type=float, default=5e-4, help="SGD weight decay")
+    p.add_argument(
+        "--update-scope",
+        type=str,
+        default="head_only",
+        choices=["head_only", "neck_head"],
+        help="Student trainable region: head_only or neck_head",
+    )
+    p.add_argument(
+        "--neck-start-idx",
+        type=int,
+        default=-1,
+        help="Manual neck start module index override; >=0 disables YAML auto-detection",
+    )
     p.add_argument("--ema-decay", type=float, default=0.999, help="Teacher EMA decay per accepted update")
     p.add_argument("--grad-clip", type=float, default=10.0, help="Gradient clipping max norm")
+    p.add_argument("--debug-first-update", action="store_true", help="Verbose diagnostics on the first accepted update")
     p.add_argument("--seed", type=int, default=0, help="RNG seed")
 
     # Pseudo-label gating
@@ -628,12 +830,90 @@ def main() -> None:
     student_model.to(args.device)
     teacher_model.to(args.device)
 
-    # Conservative adaptation: head only
-    freeze_for_head_only(student_model)
+    core_model, layers = unwrap_core_and_layers(student_model)
+    head_idx = find_head_idx(layers)
+    neck_start_idx = resolve_neck_start_idx(core_model, int(args.neck_start_idx))
+    unfrozen_indices = compute_unfrozen_indices(
+        update_scope=str(args.update_scope),
+        neck_start_idx=neck_start_idx,
+        head_idx=head_idx,
+        n_layers=len(layers),
+    )
+    apply_freeze_policy(student_model, layers, unfrozen_indices)
 
-    optim_params = [p for p in student_model.parameters() if p.requires_grad]
+    if neck_start_idx is None:
+        raise RuntimeError(
+            "Unable to infer neck_start_idx from model YAML. "
+            "Pass --neck-start-idx >= 0 to provide a manual override."
+        )
+
+    unfrozen_desc = [f"{i}:{layers[i].__class__.__name__}" for i in unfrozen_indices]
+    trainable_param_count = int(sum(p.numel() for p in student_model.parameters() if p.requires_grad))
+    print(f"[adapt] update_scope={args.update_scope}")
+    print(f"[adapt] neck_start_idx={neck_start_idx}")
+    print(f"[adapt] head_idx={head_idx}")
+    print(f"[adapt] unfrozen_modules={unfrozen_desc}")
+    print(f"[adapt] trainable_params={trainable_param_count}")
+    unfrozen_module_tags = [f"m{i}_{layers[i].__class__.__name__}" for i in unfrozen_indices]
+
+    selected_trainable_params = collect_selected_trainable_params(student_model, layers, unfrozen_indices)
+    selected_trainable_param_ids = {id(item["param"]) for item in selected_trainable_params}
+    selected_trainable_by_module_idx: Dict[int, List[Dict[str, object]]] = {}
+    for item in selected_trainable_params:
+        mod_idx = int(item["module_idx"])
+        if mod_idx not in selected_trainable_by_module_idx:
+            selected_trainable_by_module_idx[mod_idx] = []
+        selected_trainable_by_module_idx[mod_idx].append(item)
+
+    unmapped_trainable_names = [
+        name
+        for name, param in student_model.named_parameters()
+        if param.requires_grad and id(param) not in selected_trainable_param_ids
+    ]
+    if unmapped_trainable_names:
+        raise RuntimeError(
+            "Found trainable student_model parameters not mapped to unfrozen module indices: "
+            + ", ".join(unmapped_trainable_names[:10])
+        )
+
+    optimizer_module_param_counts: List[Dict[str, object]] = []
+    for mod_idx in unfrozen_indices:
+        module = layers[mod_idx]
+        module_params = list(module.parameters())
+        module_total_numel = int(sum(p.numel() for p in module_params))
+        module_optimizer_numel = int(
+            sum(int(item["numel"]) for item in selected_trainable_by_module_idx.get(int(mod_idx), []))
+        )
+
+        optimizer_module_param_counts.append(
+            {
+                "idx": int(mod_idx),
+                "name": module.__class__.__name__,
+                "module_total_numel": module_total_numel,
+                "optimizer_numel": module_optimizer_numel,
+            }
+        )
+        if module_total_numel > 0 and module_optimizer_numel == 0:
+            raise RuntimeError(
+                f"Unfrozen parameterized module idx={mod_idx} ({module.__class__.__name__}) has zero optimizer parameters."
+            )
+
+    optim_params = [item["param"] for item in selected_trainable_params]
     if not optim_params:
-        raise RuntimeError("No trainable parameters found after head-only freezing.")
+        raise RuntimeError("No trainable parameters found after applying freeze policy.")
+    optimizer_total_param_count = int(sum(int(item["numel"]) for item in selected_trainable_params))
+    print("[adapt] optimizer_module_param_counts:")
+    for item in optimizer_module_param_counts:
+        optimizer_member = 1 if (int(item["module_total_numel"]) == 0 or int(item["optimizer_numel"]) > 0) else 0
+        print(
+            "[adapt]   "
+            f"idx={item['idx']} class={item['name']} "
+            f"module_total_params={item['module_total_numel']} "
+            f"optimizer_params={item['optimizer_numel']} "
+            f"optimizer_member={optimizer_member}"
+        )
+    print(f"[adapt] optimizer_total_params={optimizer_total_param_count}")
+
     optimizer = torch.optim.SGD(
         optim_params,
         lr=float(args.lr),
@@ -657,6 +937,22 @@ def main() -> None:
 
     student_model.args = SimpleNamespace(**hyp_dict)
     criterion = LossClass(student_model)
+    optimizer_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    missing_optimizer_names = [
+        str(item["name"]) for item in selected_trainable_params if id(item["param"]) not in optimizer_param_ids
+    ]
+    if missing_optimizer_names:
+        raise RuntimeError(
+            "Some selected trainable student_model params are not in optimizer param groups: "
+            + ", ".join(missing_optimizer_names[:10])
+        )
+    first_update_debug_done = False
+    first_update_debug_lines: List[str] = []
+    first_update_debug_records: List[Dict[str, object]] = []
+    first_update_debug_path = out_dir / "first_update_debug.txt"
+    first_update_debug_csv_path = out_dir / "first_update_debug.csv"
+    first_update_activation_debug_lines: List[str] = []
+    first_update_activation_debug_path = out_dir / "first_update_activation_debug.txt"
 
     # Warmup
     warmup_n = max(0, int(args.warmup))
@@ -672,6 +968,7 @@ def main() -> None:
             )
 
     records: List[AdaptRecord] = []
+    update_debug_records: List[Dict[str, object]] = []
     mp4_frames: List[np.ndarray] = []
 
     prev_teacher_box: Optional[Tuple[float, float, float, float]] = None
@@ -741,11 +1038,13 @@ def main() -> None:
         loss_box = float("nan")
         loss_cls = float("nan")
         loss_dfl = float("nan")
+        update_grad_norms = [float("nan")] * len(unfrozen_indices)
+        update_delta_norms = [float("nan")] * len(unfrozen_indices)
 
         if pseudo_accepted and teacher_top1 is not None:
             # Ultralytics predict() can force model params to requires_grad=False.
-            # Re-apply head-only trainability before each adaptation step.
-            freeze_for_head_only(student_model)
+            # Re-apply selected trainability scope before each adaptation step.
+            apply_freeze_policy(student_model, layers, unfrozen_indices)
 
             # Strong appearance-only augmentation on original image
             student_aug_rgb = strong_augment(img_rgb, rng)
@@ -775,8 +1074,41 @@ def main() -> None:
                 with torch.enable_grad():
                     student_model.train()
                     optimizer.zero_grad(set_to_none=True)
+                    debug_this_update = bool(args.debug_first_update and (not first_update_debug_done))
+                    activation_target_indices = [12, 15, 18, 21]
+                    activation_module_tensor_refs: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
+                    detect_input_tensor_refs: List[Tuple[str, torch.Tensor]] = []
+                    detect_output_tensor_refs: List[Tuple[str, torch.Tensor]] = []
+                    activation_hook_handles = []
+                    if debug_this_update:
+                        def make_activation_hook(mod_idx: int):
+                            def _hook(_module, _inputs, output):
+                                refs: List[Tuple[str, torch.Tensor]] = []
+                                retain_grad_tensors(output, f"layer{mod_idx}", refs)
+                                activation_module_tensor_refs[mod_idx] = refs
+                            return _hook
 
-                    preds = student_model(img_tensor)
+                        for mod_idx in activation_target_indices:
+                            if 0 <= mod_idx < len(layers):
+                                activation_hook_handles.append(layers[mod_idx].register_forward_hook(make_activation_hook(mod_idx)))
+
+                        def detect_io_hook(_module, inputs, output):
+                            detect_input_tensor_refs.clear()
+                            detect_output_tensor_refs.clear()
+                            if isinstance(inputs, tuple) and len(inputs) > 0:
+                                retain_grad_tensors(inputs[0], "detect_in", detect_input_tensor_refs)
+                            else:
+                                retain_grad_tensors(inputs, "detect_in", detect_input_tensor_refs)
+                            retain_grad_tensors(output, "detect_out", detect_output_tensor_refs)
+
+                        if 0 <= head_idx < len(layers):
+                            activation_hook_handles.append(layers[head_idx].register_forward_hook(detect_io_hook))
+
+                    try:
+                        preds = student_model(img_tensor)
+                    finally:
+                        for handle in activation_hook_handles:
+                            handle.remove()
 
                     # helpful one-time debug if needed
                     # print("grad enabled:", torch.is_grad_enabled())
@@ -826,11 +1158,268 @@ def main() -> None:
                     # Backprop requires a scalar.
                     loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
                     loss_scalar.backward()
+                    params_before_step_by_idx = {}
+                    for mod_pos, mod_idx in enumerate(unfrozen_indices):
+                        module = layers[mod_idx]
+                        update_grad_norms[mod_pos] = module_grad_l2_norm(module)
+                        params_before_step_by_idx[mod_idx] = clone_module_params(module)
+                    debug_param_records_pre: List[Dict[str, object]] = []
+                    global_grad_before_clip = float("nan")
+                    global_grad_after_clip = float("nan")
+                    optimizer_lr = float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else float("nan")
+                    activation_module_grad_summary: Dict[int, Dict[str, object]] = {}
+                    detect_input_grad_summary: List[Dict[str, object]] = []
+                    detect_output_grad_summary: List[Dict[str, object]] = []
+                    detect_branch_grad_summary: Dict[str, Dict[str, float]] = {}
+                    if debug_this_update:
+                        global_grad_before_clip = params_grad_l2_norm(optim_params)
+                        for selected_entry in selected_trainable_params:
+                            param = selected_entry["param"]
+                            in_optimizer = bool(id(param) in optimizer_param_ids)
+                            if not in_optimizer:
+                                raise RuntimeError(
+                                    "Selected debug parameter is not present in optimizer params: "
+                                    f"{selected_entry['name']} (module idx {selected_entry['module_idx']})."
+                                )
+                            debug_param_records_pre.append(
+                                {
+                                    "param_name": str(selected_entry["name"]),
+                                    "module_idx": int(selected_entry["module_idx"]),
+                                    "module_name": str(selected_entry["module_name"]),
+                                    "shape": tuple(param.shape),
+                                    "param_obj": param,
+                                    "pre_tensor": param.detach().clone(),
+                                    "grad_norm": tensor_l2_norm(param.grad),
+                                    "optimizer_member": int(in_optimizer),
+                                }
+                            )
+
+                        for mod_idx in activation_target_indices:
+                            refs = activation_module_tensor_refs.get(mod_idx, [])
+                            sq_sum = 0.0
+                            n_nonzero = 0
+                            for _, tensor_ref in refs:
+                                grad_norm = tensor_l2_norm(tensor_ref.grad)
+                                sq_sum += float(grad_norm * grad_norm)
+                                if grad_norm > 1e-12:
+                                    n_nonzero += 1
+                            activation_module_grad_summary[int(mod_idx)] = {
+                                "module_name": layers[mod_idx].__class__.__name__ if 0 <= mod_idx < len(layers) else "n/a",
+                                "num_tensors": len(refs),
+                                "num_nonzero": int(n_nonzero),
+                                "grad_l2": math.sqrt(sq_sum),
+                            }
+
+                        for name, tensor_ref in detect_input_tensor_refs:
+                            detect_input_grad_summary.append(
+                                {
+                                    "name": str(name),
+                                    "shape": tuple(tensor_ref.shape),
+                                    "grad_l2": float(tensor_l2_norm(tensor_ref.grad)),
+                                }
+                            )
+                        for name, tensor_ref in detect_output_tensor_refs:
+                            detect_output_grad_summary.append(
+                                {
+                                    "name": str(name),
+                                    "shape": tuple(tensor_ref.shape),
+                                    "grad_l2": float(tensor_l2_norm(tensor_ref.grad)),
+                                }
+                            )
+
+                        detect_prefix = f"model.{head_idx}."
+                        for selected_entry in selected_trainable_params:
+                            if int(selected_entry["module_idx"]) != int(head_idx):
+                                continue
+                            local_name = str(selected_entry["name"])
+                            if local_name.startswith(detect_prefix):
+                                local_name = local_name[len(detect_prefix):]
+                            parts = local_name.split(".")
+                            if len(parts) >= 2 and parts[0] in {"cv2", "cv3"} and parts[1].isdigit():
+                                branch_key = f"{parts[0]}.{parts[1]}"
+                            elif parts:
+                                branch_key = parts[0]
+                            else:
+                                branch_key = "unknown"
+
+                            if branch_key not in detect_branch_grad_summary:
+                                detect_branch_grad_summary[branch_key] = {
+                                    "num_params": 0.0,
+                                    "num_nonzero_grad": 0.0,
+                                    "sum_grad_l2": 0.0,
+                                    "max_grad_l2": 0.0,
+                                }
+                            stat = detect_branch_grad_summary[branch_key]
+                            grad_norm = float(tensor_l2_norm(selected_entry["param"].grad))
+                            stat["num_params"] += 1.0
+                            stat["sum_grad_l2"] += grad_norm
+                            if grad_norm > 1e-12:
+                                stat["num_nonzero_grad"] += 1.0
+                            stat["max_grad_l2"] = max(float(stat["max_grad_l2"]), grad_norm)
 
                     if float(args.grad_clip) > 0:
                         torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+                    if debug_this_update:
+                        global_grad_after_clip = params_grad_l2_norm(optim_params)
 
                     optimizer.step()
+                    for mod_pos, mod_idx in enumerate(unfrozen_indices):
+                        update_delta_norms[mod_pos] = module_param_delta_l2_norm(
+                            layers[mod_idx],
+                            params_before_step_by_idx[mod_idx],
+                        )
+                    if debug_this_update:
+                        debug_lines = [
+                            "First Accepted Update Debug",
+                            f"frame={idx}",
+                            f"optimizer_lr={optimizer_lr:.8e}",
+                            f"global_grad_l2_before_clip={global_grad_before_clip:.8e}",
+                            f"global_grad_l2_after_clip={global_grad_after_clip:.8e}",
+                            "",
+                            f"num_selected_trainable_params={len(debug_param_records_pre)}",
+                            "",
+                        ]
+                        if not debug_param_records_pre:
+                            debug_lines.append("No selected trainable parameters available for first-update diagnostics.")
+
+                        first_update_debug_records = []
+                        for item in debug_param_records_pre:
+                            param = item["param_obj"]
+                            pre_tensor = item["pre_tensor"]
+                            post_tensor = param.detach()
+                            delta = (post_tensor - pre_tensor).float()
+                            delta_norm = tensor_l2_norm(delta)
+                            max_abs_delta = float(torch.max(torch.abs(delta)).item()) if delta.numel() > 0 else 0.0
+                            first_update_debug_records.append(
+                                {
+                                    "param_name": str(item["param_name"]),
+                                    "module_idx": int(item["module_idx"]),
+                                    "module_name": str(item["module_name"]),
+                                    "shape": tuple(item["shape"]),
+                                    "grad_l2": float(item["grad_norm"]),
+                                    "delta_l2": float(delta_norm),
+                                    "max_abs_delta": float(max_abs_delta),
+                                    "optimizer_member": int(item["optimizer_member"]),
+                                }
+                            )
+
+                        eps = 1e-12
+                        top_grad = sorted(first_update_debug_records, key=lambda r: float(r["grad_l2"]), reverse=True)[:20]
+                        top_delta = sorted(first_update_debug_records, key=lambda r: float(r["delta_l2"]), reverse=True)[:20]
+
+                        debug_lines.append("Top 20 Parameters by grad_l2")
+                        for rank, rec in enumerate(top_grad, start=1):
+                            debug_lines.append(
+                                f"{rank:02d} grad_l2={float(rec['grad_l2']):.8e} delta_l2={float(rec['delta_l2']):.8e} "
+                                f"module_idx={int(rec['module_idx'])} class={rec['module_name']} name={rec['param_name']}"
+                            )
+                        debug_lines.append("")
+                        debug_lines.append("Top 20 Parameters by delta_l2")
+                        for rank, rec in enumerate(top_delta, start=1):
+                            debug_lines.append(
+                                f"{rank:02d} delta_l2={float(rec['delta_l2']):.8e} grad_l2={float(rec['grad_l2']):.8e} "
+                                f"module_idx={int(rec['module_idx'])} class={rec['module_name']} name={rec['param_name']}"
+                            )
+
+                        per_module: Dict[Tuple[int, str], Dict[str, float]] = {}
+                        for rec in first_update_debug_records:
+                            key = (int(rec["module_idx"]), str(rec["module_name"]))
+                            if key not in per_module:
+                                per_module[key] = {
+                                    "num_params": 0.0,
+                                    "num_nonzero_grad": 0.0,
+                                    "num_nonzero_delta": 0.0,
+                                    "sum_grad_l2": 0.0,
+                                    "sum_delta_l2": 0.0,
+                                    "max_delta_l2": 0.0,
+                                }
+                            stat = per_module[key]
+                            grad_v = float(rec["grad_l2"])
+                            delta_v = float(rec["delta_l2"])
+                            stat["num_params"] += 1.0
+                            stat["sum_grad_l2"] += grad_v
+                            stat["sum_delta_l2"] += delta_v
+                            if grad_v > eps:
+                                stat["num_nonzero_grad"] += 1.0
+                            if delta_v > eps:
+                                stat["num_nonzero_delta"] += 1.0
+                            stat["max_delta_l2"] = max(float(stat["max_delta_l2"]), delta_v)
+
+                        debug_lines.append("")
+                        debug_lines.append("Per-Module Aggregation (selected optimizer-bound params only)")
+                        for key in sorted(per_module.keys(), key=lambda x: x[0]):
+                            mod_idx, mod_name = key
+                            stat = per_module[key]
+                            n = max(1.0, stat["num_params"])
+                            debug_lines.append(
+                                f"module_idx={mod_idx} class={mod_name} "
+                                f"num_params={int(stat['num_params'])} "
+                                f"num_nonzero_grad={int(stat['num_nonzero_grad'])} "
+                                f"num_nonzero_delta={int(stat['num_nonzero_delta'])} "
+                                f"mean_grad_l2={float(stat['sum_grad_l2'])/n:.8e} "
+                                f"mean_delta_l2={float(stat['sum_delta_l2'])/n:.8e} "
+                                f"max_delta_l2={float(stat['max_delta_l2']):.8e}"
+                            )
+
+                        activation_debug_lines = [
+                            "First Accepted Update Activation Debug",
+                            f"frame={idx}",
+                            f"head_idx={head_idx}",
+                            "",
+                            "Activation Grad Norms at Selected Neck Modules",
+                        ]
+                        for mod_idx in activation_target_indices:
+                            if mod_idx not in activation_module_grad_summary:
+                                activation_debug_lines.append(f"module_idx={mod_idx} status=not_captured")
+                                continue
+                            mod_stat = activation_module_grad_summary[mod_idx]
+                            activation_debug_lines.append(
+                                f"module_idx={mod_idx} class={mod_stat['module_name']} "
+                                f"num_tensors={int(mod_stat['num_tensors'])} "
+                                f"num_nonzero={int(mod_stat['num_nonzero'])} "
+                                f"activation_grad_l2={float(mod_stat['grad_l2']):.8e}"
+                            )
+
+                        activation_debug_lines.append("")
+                        activation_debug_lines.append("Detect Input Activation Grad Norms")
+                        if not detect_input_grad_summary:
+                            activation_debug_lines.append("detect_inputs=not_accessible_or_no_grad_tensors")
+                        for rec in detect_input_grad_summary:
+                            activation_debug_lines.append(
+                                f"name={rec['name']} shape={rec['shape']} grad_l2={float(rec['grad_l2']):.8e}"
+                            )
+
+                        activation_debug_lines.append("")
+                        activation_debug_lines.append("Detect Output Activation Grad Norms")
+                        if not detect_output_grad_summary:
+                            activation_debug_lines.append("detect_outputs=not_accessible_or_no_grad_tensors")
+                        for rec in detect_output_grad_summary:
+                            activation_debug_lines.append(
+                                f"name={rec['name']} shape={rec['shape']} grad_l2={float(rec['grad_l2']):.8e}"
+                            )
+
+                        activation_debug_lines.append("")
+                        activation_debug_lines.append("Detect Branch Parameter Grad Summary")
+                        if not detect_branch_grad_summary:
+                            activation_debug_lines.append("detect_branch_summary=unavailable")
+                        for branch_key in sorted(detect_branch_grad_summary.keys()):
+                            stat = detect_branch_grad_summary[branch_key]
+                            n_params = max(1.0, float(stat["num_params"]))
+                            activation_debug_lines.append(
+                                f"branch={branch_key} "
+                                f"num_params={int(stat['num_params'])} "
+                                f"num_nonzero_grad={int(stat['num_nonzero_grad'])} "
+                                f"mean_grad_l2={float(stat['sum_grad_l2'])/n_params:.8e} "
+                                f"max_grad_l2={float(stat['max_grad_l2']):.8e}"
+                            )
+
+                        first_update_debug_lines = debug_lines
+                        first_update_activation_debug_lines = activation_debug_lines
+                        for line in debug_lines:
+                            print(f"[first-update-debug] {line}")
+                        for line in activation_debug_lines:
+                            print(f"[first-update-activation-debug] {line}")
+                        first_update_debug_done = True
 
             # teacher follows student after successful update
             update_teacher_ema(teacher_model, student_model, decay=float(args.ema_decay))
@@ -919,6 +1508,14 @@ def main() -> None:
                 latency_student_post_ms=float(student_post_lat_ms),
             )
         )
+        update_debug_records.append(
+            {
+                "frame": idx,
+                "update_applied": int(update_applied),
+                "grad_norms": list(update_grad_norms),
+                "delta_norms": list(update_delta_norms),
+            }
+        )
 
         # Update prevs
         prev_teacher_box = teacher_top1.xyxy if teacher_top1 is not None else None
@@ -1003,6 +1600,94 @@ def main() -> None:
                     f"{r.latency_student_post_ms:.3f}",
                 ]
             )
+
+    update_debug_csv_path = out_dir / "update_debug.csv"
+    with update_debug_csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = ["frame", "update_applied"]
+        header.extend([f"grad_{tag}" for tag in unfrozen_module_tags])
+        header.extend([f"delta_{tag}" for tag in unfrozen_module_tags])
+        writer.writerow(header)
+
+        for rec in update_debug_records:
+            row = [int(rec["frame"]), int(rec["update_applied"])]
+            grad_vals = rec["grad_norms"]
+            delta_vals = rec["delta_norms"]
+            row.extend([f"{v:.8e}" if math.isfinite(v) else "" for v in grad_vals])
+            row.extend([f"{v:.8e}" if math.isfinite(v) else "" for v in delta_vals])
+            writer.writerow(row)
+
+    update_debug_summary_path = out_dir / "update_debug_summary.txt"
+    applied_updates = [r for r in update_debug_records if int(r["update_applied"]) == 1]
+    debug_lines = [
+        "Update Debug Summary",
+        f"frames_total={len(update_debug_records)}",
+        f"updates_applied={len(applied_updates)}",
+        "",
+    ]
+    for mod_pos, mod_idx in enumerate(unfrozen_indices):
+        mod_name = layers[mod_idx].__class__.__name__
+        grad_vals = [
+            float(r["grad_norms"][mod_pos])
+            for r in applied_updates
+            if math.isfinite(float(r["grad_norms"][mod_pos]))
+        ]
+        delta_vals = [
+            float(r["delta_norms"][mod_pos])
+            for r in applied_updates
+            if math.isfinite(float(r["delta_norms"][mod_pos]))
+        ]
+        mean_grad = float(np.mean(grad_vals)) if grad_vals else float("nan")
+        mean_delta = float(np.mean(delta_vals)) if delta_vals else float("nan")
+        debug_lines.append(
+            (
+                f"module_idx={mod_idx} class={mod_name} "
+                f"mean_grad_l2={mean_grad:.8e} "
+                f"mean_delta_l2={mean_delta:.8e} "
+                f"samples={len(grad_vals)}"
+            )
+        )
+    update_debug_summary_path.write_text("\n".join(debug_lines), encoding="utf-8")
+    if args.debug_first_update:
+        with first_update_debug_csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "param_name",
+                    "module_idx",
+                    "module_name",
+                    "shape",
+                    "grad_l2",
+                    "delta_l2",
+                    "max_abs_delta",
+                    "optimizer_member",
+                ]
+            )
+            for rec in first_update_debug_records:
+                writer.writerow(
+                    [
+                        rec["param_name"],
+                        int(rec["module_idx"]),
+                        rec["module_name"],
+                        str(tuple(rec["shape"])),
+                        f"{float(rec['grad_l2']):.8e}",
+                        f"{float(rec['delta_l2']):.8e}",
+                        f"{float(rec['max_abs_delta']):.8e}",
+                        int(rec["optimizer_member"]),
+                    ]
+                )
+        if not first_update_debug_lines:
+            first_update_debug_lines = [
+                "First Accepted Update Debug",
+                "No accepted update encountered; detailed first-update diagnostics were not collected.",
+            ]
+        first_update_debug_path.write_text("\n".join(first_update_debug_lines), encoding="utf-8")
+        if not first_update_activation_debug_lines:
+            first_update_activation_debug_lines = [
+                "First Accepted Update Activation Debug",
+                "No accepted update encountered; activation-flow diagnostics were not collected.",
+            ]
+        first_update_activation_debug_path.write_text("\n".join(first_update_activation_debug_lines), encoding="utf-8")
 
     # -------------------------
     # Plots
@@ -1133,9 +1818,15 @@ def main() -> None:
         "",
         "Outputs:",
         f"  csv: {csv_path.name}",
+        f"  update_debug_csv: {update_debug_csv_path.name}",
+        f"  update_debug_summary: {update_debug_summary_path.name}",
         "  plots: plot_teacher_conf.png, plot_student_pre_conf.png, plot_student_post_conf.png, plot_pseudo_accept.png, plot_update_applied.png, plot_update_rate_roll.png, plot_loss_total.png, plot_teacher_iou_prev.png, plot_student_post_iou_prev.png, plot_student_delta_conf.png, plot_student_pre_post_iou.png, plot_student_pre_post_center_shift.png",
         "  hists: hist_teacher_conf.png, hist_student_post_conf.png, hist_loss_total.png, hist_student_delta_conf.png",
     ]
+    if args.debug_first_update:
+        summary_lines.append(f"  first_update_debug: {first_update_debug_path.name}")
+        summary_lines.append(f"  first_update_debug_csv: {first_update_debug_csv_path.name}")
+        summary_lines.append(f"  first_update_activation_debug: {first_update_activation_debug_path.name}")
     if args.make_mp4:
         summary_lines.append("  mp4: adapt_overlay.mp4")
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
@@ -1160,14 +1851,17 @@ if __name__ == "__main__":
 # PYTHONPATH=. python odad/online_adapt.py \
 #   --weights /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --output /home/hm25936/mae/odad/online_adapt_lab_new_metrics \
+#   --output /home/hm25936/mae/odad/online_adapt_lab_neck_head_update \
 #   --device cuda:0 \
 #   --imgsz 1024 \
-#   --teacher-conf-thresh 0.70 \
+#   --teacher-conf-thresh 0.80 \
 #   --infer-conf 0.001 \
-#   --temporal-iou-gate 0.30 \
+#   --temporal-iou-gate 0.50 \
 #   --lr 3e-4 \
 #   --ema-decay 0.999 \
+#   --update-scope neck_head \
+#   --debug-first-update \
+#   --max-frames 300 \
 #   --make-mp4 \
 #   --mp4-every 2 \
 #   --mp4-fps 12 \

@@ -1,0 +1,28 @@
+First Accepted Update Activation Debug
+frame=61
+head_idx=22
+
+Activation Grad Norms at Selected Neck Modules
+module_idx=12 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=2.66369925e-01
+module_idx=15 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=1.40226986e-01
+module_idx=18 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=3.16370409e-01
+module_idx=21 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=4.88904875e-01
+
+Detect Input Activation Grad Norms
+name=detect_in.0 shape=(1, 65, 128, 128) grad_l2=3.00290001e-05
+name=detect_in.1 shape=(1, 65, 64, 64) grad_l2=6.01990199e-04
+name=detect_in.2 shape=(1, 65, 32, 32) grad_l2=3.67668182e-01
+
+Detect Output Activation Grad Norms
+name=detect_out.0 shape=(1, 65, 128, 128) grad_l2=3.00290001e-05
+name=detect_out.1 shape=(1, 65, 64, 64) grad_l2=6.01990199e-04
+name=detect_out.2 shape=(1, 65, 32, 32) grad_l2=3.67668182e-01
+
+Detect Branch Parameter Grad Summary
+branch=cv2.0 num_params=8 num_nonzero_grad=0 mean_grad_l2=0.00000000e+00 max_grad_l2=0.00000000e+00
+branch=cv2.1 num_params=8 num_nonzero_grad=0 mean_grad_l2=0.00000000e+00 max_grad_l2=0.00000000e+00
+branch=cv2.2 num_params=8 num_nonzero_grad=2 mean_grad_l2=6.50376307e-01 max_grad_l2=4.82114061e+00
+branch=cv3.0 num_params=8 num_nonzero_grad=2 mean_grad_l2=1.52681055e-04 max_grad_l2=7.80425554e-04
+branch=cv3.1 num_params=8 num_nonzero_grad=2 mean_grad_l2=1.16815048e-03 max_grad_l2=6.68851172e-03
+branch=cv3.2 num_params=8 num_nonzero_grad=2 mean_grad_l2=1.79873465e-01 max_grad_l2=1.02411111e+00
+branch=dfl num_params=1 num_nonzero_grad=0 mean_grad_l2=0.00000000e+00 max_grad_l2=0.00000000e+00
