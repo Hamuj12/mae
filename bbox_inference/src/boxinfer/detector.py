@@ -46,6 +46,22 @@ def _xyxy_to_xywh_norm(xyxy: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
     return np.array([cx / img_w, cy / img_h, w / img_w, h / img_h], dtype = float)
 
 
+def _parse_input_size(input_size) -> tuple[int, int]:
+    """
+    Parse detector input size as (height, width).
+    Supported forms:
+    - int -> square (size, size)
+    - tuple/list with 2 values -> (height, width)
+    """
+    if isinstance(input_size, (list, tuple)) and len(input_size) == 2:
+        h = int(max(32, int(input_size[0])))
+        w = int(max(32, int(input_size[1])))
+        return h, w
+
+    size = int(max(32, int(input_size)))
+    return size, size
+
+
 def _letterbox_image(
                         image_bgr: np.ndarray,
                         dst_w: int,
@@ -91,7 +107,7 @@ class YoloBBoxDetector:
                     detector_name: str = 'yolo_bbox',
                     conf_threshold: float = 0.25,
                     iou_threshold: float = 0.45,
-                    input_size: int = 1024,
+                    input_size = 1024,
                     class_whitelist: Optional[List[int]] = None,
                     prefer_cuda: bool = True,
                     device: str = 'cuda:0',
@@ -109,7 +125,8 @@ class YoloBBoxDetector:
         self._detector_name   = str(detector_name)
         self._conf_thr        = float(conf_threshold)
         self._iou_thr         = float(iou_threshold)
-        self._input_size      = int(max(32, input_size))
+        self._requested_input_h, self._requested_input_w = _parse_input_size(input_size)
+        self._input_h, self._input_w = int(self._requested_input_h), int(self._requested_input_w)
         self._class_whitelist = set(class_whitelist or [])
         self._prefer_cuda     = bool(prefer_cuda)
         self._device          = str(device).strip() or 'cuda:0'
@@ -143,12 +160,22 @@ class YoloBBoxDetector:
         self._input_name  = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
-        # use fixed model input size when present, otherwise user input_size
+        # use fixed model input size when present, otherwise requested input_size
         model_input_shape = self._session.get_inputs()[0].shape
         model_h = _shape_dim_to_int(model_input_shape[2]) if len(model_input_shape) >= 4 else None
         model_w = _shape_dim_to_int(model_input_shape[3]) if len(model_input_shape) >= 4 else None
-        self._input_h = model_h if model_h is not None else self._input_size
-        self._input_w = model_w if model_w is not None else self._input_size
+        if model_h is not None and model_w is not None:
+            self._input_h = int(model_h)
+            self._input_w = int(model_w)
+            if (self._input_h, self._input_w) != (int(self._requested_input_h), int(self._requested_input_w)):
+                raise ValueError(
+                                    f'ONNX model input is fixed at ({self._input_h}, {self._input_w}) '
+                                    f'but requested input_size is ({int(self._requested_input_h)}, {int(self._requested_input_w)}). '
+                                    f'Use matching config or re-export ONNX with the desired/static or dynamic input shape.'
+                                )
+        else:
+            self._input_h = int(self._requested_input_h)
+            self._input_w = int(self._requested_input_w)
 
     def _init_tensorrt(self) -> None:
         if Path(self._model_path).suffix.lower() != '.engine':
@@ -345,11 +372,12 @@ class YoloBBoxDetector:
     def _detect_tensorrt(self, image_bgr: np.ndarray) -> DetectionResult:
         img_h, img_w    = image_bgr.shape[:2]
         classes_arg     = sorted(self._class_whitelist) if self._class_whitelist else None
+        imgsz_arg       = int(self._input_h) if int(self._input_h) == int(self._input_w) else (int(self._input_h), int(self._input_w))
 
         # ultralytics handles trt runtime and preprocessing for engine backend
         results = self._model.predict(
                                         source = image_bgr,
-                                        imgsz = int(self._input_size),
+                                        imgsz = imgsz_arg,
                                         conf = float(self._conf_thr),
                                         iou = float(self._iou_thr),
                                         device = self._device,
