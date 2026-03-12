@@ -62,7 +62,7 @@ def _parse_input_size(input_size) -> tuple[int, int]:
     return size, size
 
 
-def _letterbox_image(
+def letterbox_image(
                         image_bgr: np.ndarray,
                         dst_w: int,
                         dst_h: int,
@@ -97,7 +97,7 @@ def _letterbox_image(
     return out, scale, float(left), float(top)
 
 
-def _rescale_camera_matrix_for_letterbox(
+def rescale_camera_matrix_for_letterbox(
                                             K_src: np.ndarray,
                                             src_w: int,
                                             src_h: int,
@@ -124,7 +124,7 @@ def _rescale_camera_matrix_for_letterbox(
                             f'src=({sw}, {sh}), dst=({dw}, {dh})'
                         )
 
-    # use same resize/pad policy as _letterbox_image()
+    # use same resize/pad policy as letterbox_image()
     scale = min(float(dw) / float(sw), float(dh) / float(sh))
     new_w = int(round(sw * scale))
     new_h = int(round(sh * scale))
@@ -319,7 +319,7 @@ class YoloBBoxDetector:
         img_h, img_w = image_bgr.shape[:2]
 
         # preprocess image exactly once per call
-        lb_img, scale, pad_x, pad_y = _letterbox_image(
+        lb_img, scale, pad_x, pad_y = letterbox_image(
                                                             image_bgr = image_bgr,
                                                             dst_w = int(self._input_w),
                                                             dst_h = int(self._input_h),
