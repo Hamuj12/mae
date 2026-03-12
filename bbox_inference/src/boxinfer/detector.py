@@ -97,6 +97,55 @@ def _letterbox_image(
     return out, scale, float(left), float(top)
 
 
+def _rescale_camera_matrix_for_letterbox(
+                                            K_src: np.ndarray,
+                                            src_w: int,
+                                            src_h: int,
+                                            dst_w: int,
+                                            dst_h: int,
+                                        ) -> tuple[np.ndarray, float, float, float]:
+    """
+    Rescale camera intrinsics for letterboxed image coordinates.
+
+    Returns:
+    - K_lb: 3x3 intrinsics after resize+pad
+    - scale: uniform resize scale
+    - pad_x: left pad in pixels
+    - pad_y: top pad in pixels
+    """
+    K = np.asarray(K_src, dtype = float).reshape(3, 3)
+    sw = int(src_w)
+    sh = int(src_h)
+    dw = int(dst_w)
+    dh = int(dst_h)
+    if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+        raise ValueError(
+                            f'invalid source/destination image size for K letterbox rescale: '
+                            f'src=({sw}, {sh}), dst=({dw}, {dh})'
+                        )
+
+    # use same resize/pad policy as _letterbox_image()
+    scale = min(float(dw) / float(sw), float(dh) / float(sh))
+    new_w = int(round(sw * scale))
+    new_h = int(round(sh * scale))
+    pad_w = dw - new_w
+    pad_h = dh - new_h
+    pad_x = float(int(np.floor(pad_w / 2.0)))
+    pad_y = float(int(np.floor(pad_h / 2.0)))
+
+    # x_lb = scale * x_src + pad_x, y_lb = scale * y_src + pad_y
+    A = np.array(
+                    [
+                        [scale, 0.0, pad_x],
+                        [0.0, scale, pad_y],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype = float,
+                )
+    K_lb = A @ K
+    return K_lb, float(scale), pad_x, pad_y
+
+
 class YoloBBoxDetector:
     """Unified detector object that returns bbox, score, class, and inference timing"""
 
