@@ -62,6 +62,17 @@ def _parse_input_size(input_size) -> tuple[int, int]:
     return size, size
 
 
+def _validate_preprocessed_shape(image_bgr: np.ndarray, exp_h: int, exp_w: int) -> tuple[int, int]:
+    """Validate that a preprocessed image already matches detector input size."""
+    img_h, img_w = image_bgr.shape[:2]
+    if int(img_h) != int(exp_h) or int(img_w) != int(exp_w):
+        raise ValueError(
+                            f'preprocessed_input=True but image shape is ({int(img_h)}, {int(img_w)}); '
+                            f'expected ({int(exp_h)}, {int(exp_w)})'
+                        )
+    return int(img_h), int(img_w)
+
+
 def letterbox_image(
                         image_bgr: np.ndarray,
                         dst_w: int,
@@ -160,6 +171,7 @@ class YoloBBoxDetector:
                     class_whitelist: Optional[List[int]] = None,
                     prefer_cuda: bool = True,
                     device: str = 'cuda:0',
+                    preprocessed_input: bool = False,
                 ) -> None:
         # resolve once so logs carry canonical absolute path
         self._model_path = str(Path(str(model_path)).expanduser().resolve())
@@ -179,6 +191,7 @@ class YoloBBoxDetector:
         self._class_whitelist = set(class_whitelist or [])
         self._prefer_cuda     = bool(prefer_cuda)
         self._device          = str(device).strip() or 'cuda:0'
+        self._preprocessed_input = bool(preprocessed_input)
 
         # backend runtime state is initialized lazily in init helpers
         self._session       = None
@@ -232,6 +245,10 @@ class YoloBBoxDetector:
 
         if YOLO is None:
             raise ImportError('ultralytics is required for TensorRT backend')
+
+        # TensorRT engines are configured against the requested detector input size.
+        self._input_h = int(self._requested_input_h)
+        self._input_w = int(self._requested_input_w)
 
         # set task explicitly to avoid warning when metadata is not embedded in engine
         self._model = YOLO(self._model_path, task = 'detect')
@@ -318,12 +335,19 @@ class YoloBBoxDetector:
     def _detect_onnx(self, image_bgr: np.ndarray) -> DetectionResult:
         img_h, img_w = image_bgr.shape[:2]
 
-        # preprocess image exactly once per call
-        lb_img, scale, pad_x, pad_y = letterbox_image(
-                                                            image_bgr = image_bgr,
-                                                            dst_w = int(self._input_w),
-                                                            dst_h = int(self._input_h),
-                                                        )
+        # either preprocess inside detector or trust caller-provided detector-sized input
+        if self._preprocessed_input:
+            _validate_preprocessed_shape(image_bgr, exp_h = int(self._input_h), exp_w = int(self._input_w))
+            lb_img = image_bgr
+            scale = 1.0
+            pad_x = 0.0
+            pad_y = 0.0
+        else:
+            lb_img, scale, pad_x, pad_y = letterbox_image(
+                                                                image_bgr = image_bgr,
+                                                                dst_w = int(self._input_w),
+                                                                dst_h = int(self._input_h),
+                                                            )
         rgb = cv2.cvtColor(lb_img, cv2.COLOR_BGR2RGB)
         # model expects NCHW float32 in [0, 1]
         inp = rgb.astype(np.float32) / 255.0
@@ -420,10 +444,14 @@ class YoloBBoxDetector:
 
     def _detect_tensorrt(self, image_bgr: np.ndarray) -> DetectionResult:
         img_h, img_w    = image_bgr.shape[:2]
+        if self._preprocessed_input:
+            img_h, img_w = _validate_preprocessed_shape(image_bgr, exp_h = int(self._input_h), exp_w = int(self._input_w))
+
         classes_arg     = sorted(self._class_whitelist) if self._class_whitelist else None
         imgsz_arg       = int(self._input_h) if int(self._input_h) == int(self._input_w) else (int(self._input_h), int(self._input_w))
 
-        # ultralytics handles trt runtime and preprocessing for engine backend
+        # ultralytics still owns TensorRT runtime preprocessing; when preprocessed_input=True
+        # we enforce that the incoming image already matches detector input geometry.
         results = self._model.predict(
                                         source = image_bgr,
                                         imgsz = imgsz_arg,
