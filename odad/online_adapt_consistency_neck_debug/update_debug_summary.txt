@@ -1,0 +1,17 @@
+Update Debug Summary
+frames_total=300
+updates_applied=95
+
+module_idx=10 class=Upsample mean_grad_l2=0.00000000e+00 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=11 class=Concat mean_grad_l2=0.00000000e+00 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=12 class=C2f mean_grad_l2=3.92179916e+02 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=13 class=Upsample mean_grad_l2=0.00000000e+00 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=14 class=Concat mean_grad_l2=0.00000000e+00 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=15 class=C2f mean_grad_l2=2.59914834e+02 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=16 class=Conv mean_grad_l2=1.73097897e+02 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=17 class=Concat mean_grad_l2=0.00000000e+00 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=18 class=C2f mean_grad_l2=3.76457736e+02 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=19 class=Conv mean_grad_l2=2.13107972e+02 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=20 class=Concat mean_grad_l2=0.00000000e+00 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=21 class=C2f mean_grad_l2=3.65900552e+02 mean_delta_l2=0.00000000e+00 samples=95
+module_idx=22 class=Detect mean_grad_l2=4.23048340e+02 mean_delta_l2=5.65590086e-03 samples=95

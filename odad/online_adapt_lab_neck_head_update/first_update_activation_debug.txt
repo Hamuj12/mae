@@ -3,8 +3,8 @@ frame=61
 head_idx=22
 
 Activation Grad Norms at Selected Neck Modules
-module_idx=12 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=2.66369925e-01
-module_idx=15 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=1.40226986e-01
+module_idx=12 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=2.66369324e-01
+module_idx=15 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=1.40226873e-01
 module_idx=18 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=3.16370409e-01
 module_idx=21 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=4.88904875e-01
 

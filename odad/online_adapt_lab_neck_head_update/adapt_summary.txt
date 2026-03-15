@@ -3,6 +3,10 @@ weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
 dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
 frames=300
 imgsz=1024
+pseudo_mode=multibox
+pseudo_conf_thresh=0.800
+pseudo_topk=5
+pseudo_max_per_frame=5
 teacher_conf_thresh=0.800
 infer_conf=0.001
 iou=0.450
@@ -11,6 +15,8 @@ ema_decay=0.999000
 
 pseudo accepted: 95/300 (31.7%)
 updates applied: 95/300 (31.7%)
+mean pseudo boxes per accepted frame: 1.000
+mean boxes used per applied update: 1.000
 mean teacher conf:       0.718
 mean student post conf:  0.651
 mean adaptation loss:    2.7620

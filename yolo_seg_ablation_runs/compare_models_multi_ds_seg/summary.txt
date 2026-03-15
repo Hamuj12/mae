@@ -1,0 +1,32 @@
+YOLO Segmentation Ablation (Top-1 Instance Confidence Stats)
+device=cuda:0
+conf_threshold=0.250 iou=0.450
+n_vis_per_dataset=12 eval_images_per_dataset=500 bins=30
+
+Datasets:
+  - lab: /home/hm25936/datasets_for_yolo/lab_images_6000
+  - real: /home/hm25936/datasets_for_yolo/soho
+
+==== lab ====
+iou: 0.450
+
+[fda_mix]
+  top1_inst_rate@conf: 98.2%  (491/500)
+  top1_conf mean/med:  0.766 / 0.826
+  top1_conf std:       0.165
+  top1_conf p90/p99:   0.904 / 0.923
+  mean ± 2σ:           [0.436, 1.096]
+  mean ± 3σ:           [0.271, 1.261]
+  hist:                hist_top1conf_fda_mix.png
+
+==== real ====
+iou: 0.450
+
+[fda_mix]
+  top1_inst_rate@conf: 12.2%  (61/500)
+  top1_conf mean/med:  0.085 / 0.012
+  top1_conf std:       0.152
+  top1_conf p90/p99:   0.304 / 0.664
+  mean ± 2σ:           [-0.218, 0.389]
+  mean ± 3σ:           [-0.370, 0.541]
+  hist:                hist_top1conf_fda_mix.png

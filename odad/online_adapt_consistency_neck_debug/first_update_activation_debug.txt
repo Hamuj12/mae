@@ -1,0 +1,46 @@
+First Accepted Update Activation Debug
+frame=61
+head_idx=22
+
+Activation Grad Norms at Selected Neck Modules
+module_idx=12 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=2.66856732e-01
+module_idx=15 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=1.40270555e-01
+module_idx=18 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=3.16658049e-01
+module_idx=21 class=C2f num_tensors=1 num_nonzero=1 activation_grad_l2=4.88923071e-01
+
+Detect Input Activation Grad Norms
+name=detect_in.0 shape=(1, 65, 128, 128) grad_l2=3.00290001e-05
+name=detect_in.1 shape=(1, 65, 64, 64) grad_l2=6.01990199e-04
+name=detect_in.2 shape=(1, 65, 32, 32) grad_l2=3.67668182e-01
+
+Detect Output Activation Grad Norms
+name=detect_out.0 shape=(1, 65, 128, 128) grad_l2=3.00290001e-05
+name=detect_out.1 shape=(1, 65, 64, 64) grad_l2=6.01990199e-04
+name=detect_out.2 shape=(1, 65, 32, 32) grad_l2=3.67668182e-01
+
+Detect Branch Parameter Grad Summary
+branch=cv2.0 num_params=8 num_nonzero_grad=0 mean_grad_l2=0.00000000e+00 max_grad_l2=0.00000000e+00
+branch=cv2.1 num_params=8 num_nonzero_grad=0 mean_grad_l2=0.00000000e+00 max_grad_l2=0.00000000e+00
+branch=cv2.2 num_params=8 num_nonzero_grad=2 mean_grad_l2=6.50376307e-01 max_grad_l2=4.82114061e+00
+branch=cv3.0 num_params=8 num_nonzero_grad=2 mean_grad_l2=1.52681055e-04 max_grad_l2=7.80425554e-04
+branch=cv3.1 num_params=8 num_nonzero_grad=2 mean_grad_l2=1.16815048e-03 max_grad_l2=6.68851172e-03
+branch=cv3.2 num_params=8 num_nonzero_grad=2 mean_grad_l2=1.79873465e-01 max_grad_l2=1.02411111e+00
+branch=dfl num_params=1 num_nonzero_grad=0 mean_grad_l2=0.00000000e+00 max_grad_l2=0.00000000e+00
+
+Consistency Feature Diagnostics
+consistency_enabled=1 weight=1.00000000e+01 type=l2 source=neck stopgrad_teacher=1
+consistency_layers=[15, 18, 21]
+trainable_student_model_id=135967047623280 student_yolo_model_id=135967047623280 student_model_object_match=1
+ema_teacher_model_id=135967046042640 teacher_yolo_model_id=135967046042640 teacher_model_object_match=1
+student_cached_layers_identity_ok=1 teacher_cached_layers_identity_ok=1
+Consistency Explicit-Forward Capture Records
+student_capture source=neck method=explicit_forward module_idx=15 class=C2f module_id=135967047563408 model_id=135967047623280 module_in_trainable_graph=1 layer_matches_trainable_layers=1
+student_capture source=neck method=explicit_forward module_idx=18 class=C2f module_id=135967047996000 model_id=135967047623280 module_in_trainable_graph=1 layer_matches_trainable_layers=1
+student_capture source=neck method=explicit_forward module_idx=21 class=C2f module_id=135967047997904 model_id=135967047623280 module_in_trainable_graph=1 layer_matches_trainable_layers=1
+teacher_capture source=neck method=explicit_forward module_idx=15 class=C2f module_id=135967046112384 model_id=135967046042640 module_in_teacher_graph=1 layer_matches_teacher_layers=1
+teacher_capture source=neck method=explicit_forward module_idx=18 class=C2f module_id=135967046114288 model_id=135967046042640 module_in_teacher_graph=1 layer_matches_teacher_layers=1
+teacher_capture source=neck method=explicit_forward module_idx=21 class=C2f module_id=135967046116192 model_id=135967046042640 module_in_teacher_graph=1 layer_matches_teacher_layers=1
+consistency_taps=['neck[15].0', 'neck[18].0', 'neck[21].0']
+tap=neck[15].0 student_model_instance=student:135967047623280 student_model_id_matches_trainable=1 student_module_idx=15 student_module_class=C2f student_module_id=135967047563408 student_module_in_trainable_graph=1 student_capture_method=explicit_forward student_layer_matches_trainable_layers=1 teacher_model_instance=teacher:135967046042640 teacher_model_id_matches_ema=1 teacher_module_idx=15 teacher_module_class=C2f teacher_module_id=135967046112384 teacher_module_in_ema_graph=1 teacher_capture_method=explicit_forward teacher_layer_matches_teacher_layers=1 student_shape=(1, 64, 128, 128) teacher_shape=(1, 64, 128, 128) tap_loss=1.77012607e-02 student_grad_nonzero=1 student_grad_l2=1.40270555e-01
+tap=neck[18].0 student_model_instance=student:135967047623280 student_model_id_matches_trainable=1 student_module_idx=18 student_module_class=C2f student_module_id=135967047996000 student_module_in_trainable_graph=1 student_capture_method=explicit_forward student_layer_matches_trainable_layers=1 teacher_model_instance=teacher:135967046042640 teacher_model_id_matches_ema=1 teacher_module_idx=18 teacher_module_class=C2f teacher_module_id=135967046114288 teacher_module_in_ema_graph=1 teacher_capture_method=explicit_forward teacher_layer_matches_teacher_layers=1 student_shape=(1, 128, 64, 64) teacher_shape=(1, 128, 64, 64) tap_loss=1.34435333e-02 student_grad_nonzero=1 student_grad_l2=3.16658049e-01
+tap=neck[21].0 student_model_instance=student:135967047623280 student_model_id_matches_trainable=1 student_module_idx=21 student_module_class=C2f student_module_id=135967047997904 student_module_in_trainable_graph=1 student_capture_method=explicit_forward student_layer_matches_trainable_layers=1 teacher_model_instance=teacher:135967046042640 teacher_model_id_matches_ema=1 teacher_module_idx=21 teacher_module_class=C2f teacher_module_id=135967046116192 teacher_module_in_ema_graph=1 teacher_capture_method=explicit_forward teacher_layer_matches_teacher_layers=1 student_shape=(1, 256, 32, 32) teacher_shape=(1, 256, 32, 32) tap_loss=1.35033447e-02 student_grad_nonzero=1 student_grad_l2=4.88923071e-01

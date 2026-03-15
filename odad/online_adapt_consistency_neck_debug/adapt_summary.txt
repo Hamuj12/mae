@@ -1,0 +1,41 @@
+Online Adaptation Summary (Phase-1)
+weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+frames=300
+imgsz=1024
+teacher_conf_thresh=0.800
+infer_conf=0.001
+iou=0.450
+lr=3.00e-04
+ema_decay=0.999000
+consistency_weight=10.000000
+consistency_type=l2
+consistency_source=neck
+consistency_layers=[15, 18, 21]
+consistency_stopgrad_teacher=True
+
+pseudo accepted: 95/300 (31.7%)
+updates applied: 95/300 (31.7%)
+mean teacher conf:       0.718
+mean student post conf:  0.651
+mean adaptation loss:    2.7620
+mean total loss (det+cons): 2.8588
+mean consistency loss (updated frames): 0.009681
+mean teacher temporal IoU: 0.751
+mean student temporal IoU: 0.774
+mean student delta conf (all frames): -0.000399
+mean student delta conf (updated frames): -0.001259
+fraction updated frames improved: 0.042105
+mean student pre-post IoU: 0.999298
+mean student pre-post center shift: 0.082057
+
+Outputs:
+  csv: adapt_log.csv
+  update_debug_csv: update_debug.csv
+  update_debug_summary: update_debug_summary.txt
+  plots: plot_teacher_conf.png, plot_student_pre_conf.png, plot_student_post_conf.png, plot_pseudo_accept.png, plot_update_applied.png, plot_update_rate_roll.png, plot_loss_total.png, plot_teacher_iou_prev.png, plot_student_post_iou_prev.png, plot_student_delta_conf.png, plot_student_pre_post_iou.png, plot_student_pre_post_center_shift.png
+  hists: hist_teacher_conf.png, hist_student_post_conf.png, hist_loss_total.png, hist_student_delta_conf.png
+  first_update_debug: first_update_debug.txt
+  first_update_debug_csv: first_update_debug.csv
+  first_update_activation_debug: first_update_activation_debug.txt
+  mp4: adapt_overlay.mp4

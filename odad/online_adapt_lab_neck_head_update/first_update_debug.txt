@@ -4,6 +4,10 @@ optimizer_lr=3.00000000e-04
 global_grad_l2_before_clip=4.96086687e+00
 global_grad_l2_after_clip=4.96086687e+00
 
+num_pseudo_boxes_used=1
+pseudo_box_confidences=[0.821736]
+pseudo_box_targets_xywh=[(0.492393, 0.517885, 0.207703, 0.166518)]
+
 num_selected_trainable_params=103
 
 Top 20 Parameters by grad_l2

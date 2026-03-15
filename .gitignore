@@ -3,6 +3,7 @@ outputs/
 checkpoints/
 model_weights/
 yolov8n.pt
+yolov8n-seg.pt
 runs/
 wandb/
 output_dir/

@@ -68,11 +68,12 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 import matplotlib
@@ -169,6 +170,8 @@ class AdaptRecord:
     pseudo_accepted: int
     update_applied: int
     loss_total: float
+    consistency_loss: float
+    total_loss_with_consistency: float
     loss_box: float
     loss_cls: float
     loss_dfl: float
@@ -746,6 +749,492 @@ def safe_loss_items_to_dict(loss_items) -> Dict[str, float]:
     return out
 
 
+def parse_consistency_layers_arg(raw_values: Optional[List[str]]) -> Optional[List[int]]:
+    if raw_values is None:
+        return None
+    out: List[int] = []
+    for raw in raw_values:
+        parts = [p.strip() for p in str(raw).split(",")]
+        for part in parts:
+            if not part:
+                continue
+            try:
+                out.append(int(part))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid --consistency-layers token '{part}'. Expected integer indices."
+                ) from exc
+    if not out:
+        return None
+    deduped: List[int] = []
+    seen = set()
+    for idx in out:
+        if idx not in seen:
+            deduped.append(idx)
+            seen.add(idx)
+    return deduped
+
+
+def resolve_consistency_layers(
+    raw_values: Optional[List[str]],
+    consistency_source: str,
+) -> List[int]:
+    parsed = parse_consistency_layers_arg(raw_values)
+    if parsed is not None:
+        return parsed
+    if consistency_source == "neck":
+        return [15, 18, 21]
+    if consistency_source == "detect_in":
+        return [0, 1, 2]
+    raise RuntimeError(f"Unsupported consistency_source={consistency_source}")
+
+
+def collect_model_module_ids(model: nn.Module) -> Set[int]:
+    return {id(m) for m in model.modules()}
+
+
+def assert_cached_layers_match_model(
+    model: nn.Module,
+    cached_layers: List[nn.Module],
+    model_label: str,
+) -> None:
+    _, live_layers = unwrap_core_and_layers(model)
+    if len(live_layers) != len(cached_layers):
+        raise RuntimeError(
+            f"{model_label} cached layer count mismatch: cached={len(cached_layers)} live={len(live_layers)}. "
+            "Feature hooks may be attached to stale/wrong model objects."
+        )
+    mismatch_indices = [i for i, (cached, live) in enumerate(zip(cached_layers, live_layers)) if cached is not live]
+    if mismatch_indices:
+        first_idx = int(mismatch_indices[0])
+        raise RuntimeError(
+            f"{model_label} cached layer identity mismatch at idx={first_idx}: "
+            f"cached_id={id(cached_layers[first_idx])} live_id={id(live_layers[first_idx])}. "
+            "Feature taps must attach to the exact model used for forward/backward."
+        )
+
+
+def collect_feature_tensors(obj: Any, sink: List[torch.Tensor]) -> None:
+    if isinstance(obj, torch.Tensor):
+        sink.append(obj)
+        return
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            collect_feature_tensors(item, sink)
+        return
+    if isinstance(obj, dict):
+        for key in sorted(obj.keys()):
+            collect_feature_tensors(obj[key], sink)
+
+
+def resolve_layer_input_for_explicit_forward(
+    x: Any,
+    layer_outputs: List[Any],
+    from_spec: Any,
+    layer_idx: int,
+    model_label: str,
+) -> Any:
+    if from_spec == -1:
+        return x
+
+    if isinstance(from_spec, int):
+        if from_spec < 0:
+            ref_idx = layer_idx + from_spec
+        else:
+            ref_idx = from_spec
+        if ref_idx < 0 or ref_idx >= len(layer_outputs):
+            raise RuntimeError(
+                f"{model_label} explicit forward invalid from index at layer {layer_idx}: "
+                f"from={from_spec} resolved={ref_idx} available=[0,{len(layer_outputs)-1}]."
+            )
+        return layer_outputs[ref_idx]
+
+    if isinstance(from_spec, (list, tuple)):
+        out_list = []
+        for src in from_spec:
+            if src == -1:
+                out_list.append(x)
+                continue
+            if not isinstance(src, int):
+                raise RuntimeError(
+                    f"{model_label} explicit forward unsupported non-integer from entry at layer {layer_idx}: {src}."
+                )
+            ref_idx = (layer_idx + src) if src < 0 else src
+            if ref_idx < 0 or ref_idx >= len(layer_outputs):
+                raise RuntimeError(
+                    f"{model_label} explicit forward invalid from index at layer {layer_idx}: "
+                    f"from={src} resolved={ref_idx} available=[0,{len(layer_outputs)-1}]."
+                )
+            out_list.append(layer_outputs[ref_idx])
+        return out_list
+
+    raise RuntimeError(
+        f"{model_label} explicit forward unsupported from-spec type at layer {layer_idx}: {type(from_spec)}."
+    )
+
+
+def explicit_forward_with_feature_capture(
+    model: nn.Module,
+    layers: List[nn.Module],
+    img_tensor: torch.Tensor,
+    consistency_source: str,
+    consistency_layers: List[int],
+    head_idx: int,
+    model_label: str,
+    expected_model_id: int,
+    model_module_ids: Set[int],
+) -> Tuple[Any, Dict[int, List[Dict[str, object]]], List[Dict[str, object]], List[Dict[str, object]]]:
+    if int(id(model)) != int(expected_model_id):
+        raise RuntimeError(
+            f"{model_label} model identity mismatch for explicit capture: "
+            f"expected={expected_model_id} actual={id(model)}."
+        )
+    assert_cached_layers_match_model(model, layers, model_label=model_label)
+
+    consistency_layer_set = set(int(v) for v in consistency_layers)
+    neck_features: Dict[int, List[Dict[str, object]]] = {}
+    detect_input_features: List[Dict[str, object]] = []
+    capture_records: List[Dict[str, object]] = []
+    model_id = int(id(model))
+
+    x: Any = img_tensor
+    layer_outputs: List[Any] = []
+    for layer_idx, layer in enumerate(layers):
+        if id(layer) not in model_module_ids:
+            raise RuntimeError(
+                f"{model_label} explicit forward encountered layer idx={layer_idx} not in {model_label}_model graph."
+            )
+
+        from_spec = getattr(layer, "f", -1)
+        layer_input = resolve_layer_input_for_explicit_forward(
+            x=x,
+            layer_outputs=layer_outputs,
+            from_spec=from_spec,
+            layer_idx=layer_idx,
+            model_label=model_label,
+        )
+
+        if consistency_source == "detect_in" and layer_idx == int(head_idx):
+            refs: List[torch.Tensor] = []
+            collect_feature_tensors(layer_input, refs)
+            capture_records.append(
+                {
+                    "source": "detect_in",
+                    "capture_method": "explicit_forward",
+                    "model_label": model_label,
+                    "model_id": model_id,
+                    "module_idx": int(layer_idx),
+                    "module_name": layer.__class__.__name__,
+                    "module_id": int(id(layer)),
+                    "module_in_model_graph": 1,
+                    "layer_matches_cached_layers": 1,
+                }
+            )
+            for feat_pos, tensor_ref in enumerate(refs):
+                detect_input_features.append(
+                    {
+                        "tensor": tensor_ref,
+                        "feature_pos": int(feat_pos),
+                        "source": "detect_in",
+                        "capture_method": "explicit_forward",
+                        "model_label": model_label,
+                        "model_id": model_id,
+                        "module_idx": int(layer_idx),
+                        "module_name": layer.__class__.__name__,
+                        "module_id": int(id(layer)),
+                        "module_in_model_graph": 1,
+                        "layer_matches_cached_layers": 1,
+                    }
+                )
+
+        x = layer(layer_input)
+        layer_outputs.append(x)
+
+        if consistency_source == "neck" and layer_idx in consistency_layer_set:
+            refs = []
+            collect_feature_tensors(x, refs)
+            neck_features[layer_idx] = [
+                {
+                    "tensor": tensor_ref,
+                    "feature_pos": int(feat_pos),
+                    "source": "neck",
+                    "capture_method": "explicit_forward",
+                    "model_label": model_label,
+                    "model_id": model_id,
+                    "module_idx": int(layer_idx),
+                    "module_name": layer.__class__.__name__,
+                    "module_id": int(id(layer)),
+                    "module_in_model_graph": 1,
+                    "layer_matches_cached_layers": 1,
+                }
+                for feat_pos, tensor_ref in enumerate(refs)
+            ]
+            capture_records.append(
+                {
+                    "source": "neck",
+                    "capture_method": "explicit_forward",
+                    "model_label": model_label,
+                    "model_id": model_id,
+                    "module_idx": int(layer_idx),
+                    "module_name": layer.__class__.__name__,
+                    "module_id": int(id(layer)),
+                    "module_in_model_graph": 1,
+                    "layer_matches_cached_layers": 1,
+                }
+            )
+
+    return x, neck_features, detect_input_features, capture_records
+
+
+def assert_feature_meta_identity(
+    feature_meta: Dict[str, object],
+    expected_model_label: str,
+    expected_model_id: int,
+) -> None:
+    model_label = str(feature_meta.get("model_label"))
+    if model_label != expected_model_label:
+        raise RuntimeError(
+            f"Consistency tap model_label mismatch: expected={expected_model_label} actual={model_label}."
+        )
+    model_id = int(feature_meta.get("model_id", -1))
+    if model_id != int(expected_model_id):
+        raise RuntimeError(
+            f"Consistency tap model_id mismatch for {expected_model_label}: "
+            f"expected={expected_model_id} actual={model_id}."
+        )
+    if int(feature_meta.get("module_in_model_graph", 0)) != 1:
+        raise RuntimeError(
+            f"Consistency tap module is not in {expected_model_label}_model graph "
+            f"(module_idx={feature_meta.get('module_idx')}, module_id={feature_meta.get('module_id')})."
+        )
+    capture_method = str(feature_meta.get("capture_method", ""))
+    if capture_method != "explicit_forward":
+        raise RuntimeError(
+            f"Consistency tap capture method mismatch for {expected_model_label}: "
+            f"expected=explicit_forward actual={capture_method} "
+            f"(module_idx={feature_meta.get('module_idx')}, module_id={feature_meta.get('module_id')})."
+        )
+    if int(feature_meta.get("layer_matches_cached_layers", 0)) != 1:
+        raise RuntimeError(
+            f"Consistency tap layer identity does not match cached {expected_model_label} layer objects "
+            f"(module_idx={feature_meta.get('module_idx')}, module_id={feature_meta.get('module_id')})."
+        )
+
+
+def build_consistency_feature_pairs(
+    consistency_source: str,
+    consistency_layers: List[int],
+    student_neck_features: Dict[int, List[Dict[str, object]]],
+    teacher_neck_features: Dict[int, List[Dict[str, object]]],
+    student_detect_input_features: List[Dict[str, object]],
+    teacher_detect_input_features: List[Dict[str, object]],
+    student_layers: List[nn.Module],
+    teacher_layers: List[nn.Module],
+    expected_student_model_id: int,
+    expected_teacher_model_id: int,
+) -> List[Dict[str, object]]:
+    pairs: List[Dict[str, object]] = []
+
+    if consistency_source == "neck":
+        for layer_idx in consistency_layers:
+            if layer_idx not in student_neck_features:
+                raise RuntimeError(
+                    f"Missing student tapped feature for neck layer {layer_idx}. "
+                    "Ensure explicit-forward capture matches --consistency-layers."
+                )
+            if layer_idx not in teacher_neck_features:
+                raise RuntimeError(
+                    f"Missing teacher tapped feature for neck layer {layer_idx}. "
+                    "Ensure explicit-forward capture matches --consistency-layers."
+                )
+            s_feats = student_neck_features[layer_idx]
+            t_feats = teacher_neck_features[layer_idx]
+            if len(s_feats) != len(t_feats):
+                raise RuntimeError(
+                    f"Feature count mismatch at neck layer {layer_idx}: "
+                    f"student={len(s_feats)} teacher={len(t_feats)}."
+                )
+            for feat_pos, (s_meta, t_meta) in enumerate(zip(s_feats, t_feats)):
+                assert_feature_meta_identity(s_meta, "student", expected_student_model_id)
+                assert_feature_meta_identity(t_meta, "teacher", expected_teacher_model_id)
+                s_mod_idx = int(s_meta["module_idx"])
+                t_mod_idx = int(t_meta["module_idx"])
+                if s_mod_idx < 0 or s_mod_idx >= len(student_layers):
+                    raise RuntimeError(
+                        f"Student consistency tap has invalid module_idx={s_mod_idx} for tap neck[{layer_idx}].{feat_pos}."
+                    )
+                if t_mod_idx < 0 or t_mod_idx >= len(teacher_layers):
+                    raise RuntimeError(
+                        f"Teacher consistency tap has invalid module_idx={t_mod_idx} for tap neck[{layer_idx}].{feat_pos}."
+                    )
+                if int(s_meta["module_id"]) != int(id(student_layers[s_mod_idx])):
+                    raise RuntimeError(
+                        f"Student consistency tap module object mismatch at neck[{layer_idx}].{feat_pos}: "
+                        f"tap_module_id={int(s_meta['module_id'])} expected_layer_id={id(student_layers[s_mod_idx])}. "
+                        "Tap is not from exact trainable student_model layer object."
+                    )
+                if int(t_meta["module_id"]) != int(id(teacher_layers[t_mod_idx])):
+                    raise RuntimeError(
+                        f"Teacher consistency tap module object mismatch at neck[{layer_idx}].{feat_pos}: "
+                        f"tap_module_id={int(t_meta['module_id'])} expected_layer_id={id(teacher_layers[t_mod_idx])}. "
+                        "Tap is not from exact EMA teacher_model layer object."
+                    )
+                if s_mod_idx != t_mod_idx:
+                    raise RuntimeError(
+                        f"Consistency tap module_idx mismatch at neck[{layer_idx}].{feat_pos}: "
+                        f"student={s_mod_idx} teacher={t_mod_idx}."
+                    )
+                pairs.append(
+                    {
+                        "tap": f"neck[{layer_idx}].{feat_pos}",
+                        "student_meta": s_meta,
+                        "teacher_meta": t_meta,
+                        "student_tensor": s_meta["tensor"],
+                        "teacher_tensor": t_meta["tensor"],
+                    }
+                )
+        return pairs
+
+    if consistency_source == "detect_in":
+        if not student_detect_input_features:
+            raise RuntimeError("No student detect-input features were captured for source=detect_in.")
+        if not teacher_detect_input_features:
+            raise RuntimeError("No teacher detect-input features were captured for source=detect_in.")
+        if len(student_detect_input_features) != len(teacher_detect_input_features):
+            raise RuntimeError(
+                "Detect-input feature count mismatch between student and teacher: "
+                f"student={len(student_detect_input_features)} teacher={len(teacher_detect_input_features)}."
+            )
+
+        max_idx = len(student_detect_input_features) - 1
+        for feat_idx in consistency_layers:
+            if feat_idx < 0 or feat_idx > max_idx:
+                raise RuntimeError(
+                    f"Invalid consistency layer index {feat_idx} for source=detect_in; "
+                    f"expected range [0, {max_idx}] based on captured detect-input features."
+                )
+            s_meta = student_detect_input_features[feat_idx]
+            t_meta = teacher_detect_input_features[feat_idx]
+            assert_feature_meta_identity(s_meta, "student", expected_student_model_id)
+            assert_feature_meta_identity(t_meta, "teacher", expected_teacher_model_id)
+            s_mod_idx = int(s_meta["module_idx"])
+            t_mod_idx = int(t_meta["module_idx"])
+            if s_mod_idx < 0 or s_mod_idx >= len(student_layers):
+                raise RuntimeError(
+                    f"Student detect_in tap has invalid module_idx={s_mod_idx} for tap detect_in[{feat_idx}]."
+                )
+            if t_mod_idx < 0 or t_mod_idx >= len(teacher_layers):
+                raise RuntimeError(
+                    f"Teacher detect_in tap has invalid module_idx={t_mod_idx} for tap detect_in[{feat_idx}]."
+                )
+            if int(s_meta["module_id"]) != int(id(student_layers[s_mod_idx])):
+                raise RuntimeError(
+                    f"Student detect_in tap module object mismatch at detect_in[{feat_idx}]: "
+                    f"tap_module_id={int(s_meta['module_id'])} expected_layer_id={id(student_layers[s_mod_idx])}. "
+                    "Tap is not from exact trainable student_model layer object."
+                )
+            if int(t_meta["module_id"]) != int(id(teacher_layers[t_mod_idx])):
+                raise RuntimeError(
+                    f"Teacher detect_in tap module object mismatch at detect_in[{feat_idx}]: "
+                    f"tap_module_id={int(t_meta['module_id'])} expected_layer_id={id(teacher_layers[t_mod_idx])}. "
+                    "Tap is not from exact EMA teacher_model layer object."
+                )
+            if s_mod_idx != t_mod_idx:
+                raise RuntimeError(
+                    f"Detect-input tap module_idx mismatch at detect_in[{feat_idx}]: "
+                    f"student={s_mod_idx} teacher={t_mod_idx}."
+                )
+            pairs.append(
+                {
+                    "tap": f"detect_in[{feat_idx}]",
+                    "student_meta": s_meta,
+                    "teacher_meta": t_meta,
+                    "student_tensor": s_meta["tensor"],
+                    "teacher_tensor": t_meta["tensor"],
+                }
+            )
+        return pairs
+
+    raise RuntimeError(f"Unsupported consistency_source={consistency_source}")
+
+
+def compute_consistency_loss(
+    feature_pairs: List[Dict[str, object]],
+    consistency_type: str,
+    stopgrad_teacher: bool,
+) -> Tuple[torch.Tensor, List[Dict[str, object]]]:
+    if not feature_pairs:
+        raise RuntimeError("No feature pairs available to compute consistency loss.")
+
+    per_tap_losses: List[torch.Tensor] = []
+    per_tap_debug: List[Dict[str, object]] = []
+
+    for pair in feature_pairs:
+        tap_name = str(pair["tap"])
+        student_meta = pair["student_meta"]
+        teacher_meta = pair["teacher_meta"]
+        student_feat = pair["student_tensor"]
+        teacher_feat = pair["teacher_tensor"]
+        if not isinstance(student_feat, torch.Tensor) or not isinstance(teacher_feat, torch.Tensor):
+            raise RuntimeError(f"Consistency tap {tap_name} did not produce tensor features.")
+        if tuple(student_feat.shape) != tuple(teacher_feat.shape):
+            raise RuntimeError(
+                f"Shape mismatch for consistency tap {tap_name}: "
+                f"student={tuple(student_feat.shape)} teacher={tuple(teacher_feat.shape)}."
+            )
+
+        teacher_ref = teacher_feat.detach() if stopgrad_teacher else teacher_feat
+
+        if consistency_type == "l2":
+            tap_loss = F.mse_loss(student_feat, teacher_ref)
+        elif consistency_type == "smoothl1":
+            tap_loss = F.smooth_l1_loss(student_feat, teacher_ref)
+        elif consistency_type == "cosine":
+            if student_feat.ndim == 0:
+                student_flat = student_feat.float().view(1, 1)
+                teacher_flat = teacher_ref.float().view(1, 1)
+            elif student_feat.ndim == 1:
+                student_flat = student_feat.float().view(1, -1)
+                teacher_flat = teacher_ref.float().view(1, -1)
+            else:
+                student_flat = student_feat.float().reshape(student_feat.shape[0], -1)
+                teacher_flat = teacher_ref.float().reshape(teacher_ref.shape[0], -1)
+            cosine_sim = F.cosine_similarity(student_flat, teacher_flat, dim=1, eps=1e-8)
+            tap_loss = 1.0 - cosine_sim.mean()
+        else:
+            raise RuntimeError(f"Unsupported consistency_type={consistency_type}")
+
+        per_tap_losses.append(tap_loss)
+        per_tap_debug.append(
+            {
+                "tap": tap_name,
+                "student_shape": tuple(student_feat.shape),
+                "teacher_shape": tuple(teacher_feat.shape),
+                "loss_tensor": tap_loss,
+                "student_tensor": student_feat,
+                "student_model_label": str(student_meta["model_label"]),
+                "teacher_model_label": str(teacher_meta["model_label"]),
+                "student_model_id": int(student_meta["model_id"]),
+                "teacher_model_id": int(teacher_meta["model_id"]),
+                "student_module_idx": int(student_meta["module_idx"]),
+                "teacher_module_idx": int(teacher_meta["module_idx"]),
+                "student_module_name": str(student_meta["module_name"]),
+                "teacher_module_name": str(teacher_meta["module_name"]),
+                "student_module_id": int(student_meta["module_id"]),
+                "teacher_module_id": int(teacher_meta["module_id"]),
+                "student_module_in_model_graph": int(student_meta["module_in_model_graph"]),
+                "teacher_module_in_model_graph": int(teacher_meta["module_in_model_graph"]),
+                "student_capture_method": str(student_meta["capture_method"]),
+                "teacher_capture_method": str(teacher_meta["capture_method"]),
+                "student_layer_matches_cached_layers": int(student_meta["layer_matches_cached_layers"]),
+                "teacher_layer_matches_cached_layers": int(teacher_meta["layer_matches_cached_layers"]),
+            }
+        )
+
+    total = torch.stack(per_tap_losses).mean()
+    return total, per_tap_debug
+
+
 # -------------------------
 # CLI
 # -------------------------
@@ -779,7 +1268,45 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--ema-decay", type=float, default=0.999, help="Teacher EMA decay per accepted update")
     p.add_argument("--grad-clip", type=float, default=10.0, help="Gradient clipping max norm")
+    p.add_argument(
+        "--consistency-weight",
+        type=float,
+        default=0.0,
+        help="Feature consistency loss weight; 0 disables consistency path",
+    )
+    p.add_argument(
+        "--consistency-type",
+        type=str,
+        default="l2",
+        choices=["l2", "smoothl1", "cosine"],
+        help="Feature consistency loss type",
+    )
+    p.add_argument(
+        "--consistency-source",
+        type=str,
+        default="detect_in",
+        choices=["neck", "detect_in"],
+        help="Feature source for teacher-student consistency",
+    )
+    p.add_argument(
+        "--consistency-layers",
+        type=str,
+        action="append",
+        default=None,
+        help="Repeatable and/or comma-separated feature indices used by consistency-source",
+    )
+    p.add_argument(
+        "--consistency-stopgrad-teacher",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detach teacher features before consistency loss (teacher is always no-grad)",
+    )
     p.add_argument("--debug-first-update", action="store_true", help="Verbose diagnostics on the first accepted update")
+    p.add_argument(
+        "--debug-consistency-only",
+        action="store_true",
+        help="On first accepted update, run an extra consistency-only backward diagnostic before normal backward",
+    )
     p.add_argument("--seed", type=int, default=0, help="RNG seed")
 
     # Pseudo-label gating
@@ -827,11 +1354,33 @@ def main() -> None:
     student_model = student_yolo.model
     teacher_model = teacher_yolo.model
 
+    if student_model is not student_yolo.model:
+        raise RuntimeError(
+            "student_model object mismatch: local student_model is not identical to student_yolo.model."
+        )
+    if teacher_model is not teacher_yolo.model:
+        raise RuntimeError(
+            "teacher_model object mismatch: local teacher_model is not identical to teacher_yolo.model."
+        )
+
     student_model.to(args.device)
     teacher_model.to(args.device)
 
+    student_model_id = int(id(student_model))
+    teacher_model_id = int(id(teacher_model))
+    student_model_module_ids = collect_model_module_ids(student_model)
+    teacher_model_module_ids = collect_model_module_ids(teacher_model)
+
     core_model, layers = unwrap_core_and_layers(student_model)
+    _teacher_core_model, teacher_layers = unwrap_core_and_layers(teacher_model)
     head_idx = find_head_idx(layers)
+    teacher_head_idx = find_head_idx(teacher_layers)
+    if teacher_head_idx != head_idx:
+        raise RuntimeError(
+            f"Student/teacher Detect head index mismatch: student={head_idx}, teacher={teacher_head_idx}."
+        )
+    assert_cached_layers_match_model(student_model, layers, model_label="student")
+    assert_cached_layers_match_model(teacher_model, teacher_layers, model_label="teacher")
     neck_start_idx = resolve_neck_start_idx(core_model, int(args.neck_start_idx))
     unfrozen_indices = compute_unfrozen_indices(
         update_scope=str(args.update_scope),
@@ -840,6 +1389,31 @@ def main() -> None:
         n_layers=len(layers),
     )
     apply_freeze_policy(student_model, layers, unfrozen_indices)
+
+    consistency_weight = float(args.consistency_weight)
+    consistency_enabled = bool(consistency_weight > 0.0)
+    consistency_source = str(args.consistency_source)
+    consistency_type = str(args.consistency_type)
+    consistency_layers = resolve_consistency_layers(args.consistency_layers, consistency_source)
+    if consistency_enabled:
+        if consistency_source == "neck":
+            for layer_idx in consistency_layers:
+                if layer_idx < 0 or layer_idx >= len(layers):
+                    raise RuntimeError(
+                        f"Invalid consistency layer index {layer_idx} for source=neck; "
+                        f"expected range [0, {len(layers) - 1}] for student model."
+                    )
+                if layer_idx >= len(teacher_layers):
+                    raise RuntimeError(
+                        f"Invalid consistency layer index {layer_idx} for source=neck; "
+                        f"teacher model has {len(teacher_layers)} layers."
+                    )
+        elif consistency_source == "detect_in":
+            for feat_idx in consistency_layers:
+                if feat_idx < 0:
+                    raise RuntimeError(
+                        f"Invalid consistency layer index {feat_idx} for source=detect_in; expected non-negative indices."
+                    )
 
     if neck_start_idx is None:
         raise RuntimeError(
@@ -854,6 +1428,12 @@ def main() -> None:
     print(f"[adapt] head_idx={head_idx}")
     print(f"[adapt] unfrozen_modules={unfrozen_desc}")
     print(f"[adapt] trainable_params={trainable_param_count}")
+    print(f"[adapt] consistency_weight={consistency_weight:.6f}")
+    print(f"[adapt] consistency_type={consistency_type}")
+    print(f"[adapt] consistency_source={consistency_source}")
+    print(f"[adapt] consistency_layers={consistency_layers}")
+    print(f"[adapt] consistency_stopgrad_teacher={bool(args.consistency_stopgrad_teacher)}")
+    print(f"[adapt] student_model_id={student_model_id} teacher_model_id={teacher_model_id}")
     unfrozen_module_tags = [f"m{i}_{layers[i].__class__.__name__}" for i in unfrozen_indices]
 
     selected_trainable_params = collect_selected_trainable_params(student_model, layers, unfrozen_indices)
@@ -1035,6 +1615,8 @@ def main() -> None:
         # -------------------------
         update_applied = False
         loss_total = float("nan")
+        consistency_loss_value = float("nan")
+        total_loss_with_consistency = float("nan")
         loss_box = float("nan")
         loss_cls = float("nan")
         loss_dfl = float("nan")
@@ -1069,8 +1651,54 @@ def main() -> None:
                 "bboxes": torch.tensor([[x_c, y_c, bw, bh]], dtype=torch.float32, device=args.device),
             }
 
+            teacher_neck_features: Dict[int, List[Dict[str, object]]] = {}
+            teacher_detect_input_features: List[Dict[str, object]] = []
+            student_neck_features: Dict[int, List[Dict[str, object]]] = {}
+            student_detect_input_features: List[Dict[str, object]] = []
+            consistency_tap_debug: List[Dict[str, object]] = []
+            teacher_consistency_capture_records: List[Dict[str, object]] = []
+            student_consistency_capture_records: List[Dict[str, object]] = []
+            student_cached_layers_identity_ok = False
+            teacher_cached_layers_identity_ok = False
+            det_loss_scalar: Optional[torch.Tensor] = None
+            consistency_loss_scalar: Optional[torch.Tensor] = None
+            total_loss_scalar: Optional[torch.Tensor] = None
+            consistency_only_diag_ran = False
+            consistency_only_diag_reason = "disabled"
+            consistency_only_loss_unweighted = float("nan")
+            consistency_only_loss_weighted = float("nan")
+            consistency_only_global_grad_l2 = float("nan")
+            consistency_only_backward_error = ""
+            consistency_only_param_records: List[Dict[str, object]] = []
+
             # IMPORTANT: explicitly re-enable grad mode after Ultralytics predict()
             with torch.inference_mode(False):
+                if consistency_enabled:
+                    assert_cached_layers_match_model(student_model, layers, model_label="student")
+                    assert_cached_layers_match_model(teacher_model, teacher_layers, model_label="teacher")
+                    student_cached_layers_identity_ok = True
+                    teacher_cached_layers_identity_ok = True
+                    teacher_weak_letterboxed, _, _, _ = letterbox_image(img_rgb, int(args.imgsz))
+                    teacher_img_tensor = pil_to_model_tensor(teacher_weak_letterboxed).to(args.device)
+                    teacher_model.eval()
+                    with torch.no_grad():
+                        (
+                            _teacher_preds_unused,
+                            teacher_neck_features,
+                            teacher_detect_input_features,
+                            teacher_consistency_capture_records,
+                        ) = explicit_forward_with_feature_capture(
+                            model=teacher_model,
+                            layers=teacher_layers,
+                            img_tensor=teacher_img_tensor,
+                            consistency_source=consistency_source,
+                            consistency_layers=consistency_layers,
+                            head_idx=teacher_head_idx,
+                            model_label="teacher",
+                            expected_model_id=teacher_model_id,
+                            model_module_ids=teacher_model_module_ids,
+                        )
+
                 with torch.enable_grad():
                     student_model.train()
                     optimizer.zero_grad(set_to_none=True)
@@ -1105,7 +1733,25 @@ def main() -> None:
                             activation_hook_handles.append(layers[head_idx].register_forward_hook(detect_io_hook))
 
                     try:
-                        preds = student_model(img_tensor)
+                        if consistency_enabled:
+                            (
+                                preds,
+                                student_neck_features,
+                                student_detect_input_features,
+                                student_consistency_capture_records,
+                            ) = explicit_forward_with_feature_capture(
+                                model=student_model,
+                                layers=layers,
+                                img_tensor=img_tensor,
+                                consistency_source=consistency_source,
+                                consistency_layers=consistency_layers,
+                                head_idx=head_idx,
+                                model_label="student",
+                                expected_model_id=student_model_id,
+                                model_module_ids=student_model_module_ids,
+                            )
+                        else:
+                            preds = student_model(img_tensor)
                     finally:
                         for handle in activation_hook_handles:
                             handle.remove()
@@ -1156,8 +1802,64 @@ def main() -> None:
 
                     # Some Ultralytics versions return a vector [box, cls, dfl].
                     # Backprop requires a scalar.
-                    loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
-                    loss_scalar.backward()
+                    det_loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
+                    if consistency_enabled:
+                        feature_pairs = build_consistency_feature_pairs(
+                            consistency_source=consistency_source,
+                            consistency_layers=consistency_layers,
+                            student_neck_features=student_neck_features,
+                            teacher_neck_features=teacher_neck_features,
+                            student_detect_input_features=student_detect_input_features,
+                            teacher_detect_input_features=teacher_detect_input_features,
+                            student_layers=layers,
+                            teacher_layers=teacher_layers,
+                            expected_student_model_id=student_model_id,
+                            expected_teacher_model_id=teacher_model_id,
+                        )
+                        consistency_loss_scalar, consistency_tap_debug = compute_consistency_loss(
+                            feature_pairs=feature_pairs,
+                            consistency_type=consistency_type,
+                            stopgrad_teacher=bool(args.consistency_stopgrad_teacher),
+                        )
+                        if debug_this_update:
+                            for rec in consistency_tap_debug:
+                                student_tensor = rec["student_tensor"]
+                                if isinstance(student_tensor, torch.Tensor) and student_tensor.requires_grad:
+                                    student_tensor.retain_grad()
+                    else:
+                        consistency_loss_scalar = det_loss_scalar.new_tensor(0.0)
+                        consistency_tap_debug = []
+
+                    run_consistency_only_diag = bool(debug_this_update and bool(args.debug_consistency_only))
+                    if run_consistency_only_diag:
+                        if not consistency_enabled:
+                            consistency_only_diag_reason = "skipped_consistency_disabled"
+                        else:
+                            consistency_only_diag_reason = "ran"
+                            consistency_only_diag_ran = True
+                            consistency_only_loss_unweighted = float(consistency_loss_scalar.detach().cpu())
+                            consistency_only_obj = consistency_weight * consistency_loss_scalar
+                            consistency_only_loss_weighted = float(consistency_only_obj.detach().cpu())
+                            optimizer.zero_grad(set_to_none=True)
+                            try:
+                                consistency_only_obj.backward(retain_graph=True)
+                            except RuntimeError as exc:
+                                consistency_only_backward_error = str(exc)
+                                consistency_only_diag_reason = "backward_error"
+                            consistency_only_global_grad_l2 = params_grad_l2_norm(optim_params)
+                            for selected_entry in selected_trainable_params:
+                                consistency_only_param_records.append(
+                                    {
+                                        "param_name": str(selected_entry["name"]),
+                                        "module_idx": int(selected_entry["module_idx"]),
+                                        "module_name": str(selected_entry["module_name"]),
+                                        "grad_l2": float(tensor_l2_norm(selected_entry["param"].grad)),
+                                    }
+                                )
+                            optimizer.zero_grad(set_to_none=True)
+
+                    total_loss_scalar = det_loss_scalar + (consistency_weight * consistency_loss_scalar)
+                    total_loss_scalar.backward()
                     params_before_step_by_idx = {}
                     for mod_pos, mod_idx in enumerate(unfrozen_indices):
                         module = layers[mod_idx]
@@ -1272,6 +1974,9 @@ def main() -> None:
                         debug_lines = [
                             "First Accepted Update Debug",
                             f"frame={idx}",
+                            f"det_loss={float(det_loss_scalar.detach().cpu()):.8e}",
+                            f"consistency_loss={float(consistency_loss_scalar.detach().cpu()):.8e}",
+                            f"total_loss={float(total_loss_scalar.detach().cpu()):.8e}",
                             f"optimizer_lr={optimizer_lr:.8e}",
                             f"global_grad_l2_before_clip={global_grad_before_clip:.8e}",
                             f"global_grad_l2_after_clip={global_grad_after_clip:.8e}",
@@ -1279,6 +1984,77 @@ def main() -> None:
                             f"num_selected_trainable_params={len(debug_param_records_pre)}",
                             "",
                         ]
+                        debug_lines.append("Consistency-Only Backward Diagnostics")
+                        debug_lines.append(
+                            f"requested={int(bool(args.debug_consistency_only))} "
+                            f"ran={int(consistency_only_diag_ran)} "
+                            f"reason={consistency_only_diag_reason}"
+                        )
+                        debug_lines.append(f"consistency_only_loss_unweighted={consistency_only_loss_unweighted:.8e}")
+                        debug_lines.append(f"consistency_only_loss_weighted={consistency_only_loss_weighted:.8e}")
+                        debug_lines.append(f"consistency_only_global_grad_l2={consistency_only_global_grad_l2:.8e}")
+                        if consistency_only_backward_error:
+                            debug_lines.append(f"consistency_only_backward_error={consistency_only_backward_error}")
+
+                        if consistency_only_param_records:
+                            eps = 1e-12
+                            n_nonzero_cons = int(sum(1 for rec in consistency_only_param_records if float(rec["grad_l2"]) > eps))
+                            if n_nonzero_cons == 0:
+                                debug_lines.append(
+                                    "consistency_only_nonzero_grad_params=0 (all selected trainable params had zero grad)"
+                                )
+                            else:
+                                debug_lines.append(
+                                    f"consistency_only_nonzero_grad_params={n_nonzero_cons}/{len(consistency_only_param_records)}"
+                                )
+
+                            debug_lines.append("Consistency-Only Top 20 Parameters by grad_l2")
+                            top_consistency_only = sorted(
+                                consistency_only_param_records,
+                                key=lambda r: float(r["grad_l2"]),
+                                reverse=True,
+                            )[:20]
+                            for rank, rec in enumerate(top_consistency_only, start=1):
+                                debug_lines.append(
+                                    f"{rank:02d} grad_l2={float(rec['grad_l2']):.8e} "
+                                    f"module_idx={int(rec['module_idx'])} class={rec['module_name']} "
+                                    f"name={rec['param_name']}"
+                                )
+
+                            per_module_cons: Dict[Tuple[int, str], Dict[str, float]] = {}
+                            for rec in consistency_only_param_records:
+                                key = (int(rec["module_idx"]), str(rec["module_name"]))
+                                if key not in per_module_cons:
+                                    per_module_cons[key] = {
+                                        "num_params": 0.0,
+                                        "num_nonzero_grad": 0.0,
+                                        "sum_grad_l2": 0.0,
+                                        "max_grad_l2": 0.0,
+                                    }
+                                stat = per_module_cons[key]
+                                grad_v = float(rec["grad_l2"])
+                                stat["num_params"] += 1.0
+                                stat["sum_grad_l2"] += grad_v
+                                if grad_v > eps:
+                                    stat["num_nonzero_grad"] += 1.0
+                                stat["max_grad_l2"] = max(float(stat["max_grad_l2"]), grad_v)
+
+                            debug_lines.append("Consistency-Only Per-Module Aggregation (selected trainable params)")
+                            for key in sorted(per_module_cons.keys(), key=lambda x: x[0]):
+                                mod_idx, mod_name = key
+                                stat = per_module_cons[key]
+                                n = max(1.0, float(stat["num_params"]))
+                                debug_lines.append(
+                                    f"module_idx={mod_idx} class={mod_name} "
+                                    f"num_params={int(stat['num_params'])} "
+                                    f"num_nonzero_grad={int(stat['num_nonzero_grad'])} "
+                                    f"mean_grad_l2={float(stat['sum_grad_l2'])/n:.8e} "
+                                    f"max_grad_l2={float(stat['max_grad_l2']):.8e}"
+                                )
+                        else:
+                            debug_lines.append("consistency_only_param_grad_records=none")
+                        debug_lines.append("")
+
                         if not debug_param_records_pre:
                             debug_lines.append("No selected trainable parameters available for first-update diagnostics.")
 
@@ -1413,6 +2189,98 @@ def main() -> None:
                                 f"max_grad_l2={float(stat['max_grad_l2']):.8e}"
                             )
 
+                        activation_debug_lines.append("")
+                        activation_debug_lines.append("Consistency Feature Diagnostics")
+                        activation_debug_lines.append(
+                            f"consistency_enabled={int(consistency_enabled)} "
+                            f"weight={consistency_weight:.8e} "
+                            f"type={consistency_type} "
+                            f"source={consistency_source} "
+                            f"stopgrad_teacher={int(bool(args.consistency_stopgrad_teacher))}"
+                        )
+                        activation_debug_lines.append(f"consistency_layers={consistency_layers}")
+                        activation_debug_lines.append(
+                            f"trainable_student_model_id={student_model_id} "
+                            f"student_yolo_model_id={id(student_yolo.model)} "
+                            f"student_model_object_match={int(student_model is student_yolo.model)}"
+                        )
+                        activation_debug_lines.append(
+                            f"ema_teacher_model_id={teacher_model_id} "
+                            f"teacher_yolo_model_id={id(teacher_yolo.model)} "
+                            f"teacher_model_object_match={int(teacher_model is teacher_yolo.model)}"
+                        )
+                        activation_debug_lines.append(
+                            f"student_cached_layers_identity_ok={int(student_cached_layers_identity_ok)} "
+                            f"teacher_cached_layers_identity_ok={int(teacher_cached_layers_identity_ok)}"
+                        )
+                        activation_debug_lines.append("Consistency Explicit-Forward Capture Records")
+                        if not student_consistency_capture_records:
+                            activation_debug_lines.append("student_consistency_capture_records=none")
+                        for reg in student_consistency_capture_records:
+                            activation_debug_lines.append(
+                                f"student_capture source={reg['source']} "
+                                f"method={reg['capture_method']} "
+                                f"module_idx={int(reg['module_idx'])} "
+                                f"class={reg['module_name']} "
+                                f"module_id={int(reg['module_id'])} "
+                                f"model_id={int(reg['model_id'])} "
+                                f"module_in_trainable_graph={int(reg['module_in_model_graph'])} "
+                                f"layer_matches_trainable_layers={int(reg['layer_matches_cached_layers'])}"
+                            )
+                        if not teacher_consistency_capture_records:
+                            activation_debug_lines.append("teacher_consistency_capture_records=none")
+                        for reg in teacher_consistency_capture_records:
+                            activation_debug_lines.append(
+                                f"teacher_capture source={reg['source']} "
+                                f"method={reg['capture_method']} "
+                                f"module_idx={int(reg['module_idx'])} "
+                                f"class={reg['module_name']} "
+                                f"module_id={int(reg['module_id'])} "
+                                f"model_id={int(reg['model_id'])} "
+                                f"module_in_teacher_graph={int(reg['module_in_model_graph'])} "
+                                f"layer_matches_teacher_layers={int(reg['layer_matches_cached_layers'])}"
+                            )
+                        if not consistency_tap_debug:
+                            activation_debug_lines.append("consistency_taps=none")
+                        else:
+                            tap_names = [str(rec["tap"]) for rec in consistency_tap_debug]
+                            activation_debug_lines.append(f"consistency_taps={tap_names}")
+                            for rec in consistency_tap_debug:
+                                student_tensor = rec["student_tensor"]
+                                grad_norm = (
+                                    float(tensor_l2_norm(student_tensor.grad))
+                                    if isinstance(student_tensor, torch.Tensor)
+                                    else 0.0
+                                )
+                                grad_nonzero = int(grad_norm > 1e-12)
+                                loss_val = float(rec["loss_tensor"].detach().cpu())
+                                student_model_id_match = int(int(rec["student_model_id"]) == int(student_model_id))
+                                teacher_model_id_match = int(int(rec["teacher_model_id"]) == int(teacher_model_id))
+                                activation_debug_lines.append(
+                                    f"tap={rec['tap']} "
+                                    f"student_model_instance={rec['student_model_label']}:{int(rec['student_model_id'])} "
+                                    f"student_model_id_matches_trainable={student_model_id_match} "
+                                    f"student_module_idx={int(rec['student_module_idx'])} "
+                                    f"student_module_class={rec['student_module_name']} "
+                                    f"student_module_id={int(rec['student_module_id'])} "
+                                    f"student_module_in_trainable_graph={int(rec['student_module_in_model_graph'])} "
+                                    f"student_capture_method={rec['student_capture_method']} "
+                                    f"student_layer_matches_trainable_layers={int(rec['student_layer_matches_cached_layers'])} "
+                                    f"teacher_model_instance={rec['teacher_model_label']}:{int(rec['teacher_model_id'])} "
+                                    f"teacher_model_id_matches_ema={teacher_model_id_match} "
+                                    f"teacher_module_idx={int(rec['teacher_module_idx'])} "
+                                    f"teacher_module_class={rec['teacher_module_name']} "
+                                    f"teacher_module_id={int(rec['teacher_module_id'])} "
+                                    f"teacher_module_in_ema_graph={int(rec['teacher_module_in_model_graph'])} "
+                                    f"teacher_capture_method={rec['teacher_capture_method']} "
+                                    f"teacher_layer_matches_teacher_layers={int(rec['teacher_layer_matches_cached_layers'])} "
+                                    f"student_shape={rec['student_shape']} "
+                                    f"teacher_shape={rec['teacher_shape']} "
+                                    f"tap_loss={loss_val:.8e} "
+                                    f"student_grad_nonzero={grad_nonzero} "
+                                    f"student_grad_l2={grad_norm:.8e}"
+                                )
+
                         first_update_debug_lines = debug_lines
                         first_update_activation_debug_lines = activation_debug_lines
                         for line in debug_lines:
@@ -1425,7 +2293,11 @@ def main() -> None:
             update_teacher_ema(teacher_model, student_model, decay=float(args.ema_decay))
             update_applied = True
 
-            loss_total = float(loss_scalar.detach().cpu())
+            if det_loss_scalar is None or consistency_loss_scalar is None or total_loss_scalar is None:
+                raise RuntimeError("Internal error: loss tensors were not computed for accepted update.")
+            loss_total = float(det_loss_scalar.detach().cpu())
+            consistency_loss_value = float(consistency_loss_scalar.detach().cpu())
+            total_loss_with_consistency = float(total_loss_scalar.detach().cpu())
             loss_dict = safe_loss_items_to_dict(loss_items)
             loss_box = loss_dict["box"]
             loss_cls = loss_dict["cls"]
@@ -1500,6 +2372,8 @@ def main() -> None:
                 pseudo_accepted=int(pseudo_accepted),
                 update_applied=int(update_applied),
                 loss_total=float(loss_total),
+                consistency_loss=float(consistency_loss_value),
+                total_loss_with_consistency=float(total_loss_with_consistency),
                 loss_box=float(loss_box),
                 loss_cls=float(loss_cls),
                 loss_dfl=float(loss_dfl),
@@ -1512,6 +2386,8 @@ def main() -> None:
             {
                 "frame": idx,
                 "update_applied": int(update_applied),
+                "consistency_loss": float(consistency_loss_value),
+                "total_loss_with_consistency": float(total_loss_with_consistency),
                 "grad_norms": list(update_grad_norms),
                 "delta_norms": list(update_delta_norms),
             }
@@ -1558,7 +2434,7 @@ def main() -> None:
                 "student_post_det", "student_post_conf", "student_post_x1", "student_post_y1", "student_post_x2", "student_post_y2", "student_post_iou_prev",
                 "student_delta_conf", "student_pre_post_iou", "student_pre_post_center_shift",
                 "pseudo_accepted", "update_applied",
-                "loss_total", "loss_box", "loss_cls", "loss_dfl",
+                "loss_total", "consistency_loss", "total_loss_with_consistency", "loss_box", "loss_cls", "loss_dfl",
                 "latency_teacher_ms", "latency_student_pre_ms", "latency_student_post_ms",
             ]
         )
@@ -1592,6 +2468,8 @@ def main() -> None:
 
                     r.pseudo_accepted, r.update_applied,
                     f"{r.loss_total:.6f}" if not math.isnan(r.loss_total) else "",
+                    f"{r.consistency_loss:.6f}" if not math.isnan(r.consistency_loss) else "",
+                    f"{r.total_loss_with_consistency:.6f}" if not math.isnan(r.total_loss_with_consistency) else "",
                     f"{r.loss_box:.6f}" if not math.isnan(r.loss_box) else "",
                     f"{r.loss_cls:.6f}" if not math.isnan(r.loss_cls) else "",
                     f"{r.loss_dfl:.6f}" if not math.isnan(r.loss_dfl) else "",
@@ -1704,6 +2582,8 @@ def main() -> None:
     student_pre_post_iou = np.array([r.student_pre_post_iou for r in records], dtype=np.float32)
     student_pre_post_center_shift = np.array([r.student_pre_post_center_shift for r in records], dtype=np.float32)
     loss_total = np.array([r.loss_total for r in records], dtype=np.float32)
+    consistency_loss = np.array([r.consistency_loss for r in records], dtype=np.float32)
+    total_loss_with_consistency = np.array([r.total_loss_with_consistency for r in records], dtype=np.float32)
 
     save_plot_line(frames, teacher_conf, "Teacher top-1 Confidence vs Frame", "frame", "conf", out_dir / "plot_teacher_conf.png")
     save_plot_line(frames, student_pre_conf, "Student PRE top-1 Confidence vs Frame", "frame", "conf", out_dir / "plot_student_pre_conf.png")
@@ -1775,10 +2655,18 @@ def main() -> None:
     mean_teacher_conf = float(np.mean(teacher_conf)) if n_frames else float("nan")
     mean_student_post_conf = float(np.mean(student_post_conf)) if n_frames else float("nan")
     mean_loss = float(np.nanmean(loss_total)) if np.any(np.isfinite(loss_total)) else float("nan")
+    mean_total_loss_with_consistency = (
+        float(np.nanmean(total_loss_with_consistency)) if np.any(np.isfinite(total_loss_with_consistency)) else float("nan")
+    )
     mean_teacher_iou = float(np.nanmean(teacher_iou_prev)) if np.any(np.isfinite(teacher_iou_prev)) else float("nan")
     mean_student_iou = float(np.nanmean(student_post_iou_prev)) if np.any(np.isfinite(student_post_iou_prev)) else float("nan")
     mean_delta_conf_all = float(np.mean(student_delta_conf)) if n_frames else float("nan")
     update_mask = updates == 1
+    updated_consistency_loss = consistency_loss[update_mask]
+    updated_consistency_loss = updated_consistency_loss[np.isfinite(updated_consistency_loss)]
+    mean_consistency_loss_updated = (
+        float(np.mean(updated_consistency_loss)) if updated_consistency_loss.size > 0 else float("nan")
+    )
     mean_delta_conf_updated_only = float(np.mean(student_delta_conf[update_mask])) if np.any(update_mask) else float("nan")
     improved_updated_fraction = (
         float(np.mean(student_delta_conf[update_mask] > 0.0)) if np.any(update_mask) else float("nan")
@@ -1802,12 +2690,27 @@ def main() -> None:
         f"iou={float(args.iou):.3f}",
         f"lr={float(args.lr):.2e}",
         f"ema_decay={float(args.ema_decay):.6f}",
+        f"consistency_weight={consistency_weight:.6f}",
+        f"consistency_type={consistency_type}",
+        f"consistency_source={consistency_source}",
+        f"consistency_layers={consistency_layers}",
+        f"consistency_stopgrad_teacher={bool(args.consistency_stopgrad_teacher)}",
         "",
         f"pseudo accepted: {n_pseudo}/{n_frames} ({100.0*n_pseudo/max(1,n_frames):.1f}%)",
         f"updates applied: {n_updates}/{n_frames} ({100.0*n_updates/max(1,n_frames):.1f}%)",
         f"mean teacher conf:       {mean_teacher_conf:.3f}",
         f"mean student post conf:  {mean_student_post_conf:.3f}",
         f"mean adaptation loss:    {mean_loss:.4f}" if not math.isnan(mean_loss) else "mean adaptation loss:    n/a",
+        (
+            f"mean total loss (det+cons): {mean_total_loss_with_consistency:.4f}"
+            if not math.isnan(mean_total_loss_with_consistency)
+            else "mean total loss (det+cons): n/a"
+        ),
+        (
+            f"mean consistency loss (updated frames): {mean_consistency_loss_updated:.6f}"
+            if not math.isnan(mean_consistency_loss_updated)
+            else "mean consistency loss (updated frames): n/a"
+        ),
         f"mean teacher temporal IoU: {mean_teacher_iou:.3f}" if not math.isnan(mean_teacher_iou) else "mean teacher temporal IoU: n/a",
         f"mean student temporal IoU: {mean_student_iou:.3f}" if not math.isnan(mean_student_iou) else "mean student temporal IoU: n/a",
         f"mean student delta conf (all frames): {mean_delta_conf_all:.6f}" if not math.isnan(mean_delta_conf_all) else "mean student delta conf (all frames): n/a",
@@ -1851,7 +2754,7 @@ if __name__ == "__main__":
 # PYTHONPATH=. python odad/online_adapt.py \
 #   --weights /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --output /home/hm25936/mae/odad/online_adapt_lab_neck_head_update \
+#   --output /home/hm25936/mae/odad/online_adapt_consistency_neck_debug \
 #   --device cuda:0 \
 #   --imgsz 1024 \
 #   --teacher-conf-thresh 0.80 \
@@ -1860,7 +2763,11 @@ if __name__ == "__main__":
 #   --lr 3e-4 \
 #   --ema-decay 0.999 \
 #   --update-scope neck_head \
+#   --consistency-weight 10.0 \
+#   --consistency-type l2 \
+#   --consistency-source neck \
 #   --debug-first-update \
+#   --debug-consistency-only \
 #   --max-frames 300 \
 #   --make-mp4 \
 #   --mp4-every 2 \

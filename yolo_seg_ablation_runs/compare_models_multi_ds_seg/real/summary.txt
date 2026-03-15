@@ -1,0 +1,14 @@
+Dataset: real
+root: /home/hm25936/datasets_for_yolo/soho
+eval_images: 500
+conf_threshold (for inst_rate): 0.250
+iou: 0.450
+
+[fda_mix]
+  top1_inst_rate@conf: 12.2%  (61/500)
+  top1_conf mean/med:  0.085 / 0.012
+  top1_conf std:       0.152
+  top1_conf p90/p99:   0.304 / 0.664
+  mean ± 2σ:           [-0.218, 0.389]
+  mean ± 3σ:           [-0.370, 0.541]
+  hist:                hist_top1conf_fda_mix.png
