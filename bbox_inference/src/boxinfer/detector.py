@@ -46,7 +46,34 @@ def _xyxy_to_xywh_norm(xyxy: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
     return np.array([cx / img_w, cy / img_h, w / img_w, h / img_h], dtype = float)
 
 
-def _letterbox_image(
+def _parse_input_size(input_size) -> tuple[int, int]:
+    """
+    Parse detector input size as (height, width).
+    Supported forms:
+    - int -> square (size, size)
+    - tuple/list with 2 values -> (height, width)
+    """
+    if isinstance(input_size, (list, tuple)) and len(input_size) == 2:
+        h = int(max(32, int(input_size[0])))
+        w = int(max(32, int(input_size[1])))
+        return h, w
+
+    size = int(max(32, int(input_size)))
+    return size, size
+
+
+def _validate_preprocessed_shape(image_bgr: np.ndarray, exp_h: int, exp_w: int) -> tuple[int, int]:
+    """Validate that a preprocessed image already matches detector input size."""
+    img_h, img_w = image_bgr.shape[:2]
+    if int(img_h) != int(exp_h) or int(img_w) != int(exp_w):
+        raise ValueError(
+                            f'preprocessed_input=True but image shape is ({int(img_h)}, {int(img_w)}); '
+                            f'expected ({int(exp_h)}, {int(exp_w)})'
+                        )
+    return int(img_h), int(img_w)
+
+
+def letterbox_image(
                         image_bgr: np.ndarray,
                         dst_w: int,
                         dst_h: int,
@@ -81,6 +108,55 @@ def _letterbox_image(
     return out, scale, float(left), float(top)
 
 
+def rescale_camera_matrix_for_letterbox(
+                                            K_src: np.ndarray,
+                                            src_w: int,
+                                            src_h: int,
+                                            dst_w: int,
+                                            dst_h: int,
+                                        ) -> tuple[np.ndarray, float, float, float]:
+    """
+    Rescale camera intrinsics for letterboxed image coordinates.
+
+    Returns:
+    - K_lb: 3x3 intrinsics after resize+pad
+    - scale: uniform resize scale
+    - pad_x: left pad in pixels
+    - pad_y: top pad in pixels
+    """
+    K = np.asarray(K_src, dtype = float).reshape(3, 3)
+    sw = int(src_w)
+    sh = int(src_h)
+    dw = int(dst_w)
+    dh = int(dst_h)
+    if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+        raise ValueError(
+                            f'invalid source/destination image size for K letterbox rescale: '
+                            f'src=({sw}, {sh}), dst=({dw}, {dh})'
+                        )
+
+    # use same resize/pad policy as letterbox_image()
+    scale = min(float(dw) / float(sw), float(dh) / float(sh))
+    new_w = int(round(sw * scale))
+    new_h = int(round(sh * scale))
+    pad_w = dw - new_w
+    pad_h = dh - new_h
+    pad_x = float(int(np.floor(pad_w / 2.0)))
+    pad_y = float(int(np.floor(pad_h / 2.0)))
+
+    # x_lb = scale * x_src + pad_x, y_lb = scale * y_src + pad_y
+    A = np.array(
+                    [
+                        [scale, 0.0, pad_x],
+                        [0.0, scale, pad_y],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype = float,
+                )
+    K_lb = A @ K
+    return K_lb, float(scale), pad_x, pad_y
+
+
 class YoloBBoxDetector:
     """Unified detector object that returns bbox, score, class, and inference timing"""
 
@@ -91,10 +167,11 @@ class YoloBBoxDetector:
                     detector_name: str = 'yolo_bbox',
                     conf_threshold: float = 0.25,
                     iou_threshold: float = 0.45,
-                    input_size: int = 1024,
+                    input_size = 1024,
                     class_whitelist: Optional[List[int]] = None,
                     prefer_cuda: bool = True,
                     device: str = 'cuda:0',
+                    preprocessed_input: bool = False,
                 ) -> None:
         # resolve once so logs carry canonical absolute path
         self._model_path = str(Path(str(model_path)).expanduser().resolve())
@@ -109,10 +186,12 @@ class YoloBBoxDetector:
         self._detector_name   = str(detector_name)
         self._conf_thr        = float(conf_threshold)
         self._iou_thr         = float(iou_threshold)
-        self._input_size      = int(max(32, input_size))
+        self._requested_input_h, self._requested_input_w = _parse_input_size(input_size)
+        self._input_h, self._input_w = int(self._requested_input_h), int(self._requested_input_w)
         self._class_whitelist = set(class_whitelist or [])
         self._prefer_cuda     = bool(prefer_cuda)
         self._device          = str(device).strip() or 'cuda:0'
+        self._preprocessed_input = bool(preprocessed_input)
 
         # backend runtime state is initialized lazily in init helpers
         self._session       = None
@@ -143,12 +222,22 @@ class YoloBBoxDetector:
         self._input_name  = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
-        # use fixed model input size when present, otherwise user input_size
+        # use fixed model input size when present, otherwise requested input_size
         model_input_shape = self._session.get_inputs()[0].shape
         model_h = _shape_dim_to_int(model_input_shape[2]) if len(model_input_shape) >= 4 else None
         model_w = _shape_dim_to_int(model_input_shape[3]) if len(model_input_shape) >= 4 else None
-        self._input_h = model_h if model_h is not None else self._input_size
-        self._input_w = model_w if model_w is not None else self._input_size
+        if model_h is not None and model_w is not None:
+            self._input_h = int(model_h)
+            self._input_w = int(model_w)
+            if (self._input_h, self._input_w) != (int(self._requested_input_h), int(self._requested_input_w)):
+                raise ValueError(
+                                    f'ONNX model input is fixed at ({self._input_h}, {self._input_w}) '
+                                    f'but requested input_size is ({int(self._requested_input_h)}, {int(self._requested_input_w)}). '
+                                    f'Use matching config or re-export ONNX with the desired/static or dynamic input shape.'
+                                )
+        else:
+            self._input_h = int(self._requested_input_h)
+            self._input_w = int(self._requested_input_w)
 
     def _init_tensorrt(self) -> None:
         if Path(self._model_path).suffix.lower() != '.engine':
@@ -156,6 +245,10 @@ class YoloBBoxDetector:
 
         if YOLO is None:
             raise ImportError('ultralytics is required for TensorRT backend')
+
+        # TensorRT engines are configured against the requested detector input size.
+        self._input_h = int(self._requested_input_h)
+        self._input_w = int(self._requested_input_w)
 
         # set task explicitly to avoid warning when metadata is not embedded in engine
         self._model = YOLO(self._model_path, task = 'detect')
@@ -242,12 +335,19 @@ class YoloBBoxDetector:
     def _detect_onnx(self, image_bgr: np.ndarray) -> DetectionResult:
         img_h, img_w = image_bgr.shape[:2]
 
-        # preprocess image exactly once per call
-        lb_img, scale, pad_x, pad_y = _letterbox_image(
-                                                            image_bgr = image_bgr,
-                                                            dst_w = int(self._input_w),
-                                                            dst_h = int(self._input_h),
-                                                        )
+        # either preprocess inside detector or trust caller-provided detector-sized input
+        if self._preprocessed_input:
+            _validate_preprocessed_shape(image_bgr, exp_h = int(self._input_h), exp_w = int(self._input_w))
+            lb_img = image_bgr
+            scale = 1.0
+            pad_x = 0.0
+            pad_y = 0.0
+        else:
+            lb_img, scale, pad_x, pad_y = letterbox_image(
+                                                                image_bgr = image_bgr,
+                                                                dst_w = int(self._input_w),
+                                                                dst_h = int(self._input_h),
+                                                            )
         rgb = cv2.cvtColor(lb_img, cv2.COLOR_BGR2RGB)
         # model expects NCHW float32 in [0, 1]
         inp = rgb.astype(np.float32) / 255.0
@@ -344,12 +444,17 @@ class YoloBBoxDetector:
 
     def _detect_tensorrt(self, image_bgr: np.ndarray) -> DetectionResult:
         img_h, img_w    = image_bgr.shape[:2]
-        classes_arg     = sorted(self._class_whitelist) if self._class_whitelist else None
+        if self._preprocessed_input:
+            img_h, img_w = _validate_preprocessed_shape(image_bgr, exp_h = int(self._input_h), exp_w = int(self._input_w))
 
-        # ultralytics handles trt runtime and preprocessing for engine backend
+        classes_arg     = sorted(self._class_whitelist) if self._class_whitelist else None
+        imgsz_arg       = int(self._input_h) if int(self._input_h) == int(self._input_w) else (int(self._input_h), int(self._input_w))
+
+        # ultralytics still owns TensorRT runtime preprocessing; when preprocessed_input=True
+        # we enforce that the incoming image already matches detector input geometry.
         results = self._model.predict(
                                         source = image_bgr,
-                                        imgsz = int(self._input_size),
+                                        imgsz = imgsz_arg,
                                         conf = float(self._conf_thr),
                                         iou = float(self._iou_thr),
                                         device = self._device,

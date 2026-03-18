@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 # TYPE_CHECKING imports avoid importing heavy runtime deps on package import
 if TYPE_CHECKING:
     from .detector import YoloBBoxDetector
+    from .detector import letterbox_image
+    from .detector import rescale_camera_matrix_for_letterbox
     from .export import export_tensorrt_engine
     from .offline_test import run_offline_bbox_test
     from .offline_test import OfflineTestConfig
@@ -22,6 +24,8 @@ if TYPE_CHECKING:
 __all__ = [
             # runtime detector + model export + offline test API
             'YoloBBoxDetector',
+            'letterbox_image',
+            'rescale_camera_matrix_for_letterbox',
             'export_tensorrt_engine',
             'run_offline_bbox_test',
             'OfflineTestConfig', 
@@ -44,6 +48,14 @@ def __getattr__(name: str):
         # defer ultralytics/onnxruntime import until detector is requested
         from .detector import YoloBBoxDetector
         return YoloBBoxDetector
+    
+    if name == 'letterbox_image':
+        from .detector import letterbox_image
+        return letterbox_image
+    
+    if name == 'rescale_camera_matrix_for_letterbox':
+        from .detector import rescale_camera_matrix_for_letterbox
+        return rescale_camera_matrix_for_letterbox
 
     if name == 'export_tensorrt_engine':
         # exporter has separate runtime dependency surface
