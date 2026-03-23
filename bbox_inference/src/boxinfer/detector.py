@@ -8,7 +8,6 @@ from typing import List, Optional
 import cv2
 import numpy as np
 import onnxruntime as ort
-import pdb
 
 from .timing import summarize_latencies
 from .timing import time_call
@@ -18,7 +17,7 @@ from .types import invalid_detection
 try:
     from ultralytics import YOLO
 except Exception:
-    # allow ONNX-only use when ultralytics is not installed
+    # allow ONNX-only detect use when ultralytics is not installed
     YOLO = None
 
 
@@ -46,6 +45,30 @@ def _xyxy_to_xywh_norm(xyxy: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
     return np.array([cx / img_w, cy / img_h, w / img_w, h / img_h], dtype = float)
 
 
+def _segment_xy_to_norm(segment_xy: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
+    # convert polygon vertices from absolute pixels to normalized [0, 1]
+    seg = np.asarray(segment_xy, dtype = float).reshape(-1, 2)
+    if seg.size == 0 or img_w <= 0 or img_h <= 0:
+        return np.empty((0, 2), dtype = float)
+
+    out = seg.copy()
+    out[:, 0] = out[:, 0] / float(img_w)
+    out[:, 1] = out[:, 1] / float(img_h)
+    return out
+
+
+def _sanitize_polygon_xy(segment_xy: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
+    # clip polygon vertices to image bounds and reject invalid polygons
+    seg = np.asarray(segment_xy, dtype = float).reshape(-1, 2)
+    if seg.shape[0] < 3 or img_w <= 0 or img_h <= 0:
+        return np.empty((0, 2), dtype = float)
+
+    seg = seg.copy()
+    seg[:, 0] = np.clip(seg[:, 0], 0.0, float(img_w - 1))
+    seg[:, 1] = np.clip(seg[:, 1], 0.0, float(img_h - 1))
+    return seg
+
+
 def _parse_input_size(input_size) -> tuple[int, int]:
     """
     Parse detector input size as (height, width).
@@ -67,18 +90,18 @@ def _validate_preprocessed_shape(image_bgr: np.ndarray, exp_h: int, exp_w: int) 
     img_h, img_w = image_bgr.shape[:2]
     if int(img_h) != int(exp_h) or int(img_w) != int(exp_w):
         raise ValueError(
-                            f'preprocessed_input=True but image shape is ({int(img_h)}, {int(img_w)}); '
-                            f'expected ({int(exp_h)}, {int(exp_w)})'
-                        )
+            f'preprocessed_input=True but image shape is ({int(img_h)}, {int(img_w)}); '
+            f'expected ({int(exp_h)}, {int(exp_w)})'
+        )
     return int(img_h), int(img_w)
 
 
 def letterbox_image(
-                        image_bgr: np.ndarray,
-                        dst_w: int,
-                        dst_h: int,
-                        pad_value: int = 114,
-                    ) -> tuple[np.ndarray, float, float, float]:
+    image_bgr: np.ndarray,
+    dst_w: int,
+    dst_h: int,
+    pad_value: int = 114,
+) -> tuple[np.ndarray, float, float, float]:
     # resize with aspect ratio preserved, then pad to model input size
     src_h, src_w = image_bgr.shape[:2]
     if src_h <= 0 or src_w <= 0:
@@ -97,24 +120,24 @@ def letterbox_image(
     bottom = int(np.ceil(pad_h / 2.0))
 
     out = cv2.copyMakeBorder(
-                                resized,
-                                top,
-                                bottom,
-                                left,
-                                right,
-                                cv2.BORDER_CONSTANT,
-                                value = (pad_value, pad_value, pad_value),
-                            )
+        resized,
+        top,
+        bottom,
+        left,
+        right,
+        cv2.BORDER_CONSTANT,
+        value = (pad_value, pad_value, pad_value),
+    )
     return out, scale, float(left), float(top)
 
 
 def rescale_camera_matrix_for_letterbox(
-                                            K_src: np.ndarray,
-                                            src_w: int,
-                                            src_h: int,
-                                            dst_w: int,
-                                            dst_h: int,
-                                        ) -> tuple[np.ndarray, float, float, float]:
+    K_src: np.ndarray,
+    src_w: int,
+    src_h: int,
+    dst_w: int,
+    dst_h: int,
+) -> tuple[np.ndarray, float, float, float]:
     """
     Rescale camera intrinsics for letterboxed image coordinates.
 
@@ -131,9 +154,9 @@ def rescale_camera_matrix_for_letterbox(
     dh = int(dst_h)
     if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
         raise ValueError(
-                            f'invalid source/destination image size for K letterbox rescale: '
-                            f'src=({sw}, {sh}), dst=({dw}, {dh})'
-                        )
+            f'invalid source/destination image size for K letterbox rescale: '
+            f'src=({sw}, {sh}), dst=({dw}, {dh})'
+        )
 
     # use same resize/pad policy as letterbox_image()
     scale = min(float(dw) / float(sw), float(dh) / float(sh))
@@ -146,33 +169,34 @@ def rescale_camera_matrix_for_letterbox(
 
     # x_lb = scale * x_src + pad_x, y_lb = scale * y_src + pad_y
     A = np.array(
-                    [
-                        [scale, 0.0, pad_x],
-                        [0.0, scale, pad_y],
-                        [0.0, 0.0, 1.0],
-                    ],
-                    dtype = float,
-                )
+        [
+            [scale, 0.0, pad_x],
+            [0.0, scale, pad_y],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype = float,
+    )
     K_lb = A @ K
     return K_lb, float(scale), pad_x, pad_y
 
 
 class YoloBBoxDetector:
-    """Unified detector object that returns bbox, score, class, and inference timing"""
+    """Unified detector object that returns bbox/segment result + timing"""
 
     def __init__(
-                    self,
-                    model_path: str,
-                    backend: str = 'onnx',
-                    detector_name: str = 'yolo_bbox',
-                    conf_threshold: float = 0.25,
-                    iou_threshold: float = 0.45,
-                    input_size = 1024,
-                    class_whitelist: Optional[List[int]] = None,
-                    prefer_cuda: bool = True,
-                    device: str = 'cuda:0',
-                    preprocessed_input: bool = False,
-                ) -> None:
+        self,
+        model_path: str,
+        backend: str = 'onnx',
+        detector_name: str = 'yolo_bbox',
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        input_size = 1024,
+        class_whitelist: Optional[List[int]] = None,
+        prefer_cuda: bool = True,
+        device: str = 'cuda:0',
+        preprocessed_input: bool = False,
+        model_task: str = 'detect',
+    ) -> None:
         # resolve once so logs carry canonical absolute path
         self._model_path = str(Path(str(model_path)).expanduser().resolve())
         if not Path(self._model_path).is_file():
@@ -183,23 +207,29 @@ class YoloBBoxDetector:
         if self._backend not in {'onnx', 'tensorrt'}:
             raise ValueError(f'unsupported backend: {self._backend}')
 
-        self._detector_name   = str(detector_name)
-        self._conf_thr        = float(conf_threshold)
-        self._iou_thr         = float(iou_threshold)
+        self._detector_name = str(detector_name)
+        self._conf_thr = float(conf_threshold)
+        self._iou_thr = float(iou_threshold)
         self._requested_input_h, self._requested_input_w = _parse_input_size(input_size)
         self._input_h, self._input_w = int(self._requested_input_h), int(self._requested_input_w)
         self._class_whitelist = set(class_whitelist or [])
-        self._prefer_cuda     = bool(prefer_cuda)
-        self._device          = str(device).strip() or 'cuda:0'
+        self._prefer_cuda = bool(prefer_cuda)
+        self._device = str(device).strip() or 'cuda:0'
         self._preprocessed_input = bool(preprocessed_input)
+        self._model_task = str(model_task).strip().lower() or 'detect'
+        if self._model_task not in {'detect', 'segment', 'pose', 'classify', 'obb'}:
+            raise ValueError(
+                f'unsupported model_task: {self._model_task}; '
+                f'expected one of detect, segment, pose, classify, obb'
+            )
 
         # backend runtime state is initialized lazily in init helpers
-        self._session       = None
-        self._model         = None
-        self._input_name    = None
-        self._output_name   = None
-        self._input_h       = None
-        self._input_w       = None
+        self._session = None
+        self._model = None
+        self._input_name = None
+        self._output_name = None
+        self._input_h = None
+        self._input_w = None
 
         # initialize backend-specific runtime once
         if self._backend == 'onnx':
@@ -207,19 +237,36 @@ class YoloBBoxDetector:
         else:
             self._init_tensorrt()
 
+    def _invalid(self) -> DetectionResult:
+        return invalid_detection(
+            self._backend,
+            self._detector_name,
+            self._model_path,
+            model_task = self._model_task,
+        )
+
     def _init_onnx(self) -> None:
         if Path(self._model_path).suffix.lower() != '.onnx':
             raise ValueError(f'ONNX backend expects a .onnx model, got: {self._model_path}')
 
+        # segmentation ONNX output decoding is model-dependent; use Ultralytics runtime.
+        if self._model_task == 'segment':
+            if YOLO is None:
+                raise ImportError('ultralytics is required for ONNX segmentation backend')
+            self._input_h = int(self._requested_input_h)
+            self._input_w = int(self._requested_input_w)
+            self._model = YOLO(self._model_path, task = self._model_task)
+            if not self._prefer_cuda:
+                self._device = 'cpu'
+            return
+
         # prefer CUDA provider when available, otherwise CPU fallback
-        providers       = ['CPUExecutionProvider']
+        providers = ['CPUExecutionProvider']
         if self._prefer_cuda and 'CUDAExecutionProvider' in ort.get_available_providers():
-            providers   = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            # providers   = ['CUDAExecutionProvider']
-            
-        # pdb.set_trace()
-        self._session     = ort.InferenceSession(self._model_path, providers = providers)
-        self._input_name  = self._session.get_inputs()[0].name
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        self._session = ort.InferenceSession(self._model_path, providers = providers)
+        self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
         # use fixed model input size when present, otherwise requested input_size
@@ -231,10 +278,10 @@ class YoloBBoxDetector:
             self._input_w = int(model_w)
             if (self._input_h, self._input_w) != (int(self._requested_input_h), int(self._requested_input_w)):
                 raise ValueError(
-                                    f'ONNX model input is fixed at ({self._input_h}, {self._input_w}) '
-                                    f'but requested input_size is ({int(self._requested_input_h)}, {int(self._requested_input_w)}). '
-                                    f'Use matching config or re-export ONNX with the desired/static or dynamic input shape.'
-                                )
+                    f'ONNX model input is fixed at ({self._input_h}, {self._input_w}) '
+                    f'but requested input_size is ({int(self._requested_input_h)}, {int(self._requested_input_w)}). '
+                    f'Use matching config or re-export ONNX with the desired/static or dynamic input shape.'
+                )
         else:
             self._input_h = int(self._requested_input_h)
             self._input_w = int(self._requested_input_w)
@@ -251,7 +298,7 @@ class YoloBBoxDetector:
         self._input_w = int(self._requested_input_w)
 
         # set task explicitly to avoid warning when metadata is not embedded in engine
-        self._model = YOLO(self._model_path, task = 'detect')
+        self._model = YOLO(self._model_path, task = self._model_task)
         if not self._prefer_cuda:
             self._device = 'cpu'
 
@@ -260,7 +307,7 @@ class YoloBBoxDetector:
 
         # guard for empty images and keep output contract stable
         if image_bgr is None or image_bgr.size == 0:
-            det = invalid_detection(self._backend, self._detector_name, self._model_path)
+            det = self._invalid()
             det.image_path = str(image_path)
             return det
 
@@ -271,8 +318,9 @@ class YoloBBoxDetector:
             det, infer_ms = time_call(self._detect_tensorrt, image_bgr)
 
         det.inference_ms = float(infer_ms)
-        det.image_path   = str(image_path)
-        det.model_path   = self._model_path
+        det.image_path = str(image_path)
+        det.model_path = self._model_path
+        det.model_task = str(self._model_task)
         return det
 
     def infer_image_path(self, image_path: str) -> DetectionResult:
@@ -282,7 +330,7 @@ class YoloBBoxDetector:
         image_path = str(Path(str(image_path)).expanduser().resolve())
         image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
         if image_bgr is None:
-            det = invalid_detection(self._backend, self._detector_name, self._model_path)
+            det = self._invalid()
             det.image_path = image_path
             return det
 
@@ -292,24 +340,27 @@ class YoloBBoxDetector:
         """Warm up model memory/graph by running a few inferences"""
 
         # allow explicit warmup disable with warmup_iters <= 0
-        runs      = max(0, int(warmup_iters))
+        runs = max(0, int(warmup_iters))
         latencies = []
 
         if runs == 0:
             summary = summarize_latencies(latencies)
             return {
-                        'runs': 0,
-                        'latencies_ms': [],
-                        'timing': {
-                                    'count': int(summary.count),
-                                    'mean_ms': float(summary.mean_ms),
-                                    'min_ms': float(summary.min_ms),
-                                    'p50_ms': float(summary.p50_ms),
-                                    'p90_ms': float(summary.p90_ms),
-                                    'p99_ms': float(summary.p99_ms),
-                                    'max_ms': float(summary.max_ms),
-                                },
-                    }
+                'runs': 0,
+                'latencies_ms': [],
+                'timing': {
+                    'count': int(summary.count),
+                    'mean_ms': float(summary.mean_ms),
+                    'min_ms': float(summary.min_ms),
+                    'p50_ms': float(summary.p50_ms),
+                    'p90_ms': float(summary.p90_ms),
+                    'p99_ms': float(summary.p99_ms),
+                    'max_ms': float(summary.max_ms),
+                },
+            }
+
+        if image_bgr is None or image_bgr.size == 0:
+            raise ValueError('warmup image is required when warmup_iters > 0')
 
         # execute a few forward passes to stabilize first-run latency
         for _ in range(runs):
@@ -318,21 +369,24 @@ class YoloBBoxDetector:
 
         summary = summarize_latencies(latencies)
         return {
-                    'runs': int(runs),
-                    # raw per-run values are useful for quick startup diagnostics
-                    'latencies_ms': [float(v) for v in latencies],
-                    'timing': {
-                                'count': int(summary.count),
-                                'mean_ms': float(summary.mean_ms),
-                                'min_ms': float(summary.min_ms),
-                                'p50_ms': float(summary.p50_ms),
-                                'p90_ms': float(summary.p90_ms),
-                                'p99_ms': float(summary.p99_ms),
-                                'max_ms': float(summary.max_ms),
-                            },
-                }
+            'runs': int(runs),
+            # raw per-run values are useful for quick startup diagnostics
+            'latencies_ms': [float(v) for v in latencies],
+            'timing': {
+                'count': int(summary.count),
+                'mean_ms': float(summary.mean_ms),
+                'min_ms': float(summary.min_ms),
+                'p50_ms': float(summary.p50_ms),
+                'p90_ms': float(summary.p90_ms),
+                'p99_ms': float(summary.p99_ms),
+                'max_ms': float(summary.max_ms),
+            },
+        }
 
     def _detect_onnx(self, image_bgr: np.ndarray) -> DetectionResult:
+        if self._model_task == 'segment':
+            return self._detect_ultralytics(image_bgr)
+
         img_h, img_w = image_bgr.shape[:2]
 
         # either preprocess inside detector or trust caller-provided detector-sized input
@@ -344,10 +398,10 @@ class YoloBBoxDetector:
             pad_y = 0.0
         else:
             lb_img, scale, pad_x, pad_y = letterbox_image(
-                                                                image_bgr = image_bgr,
-                                                                dst_w = int(self._input_w),
-                                                                dst_h = int(self._input_h),
-                                                            )
+                image_bgr = image_bgr,
+                dst_w = int(self._input_w),
+                dst_h = int(self._input_h),
+            )
         rgb = cv2.cvtColor(lb_img, cv2.COLOR_BGR2RGB)
         # model expects NCHW float32 in [0, 1]
         inp = rgb.astype(np.float32) / 255.0
@@ -355,38 +409,38 @@ class YoloBBoxDetector:
         inp = np.expand_dims(inp, axis = 0)
 
         # raw output shape varies by model export and opset
-        raw     = self._session.run([self._output_name], {self._input_name: inp})[0]
-        preds   = np.asarray(raw)
+        raw = self._session.run([self._output_name], {self._input_name: inp})[0]
+        preds = np.asarray(raw)
         if preds.ndim == 3:
-            preds   = preds[0]
+            preds = preds[0]
         if preds.ndim != 2:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
         if preds.shape[0] < preds.shape[1]:
-            preds   = preds.T
+            preds = preds.T
         if preds.shape[1] < 5:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
-        boxes_xyxy  = []
-        scores      = []
-        classes     = []
+        boxes_xyxy = []
+        scores = []
+        classes = []
 
         # decode candidate rows and apply confidence/class filters
         for row in preds:
-            vals    = np.asarray(row, dtype = float).reshape(-1)
+            vals = np.asarray(row, dtype = float).reshape(-1)
             if vals.size < 5:
                 continue
 
-            cx, cy, w, h    = vals[:4]
-            cls_scores      = vals[4:]
+            cx, cy, w, h = vals[:4]
+            cls_scores = vals[4:]
             if cls_scores.size == 0:
                 continue
 
             if cls_scores.size == 1:
-                class_id    = 0
-                score       = float(cls_scores[0])
+                class_id = 0
+                score = float(cls_scores[0])
             else:
-                class_id    = int(np.argmax(cls_scores))
-                score       = float(cls_scores[class_id])
+                class_id = int(np.argmax(cls_scores))
+                score = float(cls_scores[class_id])
 
             if not np.isfinite(score) or score < self._conf_thr:
                 continue
@@ -399,7 +453,7 @@ class YoloBBoxDetector:
 
         # no candidates survived thresholds
         if not boxes_xyxy:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
         # run NMS in xywh format expected by cv2.dnn.NMSBoxes
         nms_boxes = []
@@ -408,97 +462,151 @@ class YoloBBoxDetector:
             nms_boxes.append([float(x1), float(y1), float(max(0.0, x2 - x1)), float(max(0.0, y2 - y1))])
 
         keep = cv2.dnn.NMSBoxes(
-                                    bboxes = nms_boxes,
-                                    scores = scores,
-                                    score_threshold = self._conf_thr,
-                                    nms_threshold = self._iou_thr,
-                                )
+            bboxes = nms_boxes,
+            scores = scores,
+            score_threshold = self._conf_thr,
+            nms_threshold = self._iou_thr,
+        )
         if keep is None or len(keep) == 0:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
         # map selected bbox back from letterboxed space to original image space
-        keep_idx    = int(np.asarray(keep).reshape(-1)[0])
-        box_lb      = np.asarray(boxes_xyxy[keep_idx], dtype = float).reshape(4,)
-        box         = box_lb.copy()
-        box[0]      = (box[0] - pad_x) / max(scale, 1e-9)
-        box[1]      = (box[1] - pad_y) / max(scale, 1e-9)
-        box[2]      = (box[2] - pad_x) / max(scale, 1e-9)
-        box[3]      = (box[3] - pad_y) / max(scale, 1e-9)
+        keep_idx = int(np.asarray(keep).reshape(-1)[0])
+        box_lb = np.asarray(boxes_xyxy[keep_idx], dtype = float).reshape(4,)
+        box = box_lb.copy()
+        box[0] = (box[0] - pad_x) / max(scale, 1e-9)
+        box[1] = (box[1] - pad_y) / max(scale, 1e-9)
+        box[2] = (box[2] - pad_x) / max(scale, 1e-9)
+        box[3] = (box[3] - pad_y) / max(scale, 1e-9)
 
-        box[0]      = float(np.clip(box[0], 0.0, img_w - 1.0))
-        box[1]      = float(np.clip(box[1], 0.0, img_h - 1.0))
-        box[2]      = float(np.clip(box[2], 0.0, img_w - 1.0))
-        box[3]      = float(np.clip(box[3], 0.0, img_h - 1.0))
+        box[0] = float(np.clip(box[0], 0.0, img_w - 1.0))
+        box[1] = float(np.clip(box[1], 0.0, img_h - 1.0))
+        box[2] = float(np.clip(box[2], 0.0, img_w - 1.0))
+        box[3] = float(np.clip(box[3], 0.0, img_h - 1.0))
 
         # return both pixel bbox and normalized bbox for downstream logging
         return DetectionResult(
-                                valid = True,
-                                class_id = int(classes[keep_idx]),
-                                score = float(scores[keep_idx]),
-                                bbox_xyxy = box.astype(float),
-                                bbox_xywh_norm = _xyxy_to_xywh_norm(box, img_w = img_w, img_h = img_h),
-                                backend = self._backend,
-                                detector_name = self._detector_name,
-                                model_path = self._model_path,
-                            )
+            valid = True,
+            class_id = int(classes[keep_idx]),
+            score = float(scores[keep_idx]),
+            model_task = str(self._model_task),
+            bbox_xyxy = box.astype(float),
+            bbox_xywh_norm = _xyxy_to_xywh_norm(box, img_w = img_w, img_h = img_h),
+            has_mask = False,
+            mask_area_ratio = float('nan'),
+            segment_xy = np.empty((0, 2), dtype = float),
+            segment_xy_norm = np.empty((0, 2), dtype = float),
+            backend = self._backend,
+            detector_name = self._detector_name,
+            model_path = self._model_path,
+        )
 
-    def _detect_tensorrt(self, image_bgr: np.ndarray) -> DetectionResult:
-        img_h, img_w    = image_bgr.shape[:2]
+    def _detect_ultralytics(self, image_bgr: np.ndarray) -> DetectionResult:
+        img_h, img_w = image_bgr.shape[:2]
         if self._preprocessed_input:
             img_h, img_w = _validate_preprocessed_shape(image_bgr, exp_h = int(self._input_h), exp_w = int(self._input_w))
 
-        classes_arg     = sorted(self._class_whitelist) if self._class_whitelist else None
-        imgsz_arg       = int(self._input_h) if int(self._input_h) == int(self._input_w) else (int(self._input_h), int(self._input_w))
+        classes_arg = sorted(self._class_whitelist) if self._class_whitelist else None
+        imgsz_arg = int(self._input_h) if int(self._input_h) == int(self._input_w) else (int(self._input_h), int(self._input_w))
 
-        # ultralytics still owns TensorRT runtime preprocessing; when preprocessed_input=True
-        # we enforce that the incoming image already matches detector input geometry.
-        results = self._model.predict(
-                                        source = image_bgr,
-                                        imgsz = imgsz_arg,
-                                        conf = float(self._conf_thr),
-                                        iou = float(self._iou_thr),
-                                        device = self._device,
-                                        classes = classes_arg,
-                                        verbose = False,
-                                    )
+        # ultralytics owns runtime preprocessing for TensorRT/ONNX wrapped models
+        predict_kwargs = {
+            'source': image_bgr,
+            'imgsz': imgsz_arg,
+            'conf': float(self._conf_thr),
+            'iou': float(self._iou_thr),
+            'device': self._device,
+            'classes': classes_arg,
+            'verbose': False,
+        }
+        if self._model_task == 'segment':
+            predict_kwargs['retina_masks'] = True
+
+        results = self._model.predict(**predict_kwargs)
         if results is None or len(results) == 0:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
-        res     = results[0]
-        boxes   = getattr(res, 'boxes', None)
+        res = results[0]
+        boxes = getattr(res, 'boxes', None)
         if boxes is None or len(boxes) == 0:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
-        xyxy    = np.asarray(boxes.xyxy.cpu().numpy()).reshape(-1, 4).astype(float)
-        conf    = np.asarray(boxes.conf.cpu().numpy()).reshape(-1).astype(float)
-        cls     = np.asarray(boxes.cls.cpu().numpy()).reshape(-1).astype(int)
+        xyxy = np.asarray(boxes.xyxy.cpu().numpy()).reshape(-1, 4).astype(float)
+        conf = np.asarray(boxes.conf.cpu().numpy()).reshape(-1).astype(float)
+        cls = np.asarray(boxes.cls.cpu().numpy()).reshape(-1).astype(int)
         if xyxy.shape[0] == 0:
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
-        valid   = np.isfinite(conf)
+        valid = np.isfinite(conf)
         if self._class_whitelist:
-            valid   = valid & np.isin(cls, list(self._class_whitelist))
-        valid   = valid & (conf >= self._conf_thr)
+            valid = valid & np.isin(cls, list(self._class_whitelist))
+        valid = valid & (conf >= self._conf_thr)
         if not np.any(valid):
-            return invalid_detection(self._backend, self._detector_name, self._model_path)
+            return self._invalid()
 
         # choose highest confidence candidate after class + score filtering
-        cand_idx    = np.where(valid)[0]
-        keep_idx    = int(cand_idx[np.argmax(conf[cand_idx])])
-        box         = xyxy[keep_idx].copy()
-        box[0]      = float(np.clip(box[0], 0.0, img_w - 1.0))
-        box[1]      = float(np.clip(box[1], 0.0, img_h - 1.0))
-        box[2]      = float(np.clip(box[2], 0.0, img_w - 1.0))
-        box[3]      = float(np.clip(box[3], 0.0, img_h - 1.0))
+        cand_idx = np.where(valid)[0]
+        keep_idx = int(cand_idx[np.argmax(conf[cand_idx])])
+        box = xyxy[keep_idx].copy()
+        box[0] = float(np.clip(box[0], 0.0, img_w - 1.0))
+        box[1] = float(np.clip(box[1], 0.0, img_h - 1.0))
+        box[2] = float(np.clip(box[2], 0.0, img_w - 1.0))
+        box[3] = float(np.clip(box[3], 0.0, img_h - 1.0))
 
-        # TensorRT path returns same payload shape as ONNX path
+        has_mask = False
+        mask_area_ratio = float('nan')
+        segment_xy = np.empty((0, 2), dtype = float)
+        segment_xy_norm = np.empty((0, 2), dtype = float)
+
+        if self._model_task == 'segment':
+            masks = getattr(res, 'masks', None)
+            if masks is not None:
+                try:
+                    xy_list = getattr(masks, 'xy', None)
+                    if xy_list is not None and len(xy_list) > keep_idx and xy_list[keep_idx] is not None:
+                        seg_raw = np.asarray(xy_list[keep_idx], dtype = float).reshape(-1, 2)
+                        seg_xy = _sanitize_polygon_xy(seg_raw, img_w = img_w, img_h = img_h)
+                        if seg_xy.shape[0] >= 3:
+                            segment_xy = seg_xy
+                            segment_xy_norm = _segment_xy_to_norm(seg_xy, img_w = img_w, img_h = img_h)
+                            has_mask = True
+                except Exception:
+                    pass
+
+                try:
+                    data = getattr(masks, 'data', None)
+                    if data is not None and len(data) > keep_idx:
+                        mask_arr = data[keep_idx]
+                        if hasattr(mask_arr, 'cpu'):
+                            mask_arr = mask_arr.cpu().numpy()
+                        mask_arr = np.asarray(mask_arr, dtype = float).squeeze()
+                        if mask_arr.ndim == 2 and mask_arr.size > 0:
+                            ratio = float(np.mean(mask_arr > 0.5))
+                            if np.isfinite(ratio):
+                                mask_area_ratio = ratio
+                                has_mask = has_mask or bool(ratio > 0.0)
+                except Exception:
+                    pass
+
+            if has_mask and not np.isfinite(mask_area_ratio) and segment_xy.shape[0] >= 3 and img_w > 0 and img_h > 0:
+                area = abs(float(cv2.contourArea(segment_xy.astype(np.float32))))
+                mask_area_ratio = float(area / float(max(1, img_w * img_h)))
+
         return DetectionResult(
-                                valid = True,
-                                class_id = int(cls[keep_idx]),
-                                score = float(conf[keep_idx]),
-                                bbox_xyxy = box.astype(float),
-                                bbox_xywh_norm = _xyxy_to_xywh_norm(box, img_w = img_w, img_h = img_h),
-                                backend = self._backend,
-                                detector_name = self._detector_name,
-                                model_path = self._model_path,
-                            )
+            valid = True,
+            class_id = int(cls[keep_idx]),
+            score = float(conf[keep_idx]),
+            model_task = str(self._model_task),
+            bbox_xyxy = box.astype(float),
+            bbox_xywh_norm = _xyxy_to_xywh_norm(box, img_w = img_w, img_h = img_h),
+            has_mask = bool(has_mask),
+            mask_area_ratio = float(mask_area_ratio),
+            segment_xy = np.asarray(segment_xy, dtype = float).reshape(-1, 2),
+            segment_xy_norm = np.asarray(segment_xy_norm, dtype = float).reshape(-1, 2),
+            backend = self._backend,
+            detector_name = self._detector_name,
+            model_path = self._model_path,
+        )
+
+    def _detect_tensorrt(self, image_bgr: np.ndarray) -> DetectionResult:
+        return self._detect_ultralytics(image_bgr)

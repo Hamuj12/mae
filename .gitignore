@@ -8,3 +8,6 @@ runs/
 wandb/
 output_dir/
 odad/**/*.mp4
+bbox_inference/src/boxinfer.egg-info
+bbox_inference/test_artifacts
+bbox_inference/test_results

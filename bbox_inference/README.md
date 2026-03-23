@@ -1,14 +1,15 @@
 # MAE BBox Inference
 
-Standalone inference-only YOLO bbox package intended for use outside ROS and as a dependency for `nav_ros`
+Standalone YOLO inference package for bbox + segmentation, intended for use outside ROS and as a dependency for `nav_ros`.
 
 ## What This Package Provides
 
 - Detector object that supports `onnx` and `tensorrt` backends
+- Model tasks: `detect` and `segment` (plus pass-through task labels for export)
 - Warm-up and timing helpers for latency evaluation
 - TensorRT export helper from `.pt` and supported `.onnx`
 - Offline test runner that logs detections to CSV/JSON
-- Visualization utility that reads CSV and writes overlay images into `bbox_viz/`
+- Visualization utility that reads CSV and writes overlay images (`bbox_viz/` or `seg_viz/`)
 
 ## Install
 
@@ -26,60 +27,77 @@ python -m pip install -e ".[tensorrt]"
 python -m pip install -e . --no-deps
 ```
 
-## Runtime uses CLI entry points for export/test/visualization
-This means we use aliases for running specifics scripts. 
-Example:  `boxinfer-export-trt ...` instead of `python -m boxinfer.offline_test ...`.
+## CLI entry points
+
+This package exposes command aliases:
+- `boxinfer-export-trt`
+- `boxinfer-offline-test`
+- `boxinfer-visualize-csv`
 
 ## Export TensorRT Engine
 
-From `.pt`:
+Detect example:
 
 ```bash
-# export TRT engine from Ultralytics .pt
 boxinfer-export-trt \
   --model-path /path/to/model.pt \
   --engine-out /path/to/model.engine \
+  --task detect \
   --imgsz 1024 \
+  --device 0 \
+  --half
+```
+
+Segmentation example (non-square image size):
+
+```bash
+boxinfer-export-trt \
+  --model-path /path/to/seg_model.pt \
+  --engine-out /path/to/seg_model.engine \
+  --task segment \
+  --imgsz 3000 4096 \
   --device 0 \
   --half
 ```
 
 ## Standalone Offline Test
 
+ONNX detect example:
+
 ```bash
-# ONNX backend
 boxinfer-offline-test \
   --backend onnx \
+  --model-task detect \
   --dataset-dir /path/to/dataset \
   --model-path /path/to/model.onnx \
   --output-dir /path/to/output
 ```
-If you get a segmentation fault for onnx, try the following at the root `~/path2repo/mae/bbox_inference`:
-```bash
-python -m pip install -e . # reinstall package entry point
-hash -r # clears bash's command lookup
-```
 
-TensorRT backend:
+TensorRT segmentation example:
 
 ```bash
-# TensorRT backend with engine file
 boxinfer-offline-test \
   --backend tensorrt \
+  --model-task segment \
   --dataset-dir /path/to/dataset \
   --model-path /path/to/model.engine \
+  --input-size 3000 4096 \
   --device cuda:0 \
   --output-dir /path/to/output
 ```
 
+If you get a segmentation fault for ONNX, try the following at `~/path2repo/mae/bbox_inference`:
+
+```bash
+python -m pip install -e .
+hash -r
 ```
 
 ## Visualize From CSV
 
 ```bash
-# generate overlay images and top-k panel from csv log
 boxinfer-visualize-csv \
-  --csv-path /path/to/bbox_detections.csv \
-  --output-dir /path/to/bbox_viz \
+  --csv-path /path/to/detections.csv \
+  --output-dir /path/to/output \
   --top-k 3
 ```
