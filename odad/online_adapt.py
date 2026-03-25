@@ -22,6 +22,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 try:
     from tqdm import tqdm
@@ -103,6 +107,15 @@ class FrameLog:
     student_post_latency_ms: float
     update_latency_ms: float
     frame_latency_ms: float
+
+
+@dataclass
+class ModuleParamSummary:
+    idx: int
+    class_name: str
+    total_params: int
+    trainable_params: int
+    optimizer_params: int
 
 
 class ReplayBuffer:
@@ -400,6 +413,35 @@ def compute_unfrozen_indices(
     return list(range(neck_start_idx, head_idx + 1))
 
 
+def param_id_set_for_indices(layers: List[nn.Module], indices: Sequence[int]) -> set[int]:
+    out: set[int] = set()
+    for idx in indices:
+        for p in layers[idx].parameters():
+            out.add(id(p))
+    return out
+
+
+def build_module_param_summaries(layers: List[nn.Module], optimizer_param_ids: set[int]) -> List[ModuleParamSummary]:
+    out: List[ModuleParamSummary] = []
+    for idx, module in enumerate(layers):
+        params = list(module.parameters())
+        if not params:
+            continue
+        total_params = int(sum(p.numel() for p in params))
+        trainable_params = int(sum(p.numel() for p in params if p.requires_grad))
+        optimizer_params = int(sum(p.numel() for p in params if id(p) in optimizer_param_ids))
+        out.append(
+            ModuleParamSummary(
+                idx=idx,
+                class_name=module.__class__.__name__,
+                total_params=total_params,
+                trainable_params=trainable_params,
+                optimizer_params=optimizer_params,
+            )
+        )
+    return out
+
+
 def apply_freeze_policy(model: nn.Module, layers: List[nn.Module], unfrozen_indices: List[int]) -> None:
     for p in model.parameters():
         p.requires_grad = False
@@ -610,6 +652,67 @@ def make_progress_iter(total: int):
     return tqdm(total=total, desc="Online adapt", dynamic_ncols=True)
 
 
+def rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
+    if x.size == 0:
+        return x.astype(np.float32)
+    if window <= 1:
+        return x.astype(np.float32).copy()
+    out = np.empty_like(x, dtype=np.float32)
+    running_sum = 0.0
+    q: Deque[float] = deque()
+    for i, v in enumerate(x.astype(np.float32)):
+        q.append(float(v))
+        running_sum += float(v)
+        if len(q) > window:
+            running_sum -= q.popleft()
+        out[i] = running_sum / float(len(q))
+    return out
+
+
+def save_plot_lines(
+    x: np.ndarray,
+    ys: Sequence[np.ndarray],
+    labels: Sequence[str],
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    out_path: Path,
+) -> None:
+    fig = plt.figure(figsize=(10, 4))
+    if x.size == 0 or not ys:
+        plt.title(title)
+        plt.text(0.5, 0.5, "no data", ha="center", va="center", transform=plt.gca().transAxes)
+        plt.axis("off")
+    else:
+        for y, label in zip(ys, labels):
+            plt.plot(x, y, label=label)
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        if len(labels) > 1:
+            plt.legend()
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def save_plot_hist(values: np.ndarray, bins: int, title: str, xlabel: str, out_path: Path) -> None:
+    fig = plt.figure(figsize=(8, 5))
+    finite_vals = values[np.isfinite(values)] if values.size else np.array([], dtype=np.float32)
+    if finite_vals.size == 0:
+        plt.title(title)
+        plt.text(0.5, 0.5, "no data", ha="center", va="center", transform=plt.gca().transAxes)
+        plt.axis("off")
+    else:
+        plt.hist(finite_vals, bins=max(5, int(bins)))
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel("count")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Online teacher-student adaptation with buffered replay updates.")
     p.add_argument("--weights", type=str, required=True, help="Path to YOLO weights (.pt)")
@@ -711,13 +814,50 @@ def main() -> None:
         raise RuntimeError(f"Student/teacher head mismatch: student={head_idx}, teacher={teacher_head_idx}")
 
     neck_start_idx = resolve_neck_start_idx(core_model, int(args.neck_start_idx))
+    head_only_indices = compute_unfrozen_indices(
+        update_scope="head_only",
+        neck_start_idx=neck_start_idx,
+        head_idx=head_idx,
+        n_layers=len(layers),
+    )
+    head_only_param_ids = param_id_set_for_indices(layers, head_only_indices)
+
+    neck_head_param_ids: Optional[set[int]] = None
+    if neck_start_idx is not None:
+        neck_head_indices = compute_unfrozen_indices(
+            update_scope="neck_head",
+            neck_start_idx=neck_start_idx,
+            head_idx=head_idx,
+            n_layers=len(layers),
+        )
+        neck_head_param_ids = param_id_set_for_indices(layers, neck_head_indices)
+        if head_only_param_ids == neck_head_param_ids:
+            raise RuntimeError(
+                "head_only and neck_head result in identical trainable parameter sets; "
+                "check neck_start_idx/model layout before running this ablation."
+            )
+
     unfrozen_indices = compute_unfrozen_indices(
         update_scope=str(args.update_scope),
         neck_start_idx=neck_start_idx,
         head_idx=head_idx,
         n_layers=len(layers),
     )
+
+    if str(args.update_scope) == "head_only":
+        head_module_name = layers[head_idx].__class__.__name__
+        if head_module_name != "Detect":
+            raise RuntimeError(
+                f"update_scope=head_only expects Detect head, found {head_module_name} at idx={head_idx}."
+            )
+
     apply_freeze_policy(student_model, layers, unfrozen_indices)
+    expected_trainable_param_ids = param_id_set_for_indices(layers, unfrozen_indices)
+    actual_trainable_param_ids = {id(p) for p in student_model.parameters() if p.requires_grad}
+    if expected_trainable_param_ids != actual_trainable_param_ids:
+        raise RuntimeError(
+            "Freeze policy mismatch: actual trainable parameters do not match expected unfrozen modules."
+        )
 
     optim_params = [p for p in student_model.parameters() if p.requires_grad]
     if not optim_params:
@@ -728,6 +868,62 @@ def main() -> None:
         lr=float(args.lr),
         momentum=float(args.momentum),
         weight_decay=float(args.weight_decay),
+    )
+
+    optimizer_param_ids = {id(p) for p in optim_params}
+    if optimizer_param_ids != actual_trainable_param_ids:
+        raise RuntimeError("Optimizer parameter set does not match trainable parameter set.")
+
+    module_param_summaries = build_module_param_summaries(layers, optimizer_param_ids)
+    if str(args.update_scope) == "head_only":
+        non_head_trainable = [m for m in module_param_summaries if m.idx != head_idx and m.trainable_params > 0]
+        if non_head_trainable:
+            bad = ", ".join(f"{m.idx}:{m.class_name}" for m in non_head_trainable)
+            raise RuntimeError(f"update_scope=head_only leaked trainable params outside Detect: {bad}")
+
+    unfrozen_modules = [f"{idx}:{layers[idx].__class__.__name__}" for idx in unfrozen_indices]
+    trainable_params = int(sum(p.numel() for p in optim_params))
+    optimizer_total_params = int(sum(p.numel() for p in optim_params))
+    optimizer_membership_lines = [
+        (
+            f"  [{m.idx}:{m.class_name}] "
+            f"trainable={m.trainable_params} optimizer={m.optimizer_params} total={m.total_params}"
+        )
+        for m in module_param_summaries
+    ]
+
+    summary_path = out_dir / "summary.txt"
+    startup_lines = [
+        "startup:",
+        f"  update_scope={args.update_scope}",
+        f"  neck_start_idx={neck_start_idx if neck_start_idx is not None else 'n/a'}",
+        f"  head_idx={head_idx}",
+        f"  unfrozen_modules=[{', '.join(unfrozen_modules)}]",
+        f"  trainable_params={trainable_params}",
+        f"  optimizer_total_params={optimizer_total_params}",
+    ]
+
+    print("Startup configuration:")
+    for line in startup_lines[1:]:
+        print(line)
+    print("optimizer_membership_by_module:")
+    for line in optimizer_membership_lines:
+        print(line)
+
+    summary_path.write_text(
+        "\n".join(
+            [
+                "Online Adaptation Summary",
+                "",
+                *startup_lines,
+                "",
+                "optimizer_membership_by_module:",
+                *optimizer_membership_lines,
+                "",
+                "status=running",
+            ]
+        ),
+        encoding="utf-8",
     )
 
     if isinstance(student_model.args, dict):
@@ -974,17 +1170,118 @@ def main() -> None:
                 ]
             )
 
+    frames = np.array([r.frame for r in logs], dtype=np.int32)
     teacher_conf_vals = np.array([r.teacher_conf for r in logs], dtype=np.float32)
     student_post_conf_vals = np.array([r.student_post_conf for r in logs], dtype=np.float32)
+    accepted_vals = np.array([r.accepted for r in logs], dtype=np.float32)
+    update_applied_vals = np.array([r.update_applied for r in logs], dtype=np.float32)
+    buffer_size_vals = np.array([r.buffer_size for r in logs], dtype=np.float32)
+    batch_size_used_vals = np.array([r.batch_size_used for r in logs], dtype=np.float32)
+    det_loss_vals = np.array([r.det_loss for r in logs], dtype=np.float32)
+    update_latency_vals = np.array([r.update_latency_ms for r in logs], dtype=np.float32)
+
+    conf_gap_vals = student_post_conf_vals - teacher_conf_vals
+    conf_gap_roll_window = max(5, min(100, max(1, len(logs) // 10)))
+    conf_gap_roll = rolling_mean(conf_gap_vals, conf_gap_roll_window)
+
+    save_plot_lines(
+        frames,
+        [teacher_conf_vals, student_post_conf_vals],
+        ["teacher_top1_conf", "student_post_conf"],
+        "Teacher vs Student Confidence",
+        "frame",
+        "confidence",
+        out_dir / "plot_teacher_vs_student_conf.png",
+    )
+    save_plot_lines(
+        frames,
+        [conf_gap_vals],
+        ["student_post_conf - teacher_top1_conf"],
+        "Confidence Gap vs Frame",
+        "frame",
+        "conf_gap",
+        out_dir / "plot_conf_gap.png",
+    )
+    save_plot_lines(
+        frames,
+        [conf_gap_roll],
+        [f"rolling_mean(window={conf_gap_roll_window})"],
+        "Rolling Confidence Gap",
+        "frame",
+        "conf_gap",
+        out_dir / "plot_conf_gap_roll.png",
+    )
+    save_plot_lines(
+        frames,
+        [accepted_vals, update_applied_vals],
+        ["accepted", "update_applied"],
+        "Accept and Update Flags",
+        "frame",
+        "flag",
+        out_dir / "plot_accept_update_flags.png",
+    )
+    save_plot_lines(
+        frames,
+        [buffer_size_vals],
+        ["buffer_size"],
+        "Replay Buffer Size",
+        "frame",
+        "buffer_size",
+        out_dir / "plot_buffer_size.png",
+    )
+    save_plot_lines(
+        frames,
+        [batch_size_used_vals],
+        ["batch_size_used"],
+        "Batch Size Used",
+        "frame",
+        "batch_size",
+        out_dir / "plot_batch_size_used.png",
+    )
+
+    update_mask = update_applied_vals > 0.5
+    det_loss_frames = frames[update_mask]
+    det_loss_updates = det_loss_vals[update_mask]
+    save_plot_lines(
+        det_loss_frames,
+        [det_loss_updates],
+        ["det_loss"],
+        "Detection Loss on Update Frames",
+        "frame",
+        "det_loss",
+        out_dir / "plot_det_loss.png",
+    )
+
+    save_plot_hist(conf_gap_vals, 40, "Confidence Gap Histogram", "conf_gap", out_dir / "hist_conf_gap.png")
+    save_plot_hist(
+        update_latency_vals[update_mask],
+        40,
+        "Update Latency Histogram",
+        "update_latency_ms",
+        out_dir / "hist_update_latency.png",
+    )
 
     mean_teacher_conf = float(np.mean(teacher_conf_vals)) if logs else float("nan")
     mean_student_post_conf = float(np.mean(student_post_conf_vals)) if logs else float("nan")
     mean_update_loss = float(np.mean(update_losses)) if update_losses else float("nan")
     mean_buffer_size_updates = float(np.mean(buffer_sizes_on_updates)) if buffer_sizes_on_updates else float("nan")
 
-    summary_path = out_dir / "summary.txt"
+    mean_conf_gap = float(np.mean(conf_gap_vals)) if logs else float("nan")
+    median_conf_gap = float(np.median(conf_gap_vals)) if logs else float("nan")
+    fraction_frames_student_gt_teacher = float(np.mean(conf_gap_vals > 0.0)) if logs else float("nan")
+    fraction_frames_student_lt_teacher = float(np.mean(conf_gap_vals < 0.0)) if logs else float("nan")
+    mean_batch_size_used_on_updates = (
+        float(np.mean(batch_size_used_vals[update_mask])) if np.any(update_mask) else float("nan")
+    )
+
     summary_lines = [
         "Online Adaptation Summary",
+        "",
+        *startup_lines,
+        "",
+        "optimizer_membership_by_module:",
+        *optimizer_membership_lines,
+        "",
         f"weights={args.weights}",
         f"dataset={dataset_root}",
         f"total_frames={len(logs)}",
@@ -1004,6 +1301,25 @@ def main() -> None:
             else "mean_buffer_size_during_updates=n/a"
         ),
         "",
+        "teacher_vs_student:",
+        f"  mean_conf_gap={mean_conf_gap:.6f}" if math.isfinite(mean_conf_gap) else "  mean_conf_gap=n/a",
+        f"  median_conf_gap={median_conf_gap:.6f}" if math.isfinite(median_conf_gap) else "  median_conf_gap=n/a",
+        (
+            f"  fraction_frames_student_gt_teacher={fraction_frames_student_gt_teacher:.6f}"
+            if math.isfinite(fraction_frames_student_gt_teacher)
+            else "  fraction_frames_student_gt_teacher=n/a"
+        ),
+        (
+            f"  fraction_frames_student_lt_teacher={fraction_frames_student_lt_teacher:.6f}"
+            if math.isfinite(fraction_frames_student_lt_teacher)
+            else "  fraction_frames_student_lt_teacher=n/a"
+        ),
+        (
+            f"  mean_batch_size_used_on_updates={mean_batch_size_used_on_updates:.6f}"
+            if math.isfinite(mean_batch_size_used_on_updates)
+            else "  mean_batch_size_used_on_updates=n/a"
+        ),
+        "",
         "buffer_config:",
         f"  buffer_size={int(args.buffer_size)}",
         f"  update_batch_size={int(args.update_batch_size)}",
@@ -1014,6 +1330,15 @@ def main() -> None:
         "outputs:",
         f"  csv={csv_path.name}",
         f"  summary={summary_path.name}",
+        "  plot_teacher_vs_student_conf.png",
+        "  plot_conf_gap.png",
+        "  plot_conf_gap_roll.png",
+        "  plot_accept_update_flags.png",
+        "  plot_buffer_size.png",
+        "  plot_batch_size_used.png",
+        "  plot_det_loss.png",
+        "  hist_conf_gap.png",
+        "  hist_update_latency.png",
     ]
     if args.make_mp4:
         summary_lines.append("  mp4=adapt_overlay.mp4")
@@ -1039,7 +1364,7 @@ if __name__ == "__main__":
 # PYTHONPATH=. python odad/online_adapt.py \
 #   --weights /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --output /home/hm25936/mae/odad/online_adapt_buffered_neck_head_full \
+#   --output /home/hm25936/mae/odad/online_adapt_buffered_neckhead_full_v2 \
 #   --device cuda:0 \
 #   --imgsz 1024 \
 #   --teacher-conf-thresh 0.80 \
