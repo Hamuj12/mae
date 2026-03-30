@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Online teacher-student adaptation with buffered replay updates.
 
-This baseline keeps a conservative pseudo-label gate and an EMA teacher, but
-updates the student from mini-batches sampled from a temporal replay buffer.
+This keeps a conservative pseudo-label gate and an EMA teacher, while updating
+the student from replayed mini-batches using detection loss plus a compact
+prototype-memory alignment term.
 """
 
 from __future__ import annotations
@@ -13,7 +14,9 @@ import math
 import random
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
@@ -21,6 +24,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 import matplotlib
 
@@ -38,7 +42,7 @@ except Exception:  # pragma: no cover
     imageio = None
 
 try:
-    from ultralytics import YOLO
+    from ultralytics import YOLO, __version__ as ULTRALYTICS_VERSION
 except ImportError as exc:  # pragma: no cover
     raise ImportError("Please install ultralytics: pip install ultralytics") from exc
 
@@ -87,7 +91,14 @@ class MemoryEntry:
     height: int
     pseudo_box: Tuple[float, float, float, float]
     pseudo_cls: int
+
+
+@dataclass
+class PrototypeEntry:
+    frame_idx: int
+    pseudo_cls: int
     teacher_conf: float
+    vector: torch.Tensor
 
 
 @dataclass
@@ -98,10 +109,13 @@ class FrameLog:
     accepted: int
     num_pseudo_boxes_used: int
     buffer_size: int
+    prototype_memory_size: int
     update_applied: int
     updates_this_frame: int
     batch_size_used: int
     det_loss: float
+    prototype_loss: float
+    total_loss: float
     teacher_latency_ms: float
     student_post_conf: float
     student_post_latency_ms: float
@@ -116,6 +130,23 @@ class ModuleParamSummary:
     total_params: int
     trainable_params: int
     optimizer_params: int
+
+
+@dataclass
+class PrototypeAuditRow:
+    update_step: int
+    frame: int
+    prototype_memory_size: int
+    det_loss: float
+    prototype_loss: float
+    total_loss: float
+    grad_21: float
+    grad_22: float
+    delta_21: float
+    delta_22: float
+
+
+PROTOTYPE_AUDIT_MODULE_INDICES = (21, 22)
 
 
 class ReplayBuffer:
@@ -140,6 +171,48 @@ class ReplayBuffer:
             idxs = self._rng.sample(range(len(entries)), k=k)
             return [entries[i] for i in idxs]
         raise RuntimeError(f"Unsupported buffer sample mode: {mode}")
+
+
+class LayerFeatureTap:
+    def __init__(self, module: nn.Module, layer_idx: int) -> None:
+        self.layer_idx = int(layer_idx)
+        self._latest: Any = None
+        self._handle = module.register_forward_hook(lambda _module, _inputs, output: setattr(self, "_latest", output))
+
+    def clear(self) -> None:
+        self._latest = None
+
+    def take_pooled(self) -> torch.Tensor:
+        output = self._latest
+        self._latest = None
+        if output is None:
+            raise RuntimeError(f"Prototype layer {self.layer_idx} produced no captured output.")
+        return pool_feature_output(output)
+
+    def close(self) -> None:
+        self._handle.remove()
+
+
+def retrieve_prototype_targets(
+    prototypes: Sequence[PrototypeEntry],
+    queries: torch.Tensor,
+    topk: int,
+    distance: str,
+) -> Optional[torch.Tensor]:
+    if not prototypes:
+        return None
+
+    memory = torch.stack([entry.vector for entry in prototypes], dim=0).to(device=queries.device, dtype=queries.dtype)
+    k = min(max(1, int(topk)), memory.shape[0])
+    if distance == "cosine":
+        query_scores = F.normalize(queries, dim=1, eps=1e-12)
+        memory_scores = F.normalize(memory, dim=1, eps=1e-12)
+        indices = (query_scores @ memory_scores.T).topk(k, dim=1, largest=True).indices
+    elif distance == "l2":
+        indices = torch.cdist(queries, memory, p=2).topk(k, dim=1, largest=False).indices
+    else:  # pragma: no cover
+        raise RuntimeError(f"Unsupported prototype distance: {distance}")
+    return memory[indices].mean(dim=1)
 
 
 def list_test_images(dataset_root: Path) -> List[Path]:
@@ -294,6 +367,34 @@ def pil_to_model_tensor(img_rgb: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).unsqueeze(0)
 
 
+def pool_feature_output(output: Any) -> torch.Tensor:
+    tensors: List[torch.Tensor] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, torch.Tensor) and value.ndim >= 2:
+            tensors.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+
+    visit(output)
+    if not tensors:
+        raise RuntimeError(f"Unable to pool prototype features from output type {type(output)}.")
+
+    batch_size = int(tensors[0].shape[0])
+    pooled_chunks: List[torch.Tensor] = []
+    for tensor in tensors:
+        if int(tensor.shape[0]) != batch_size:
+            raise RuntimeError("Prototype feature tensors had inconsistent batch dimensions.")
+        reduce_dims = tuple(range(2, tensor.ndim))
+        pooled = tensor.mean(dim=reduce_dims) if reduce_dims else tensor
+        pooled_chunks.append(pooled.reshape(batch_size, -1))
+    return torch.cat(pooled_chunks, dim=1)
+
+
 def top1_from_results(results: Any) -> Optional[Top1Det]:
     if not results:
         return None
@@ -318,7 +419,10 @@ def predict_top1_wrapper(
     device: str,
     conf: float,
     iou: float,
-) -> Tuple[Optional[Top1Det], float]:
+    feature_tap: Optional[LayerFeatureTap] = None,
+) -> Tuple[Optional[Top1Det], float, Optional[torch.Tensor]]:
+    if feature_tap is not None:
+        feature_tap.clear()
     use_cuda_timing = device.startswith("cuda") and torch.cuda.is_available()
     starter = ender = None
     if use_cuda_timing:
@@ -344,7 +448,14 @@ def predict_top1_wrapper(
     else:
         latency_ms = (time.time() - t0) * 1000.0
 
-    return top1_from_results(results), latency_ms
+    prototype = None
+    if feature_tap is not None:
+        pooled = feature_tap.take_pooled()
+        if pooled.shape[0] != 1:
+            raise RuntimeError(f"Expected a single prototype vector, got batch dimension {pooled.shape[0]}.")
+        prototype = pooled[0].detach().to(device="cpu", dtype=torch.float32).view(-1).contiguous()
+
+    return top1_from_results(results), latency_ms, prototype
 
 
 def unwrap_core_and_layers(model: nn.Module) -> Tuple[nn.Module, List[nn.Module]]:
@@ -450,6 +561,128 @@ def apply_freeze_policy(model: nn.Module, layers: List[nn.Module], unfrozen_indi
             p.requires_grad = True
 
 
+def collect_module_params(layers: List[nn.Module], indices: Sequence[int]) -> Dict[int, List[torch.nn.Parameter]]:
+    out: Dict[int, List[torch.nn.Parameter]] = {}
+    for idx in indices:
+        if idx < 0 or idx >= len(layers):
+            raise RuntimeError(f"Prototype audit expects module idx {idx}, but model has {len(layers)} layers.")
+        out[int(idx)] = list(layers[idx].parameters())
+    return out
+
+
+def snapshot_params(params: Sequence[torch.nn.Parameter]) -> List[torch.Tensor]:
+    return [p.detach().clone() for p in params]
+
+
+def grad_l2(params: Sequence[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for param in params:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        total += float(torch.sum(grad * grad).item())
+    return math.sqrt(total) if total > 0.0 else 0.0
+
+
+def delta_l2(params: Sequence[torch.nn.Parameter], before: Sequence[torch.Tensor]) -> float:
+    total = 0.0
+    for param, before_param in zip(params, before):
+        delta = param.detach() - before_param
+        total += float(torch.sum(delta * delta).item())
+    return math.sqrt(total) if total > 0.0 else 0.0
+
+
+def write_prototype_audit_files(out_dir: Path, rows: Sequence[PrototypeAuditRow]) -> None:
+    csv_path = out_dir / "prototype_audit.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "update_step",
+                "frame",
+                "prototype_memory_size",
+                "det_loss",
+                "prototype_loss",
+                "total_loss",
+                "grad_21",
+                "grad_22",
+                "delta_21",
+                "delta_22",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.update_step,
+                    row.frame,
+                    row.prototype_memory_size,
+                    f"{row.det_loss:.6f}",
+                    f"{row.prototype_loss:.6f}",
+                    f"{row.total_loss:.6f}",
+                    f"{row.grad_21:.6f}",
+                    f"{row.grad_22:.6f}",
+                    f"{row.delta_21:.6f}",
+                    f"{row.delta_22:.6f}",
+                ]
+            )
+
+    eps = 1e-12
+
+    def arr(values: Sequence[float]) -> np.ndarray:
+        return np.array(list(values), dtype=np.float32)
+
+    def mean_or_nan(values: np.ndarray) -> float:
+        return float(np.mean(values)) if values.size else float("nan")
+
+    def median_or_nan(values: np.ndarray) -> float:
+        return float(np.median(values)) if values.size else float("nan")
+
+    def max_or_nan(values: np.ndarray) -> float:
+        return float(np.max(values)) if values.size else float("nan")
+
+    def frac_nonzero(values: np.ndarray) -> float:
+        return float(np.mean(values > eps)) if values.size else float("nan")
+
+    grad_21_vals = arr([row.grad_21 for row in rows])
+    grad_22_vals = arr([row.grad_22 for row in rows])
+    delta_21_vals = arr([row.delta_21 for row in rows])
+    delta_22_vals = arr([row.delta_22 for row in rows])
+    prototype_loss_vals = arr([row.prototype_loss for row in rows])
+    total_loss_vals = arr([row.total_loss for row in rows])
+
+    summary_lines = [
+        "Prototype Audit Summary",
+        "",
+        f"audited_update_steps={len(rows)}",
+        f"audited_modules={list(PROTOTYPE_AUDIT_MODULE_INDICES)}",
+        "",
+        "module_21:",
+        format_metric("mean_grad_l2", mean_or_nan(grad_21_vals), prefix="  "),
+        format_metric("median_grad_l2", median_or_nan(grad_21_vals), prefix="  "),
+        format_metric("max_grad_l2", max_or_nan(grad_21_vals), prefix="  "),
+        format_metric("mean_delta_l2", mean_or_nan(delta_21_vals), prefix="  "),
+        format_metric("median_delta_l2", median_or_nan(delta_21_vals), prefix="  "),
+        format_metric("max_delta_l2", max_or_nan(delta_21_vals), prefix="  "),
+        format_metric("fraction_nonzero_grad", frac_nonzero(grad_21_vals), prefix="  "),
+        format_metric("fraction_nonzero_delta", frac_nonzero(delta_21_vals), prefix="  "),
+        "",
+        "module_22:",
+        format_metric("mean_grad_l2", mean_or_nan(grad_22_vals), prefix="  "),
+        format_metric("median_grad_l2", median_or_nan(grad_22_vals), prefix="  "),
+        format_metric("max_grad_l2", max_or_nan(grad_22_vals), prefix="  "),
+        format_metric("mean_delta_l2", mean_or_nan(delta_22_vals), prefix="  "),
+        format_metric("median_delta_l2", median_or_nan(delta_22_vals), prefix="  "),
+        format_metric("max_delta_l2", max_or_nan(delta_22_vals), prefix="  "),
+        format_metric("fraction_nonzero_grad", frac_nonzero(grad_22_vals), prefix="  "),
+        format_metric("fraction_nonzero_delta", frac_nonzero(delta_22_vals), prefix="  "),
+        "",
+        "losses:",
+        format_metric("mean_prototype_loss", mean_or_nan(prototype_loss_vals), prefix="  "),
+        format_metric("mean_total_loss", mean_or_nan(total_loss_vals), prefix="  "),
+    ]
+    (out_dir / "prototype_audit_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+
+
 def update_teacher_ema(teacher_model: nn.Module, student_model: nn.Module, decay: float) -> None:
     with torch.no_grad():
         t_state = teacher_model.state_dict()
@@ -460,27 +693,6 @@ def update_teacher_ema(teacher_model: nn.Module, student_model: nn.Module, decay
                 teacher_val.mul_(decay).add_(student_val.detach(), alpha=(1.0 - decay))
             else:
                 teacher_val.copy_(student_val)
-
-
-def safe_loss_items_to_dict(loss_items: Any) -> Dict[str, float]:
-    out = {"box": float("nan"), "cls": float("nan"), "dfl": float("nan")}
-    try:
-        if isinstance(loss_items, torch.Tensor):
-            vals = loss_items.detach().cpu().flatten().tolist()
-        elif isinstance(loss_items, (list, tuple)):
-            vals = [float(v.detach().cpu()) if isinstance(v, torch.Tensor) else float(v) for v in loss_items]
-        else:
-            return out
-
-        if len(vals) > 0:
-            out["box"] = float(vals[0])
-        if len(vals) > 1:
-            out["cls"] = float(vals[1])
-        if len(vals) > 2:
-            out["dfl"] = float(vals[2])
-    except Exception:
-        pass
-    return out
 
 
 def unpack_loss_pair(loss_out_obj: Any) -> Tuple[Optional[torch.Tensor], Any]:
@@ -541,18 +753,57 @@ def build_training_batch(
     return batch
 
 
+def compute_prototype_alignment_loss(
+    student_embeddings: torch.Tensor,
+    prototype_targets: Optional[torch.Tensor],
+    distance: str,
+) -> torch.Tensor:
+    if prototype_targets is None or prototype_targets.numel() == 0:
+        return student_embeddings.new_zeros(())
+    if distance == "cosine":
+        student_norm = F.normalize(student_embeddings, dim=1, eps=1e-12)
+        target_norm = F.normalize(prototype_targets, dim=1, eps=1e-12)
+        return (1.0 - (student_norm * target_norm).sum(dim=1)).mean()
+    if distance == "l2":
+        return F.mse_loss(student_embeddings, prototype_targets)
+    raise RuntimeError(f"Unsupported prototype distance: {distance}")
+
+
 def run_detection_update(
     student_model: nn.Module,
     criterion: Any,
     optimizer: torch.optim.Optimizer,
     optim_params: Sequence[torch.nn.Parameter],
     batch: Dict[str, torch.Tensor],
+    prototype_memory: Sequence[PrototypeEntry],
+    student_feature_tap: LayerFeatureTap,
     grad_clip: float,
-) -> Tuple[float, Dict[str, float]]:
+    prototype_weight: float,
+    prototype_topk: int,
+    prototype_distance: str,
+    audit_enabled: bool = False,
+    audit_rows: Optional[List[PrototypeAuditRow]] = None,
+    audit_module_params: Optional[Dict[int, Sequence[torch.nn.Parameter]]] = None,
+    audit_max_updates: int = 0,
+    audit_update_step: int = 0,
+    audit_frame_idx: int = -1,
+    audit_prototype_memory_size: int = 0,
+) -> Tuple[float, float, float]:
+    capture_audit = (
+        bool(audit_enabled)
+        and audit_rows is not None
+        and audit_module_params is not None
+        and len(audit_rows) < max(0, int(audit_max_updates))
+    )
+    params_before = (
+        {idx: snapshot_params(params) for idx, params in audit_module_params.items()} if capture_audit else None
+    )
+
     with torch.inference_mode(False):
         with torch.enable_grad():
             student_model.train()
             optimizer.zero_grad(set_to_none=True)
+            student_feature_tap.clear()
             preds = student_model(batch["img"])
 
             if hasattr(student_model, "loss"):
@@ -560,23 +811,69 @@ def run_detection_update(
             else:
                 loss_out = criterion(preds, batch)
 
-            loss, loss_items = unpack_loss_pair(loss_out)
+            loss, _loss_items = unpack_loss_pair(loss_out)
+
+            if loss is None:
+                same_forward_fallback = criterion(preds, batch)
+                loss, _loss_items = unpack_loss_pair(same_forward_fallback)
 
             if loss is None and hasattr(student_model, "loss"):
                 fallback = student_model.loss(batch)
-                loss, loss_items = unpack_loss_pair(fallback)
+                loss, _loss_items = unpack_loss_pair(fallback)
 
             if loss is None:
                 raise RuntimeError(f"Unable to obtain differentiable detection loss; output type={type(loss_out)}")
 
-            loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
-            loss_scalar.backward()
+            det_loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
+            prototype_loss = det_loss_scalar.new_zeros(())
+            if len(prototype_memory) > 0 and (float(prototype_weight) > 0.0 or bool(audit_enabled)):
+                student_embeddings = student_feature_tap.take_pooled()
+                prototype_targets = retrieve_prototype_targets(
+                    prototype_memory,
+                    queries=student_embeddings,
+                    topk=int(prototype_topk),
+                    distance=str(prototype_distance),
+                )
+                prototype_loss = compute_prototype_alignment_loss(
+                    student_embeddings=student_embeddings,
+                    prototype_targets=prototype_targets,
+                    distance=str(prototype_distance),
+                )
+            else:
+                student_feature_tap.clear()
+
+            total_loss = det_loss_scalar + float(prototype_weight) * prototype_loss
+            total_loss.backward()
+            grad_norms = {idx: grad_l2(params) for idx, params in audit_module_params.items()} if capture_audit else {}
 
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(optim_params, grad_clip)
             optimizer.step()
 
-    return float(loss_scalar.detach().cpu()), safe_loss_items_to_dict(loss_items)
+            if capture_audit and params_before is not None and audit_rows is not None:
+                delta_norms = {
+                    idx: delta_l2(audit_module_params[idx], params_before[idx]) for idx in audit_module_params
+                }
+                audit_rows.append(
+                    PrototypeAuditRow(
+                        update_step=int(audit_update_step),
+                        frame=int(audit_frame_idx),
+                        prototype_memory_size=int(audit_prototype_memory_size),
+                        det_loss=float(det_loss_scalar.detach().cpu()),
+                        prototype_loss=float(prototype_loss.detach().cpu()),
+                        total_loss=float(total_loss.detach().cpu()),
+                        grad_21=float(grad_norms.get(21, 0.0)),
+                        grad_22=float(grad_norms.get(22, 0.0)),
+                        delta_21=float(delta_norms.get(21, 0.0)),
+                        delta_22=float(delta_norms.get(22, 0.0)),
+                    )
+                )
+
+    return (
+        float(det_loss_scalar.detach().cpu()),
+        float(prototype_loss.detach().cpu()),
+        float(total_loss.detach().cpu()),
+    )
 
 
 def try_load_font(size: int = 16) -> ImageFont.ImageFont:
@@ -620,7 +917,7 @@ def make_triptych(
     accepted: bool,
     update_applied: bool,
     buffer_size: int,
-    det_loss: float,
+    loss_value: float,
 ) -> Image.Image:
     w, h = img_rgb.size
     left = draw_panel(
@@ -636,7 +933,7 @@ def make_triptych(
         "Student(post)",
         student_top1,
         frame_idx,
-        extra_text=(f"loss={det_loss:.4f}" if math.isfinite(det_loss) else "loss=n/a"),
+        extra_text=(f"loss={loss_value:.4f}" if math.isfinite(loss_value) else "loss=n/a"),
     )
 
     out = Image.new("RGB", (w * 3, h), color=(0, 0, 0))
@@ -713,6 +1010,52 @@ def save_plot_hist(values: np.ndarray, bins: int, title: str, xlabel: str, out_p
     plt.close(fig)
 
 
+def format_metric(name: str, value: float, fmt: str = ".6f", prefix: str = "") -> str:
+    return f"{prefix}{name}={value:{fmt}}" if math.isfinite(value) else f"{prefix}{name}=n/a"
+
+
+def save_final_student_weights(yolo_wrapper: YOLO, student_model: nn.Module, out_path: Path) -> Path:
+    base_ckpt = getattr(yolo_wrapper, "ckpt", None)
+    ckpt = dict(base_ckpt) if isinstance(base_ckpt, dict) else {}
+
+    export_model = deepcopy(student_model).to("cpu").eval()
+    if hasattr(export_model, "args"):
+        model_args = getattr(export_model, "args")
+        if isinstance(model_args, dict):
+            export_model.args = dict(model_args)
+        elif isinstance(model_args, SimpleNamespace):
+            export_model.args = vars(model_args).copy()
+        elif hasattr(model_args, "__dict__"):
+            export_model.args = vars(model_args).copy()
+    if hasattr(export_model, "criterion"):
+        export_model.criterion = None
+    export_model.half()
+    for param in export_model.parameters():
+        param.requires_grad = False
+
+    ckpt.update(
+        {
+            "epoch": -1,
+            "best_fitness": None,
+            "model": export_model,
+            "ema": None,
+            "updates": None,
+            "optimizer": None,
+            "date": datetime.now().isoformat(),
+            "version": ULTRALYTICS_VERSION,
+            "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+            "docs": "https://docs.ultralytics.com",
+        }
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        torch.save(ckpt, out_path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to save final adapted student weights to {out_path}: {exc}") from exc
+    return out_path
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Online teacher-student adaptation with buffered replay updates.")
     p.add_argument("--weights", type=str, required=True, help="Path to YOLO weights (.pt)")
@@ -763,6 +1106,48 @@ def parse_args() -> argparse.Namespace:
         help="Replay sampling strategy",
     )
     p.add_argument("--max-updates-per-frame", type=int, default=1, help="Max optimizer updates per stream frame")
+    p.add_argument(
+        "--prototype-memory-size",
+        type=int,
+        default=128,
+        help="Maximum number of stored prototype-memory entries.",
+    )
+    p.add_argument(
+        "--prototype-layer",
+        type=int,
+        default=21,
+        help="Layer index used to build compact prototype embeddings.",
+    )
+    p.add_argument(
+        "--prototype-weight",
+        type=float,
+        default=1.0,
+        help="Weight for prototype-alignment loss.",
+    )
+    p.add_argument(
+        "--prototype-topk",
+        type=int,
+        default=4,
+        help="Number of nearest prototypes to retrieve for each replayed sample.",
+    )
+    p.add_argument(
+        "--prototype-distance",
+        type=str,
+        default="cosine",
+        choices=["cosine", "l2"],
+        help="Distance/similarity metric for prototype retrieval.",
+    )
+    p.add_argument(
+        "--prototype-audit",
+        action="store_true",
+        help="Enable compact prototype gradient/update audit.",
+    )
+    p.add_argument(
+        "--prototype-audit-max-updates",
+        type=int,
+        default=100,
+        help="Maximum number of optimizer update steps to include in the audit.",
+    )
 
     p.add_argument("--min-area-frac", type=float, default=0.001, help="Min accepted bbox area fraction")
     p.add_argument("--max-area-frac", type=float, default=0.80, help="Max accepted bbox area fraction")
@@ -776,6 +1161,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mp4-max", type=int, default=0, help="Max frames in MP4, 0 = no limit")
     p.add_argument("--mp4-fps", type=int, default=12, help="MP4 fps")
     p.add_argument("--mp4-scale", type=float, default=0.75, help="Downscale MP4 frames by this factor")
+    p.add_argument(
+        "--save-final-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save the final adapted student weights at the end of the run.",
+    )
+    p.add_argument(
+        "--final-weights-name",
+        type=str,
+        default="student_final.pt",
+        help="Filename for the saved final adapted student checkpoint.",
+    )
 
     return p.parse_args()
 
@@ -812,6 +1209,13 @@ def main() -> None:
     teacher_head_idx = find_head_idx(teacher_layers)
     if head_idx != teacher_head_idx:
         raise RuntimeError(f"Student/teacher head mismatch: student={head_idx}, teacher={teacher_head_idx}")
+    prototype_layer = int(args.prototype_layer)
+    if prototype_layer < 0 or prototype_layer >= len(layers):
+        raise RuntimeError(f"Invalid prototype_layer={prototype_layer}; expected range [0, {len(layers) - 1}].")
+    if prototype_layer >= len(teacher_layers):
+        raise RuntimeError(
+            f"Teacher prototype layer index {prototype_layer} is out of range for {len(teacher_layers)} layers."
+        )
 
     neck_start_idx = resolve_neck_start_idx(core_model, int(args.neck_start_idx))
     head_only_indices = compute_unfrozen_indices(
@@ -891,6 +1295,15 @@ def main() -> None:
         )
         for m in module_param_summaries
     ]
+    prototype_audit_enabled = bool(args.prototype_audit)
+    prototype_audit_module_params: Optional[Dict[int, List[torch.nn.Parameter]]] = None
+    prototype_audit_module_lines: List[str] = []
+    if prototype_audit_enabled:
+        prototype_audit_module_params = collect_module_params(layers, PROTOTYPE_AUDIT_MODULE_INDICES)
+        prototype_audit_module_lines = [
+            f"  [{idx}:{layers[idx].__class__.__name__}] params={sum(p.numel() for p in params)}"
+            for idx, params in prototype_audit_module_params.items()
+        ]
 
     summary_path = out_dir / "summary.txt"
     startup_lines = [
@@ -898,6 +1311,16 @@ def main() -> None:
         f"  update_scope={args.update_scope}",
         f"  neck_start_idx={neck_start_idx if neck_start_idx is not None else 'n/a'}",
         f"  head_idx={head_idx}",
+        f"  prototype_layer={prototype_layer}",
+        f"  prototype_layer_module={layers[prototype_layer].__class__.__name__}",
+        f"  prototype_memory_capacity={max(1, int(args.prototype_memory_size))}",
+        f"  prototype_weight={float(args.prototype_weight):.6f}",
+        f"  prototype_topk={max(1, int(args.prototype_topk))}",
+        f"  prototype_distance={args.prototype_distance}",
+        f"  prototype_audit={int(prototype_audit_enabled)}",
+        f"  prototype_audit_max_updates={max(0, int(args.prototype_audit_max_updates))}",
+        f"  save_final_weights={int(bool(args.save_final_weights))}",
+        f"  final_weights_name={args.final_weights_name}",
         f"  unfrozen_modules=[{', '.join(unfrozen_modules)}]",
         f"  trainable_params={trainable_params}",
         f"  optimizer_total_params={optimizer_total_params}",
@@ -909,6 +1332,10 @@ def main() -> None:
     print("optimizer_membership_by_module:")
     for line in optimizer_membership_lines:
         print(line)
+    if prototype_audit_module_lines:
+        print("prototype_audit_modules:")
+        for line in prototype_audit_module_lines:
+            print(line)
 
     summary_path.write_text(
         "\n".join(
@@ -919,6 +1346,11 @@ def main() -> None:
                 "",
                 "optimizer_membership_by_module:",
                 *optimizer_membership_lines,
+                *(
+                    ["", "prototype_audit_modules:", *prototype_audit_module_lines]
+                    if prototype_audit_module_lines
+                    else []
+                ),
                 "",
                 "status=running",
             ]
@@ -953,6 +1385,9 @@ def main() -> None:
 
     rng = random.Random(int(args.seed))
     buffer = ReplayBuffer(max_size=int(args.buffer_size), rng=rng)
+    prototype_memory: Deque[PrototypeEntry] = deque(maxlen=max(1, int(args.prototype_memory_size)))
+    student_feature_tap = LayerFeatureTap(layers[prototype_layer], layer_idx=prototype_layer)
+    teacher_feature_tap = LayerFeatureTap(teacher_layers[prototype_layer], layer_idx=prototype_layer)
 
     logs: List[FrameLog] = []
     mp4_frames: List[np.ndarray] = []
@@ -961,7 +1396,10 @@ def main() -> None:
     updated_frames = 0
     total_optimizer_updates = 0
     update_losses: List[float] = []
+    prototype_losses: List[float] = []
+    total_losses: List[float] = []
     buffer_sizes_on_updates: List[int] = []
+    prototype_audit_rows: List[PrototypeAuditRow] = []
 
     prev_teacher_box: Optional[Tuple[float, float, float, float]] = None
 
@@ -974,12 +1412,13 @@ def main() -> None:
             w, h = img_rgb.size
 
         teacher_model.eval()
-        teacher_top1, teacher_lat_ms = predict_top1_wrapper(
+        teacher_top1, teacher_lat_ms, teacher_proto = predict_top1_wrapper(
             teacher_yolo,
             source=str(img_path),
             device=str(args.device),
             conf=float(args.infer_conf),
             iou=float(args.iou),
+            feature_tap=teacher_feature_tap,
         )
 
         accepted = should_accept_pseudo(
@@ -1004,7 +1443,16 @@ def main() -> None:
                     height=h,
                     pseudo_box=teacher_top1.xyxy,
                     pseudo_cls=int(teacher_top1.cls_id),
+                )
+            )
+            if teacher_proto is None:
+                raise RuntimeError(f"Accepted frame {idx} did not produce a prototype at layer {prototype_layer}.")
+            prototype_memory.append(
+                PrototypeEntry(
+                    frame_idx=idx,
+                    pseudo_cls=int(teacher_top1.cls_id),
                     teacher_conf=float(teacher_top1.conf),
+                    vector=teacher_proto,
                 )
             )
 
@@ -1012,6 +1460,8 @@ def main() -> None:
         batch_size_used = 0
         num_pseudo_boxes_used = 0
         last_det_loss = float("nan")
+        last_prototype_loss = float("nan")
+        last_total_loss = float("nan")
         update_latency_ms = 0.0
 
         if len(buffer) >= int(args.min_buffer_before_update):
@@ -1029,13 +1479,25 @@ def main() -> None:
                     device=str(args.device),
                     rng=rng,
                 )
-                det_loss, _loss_items = run_detection_update(
+                det_loss, prototype_loss, total_loss = run_detection_update(
                     student_model=student_model,
                     criterion=criterion,
                     optimizer=optimizer,
                     optim_params=optim_params,
                     batch=batch,
+                    prototype_memory=prototype_memory,
+                    student_feature_tap=student_feature_tap,
                     grad_clip=float(args.grad_clip),
+                    prototype_weight=float(args.prototype_weight),
+                    prototype_topk=int(args.prototype_topk),
+                    prototype_distance=str(args.prototype_distance),
+                    audit_enabled=prototype_audit_enabled,
+                    audit_rows=prototype_audit_rows,
+                    audit_module_params=prototype_audit_module_params,
+                    audit_max_updates=int(args.prototype_audit_max_updates),
+                    audit_update_step=total_optimizer_updates + 1,
+                    audit_frame_idx=idx,
+                    audit_prototype_memory_size=len(prototype_memory),
                 )
                 update_latency_ms += (time.time() - update_t0) * 1000.0
 
@@ -1049,7 +1511,11 @@ def main() -> None:
                 total_optimizer_updates += 1
 
                 last_det_loss = float(det_loss)
+                last_prototype_loss = float(prototype_loss)
+                last_total_loss = float(total_loss)
                 update_losses.append(float(det_loss))
+                prototype_losses.append(float(prototype_loss))
+                total_losses.append(float(total_loss))
                 batch_size_used = len(sampled)
                 num_pseudo_boxes_used += len(sampled)
                 buffer_sizes_on_updates.append(len(buffer))
@@ -1058,13 +1524,14 @@ def main() -> None:
             updated_frames += 1
 
         student_model.eval()
-        student_post_top1, student_post_lat_ms = predict_top1_wrapper(
+        student_post_top1, student_post_lat_ms, _ = predict_top1_wrapper(
             student_yolo,
             source=str(img_path),
             device=str(args.device),
             conf=float(args.infer_conf),
             iou=float(args.iou),
         )
+        student_feature_tap.clear()
 
         frame_latency_ms = (time.time() - frame_t0) * 1000.0
 
@@ -1076,10 +1543,13 @@ def main() -> None:
                 accepted=int(accepted),
                 num_pseudo_boxes_used=int(num_pseudo_boxes_used),
                 buffer_size=len(buffer),
+                prototype_memory_size=len(prototype_memory),
                 update_applied=int(updates_this_frame > 0),
                 updates_this_frame=int(updates_this_frame),
                 batch_size_used=int(batch_size_used),
                 det_loss=float(last_det_loss),
+                prototype_loss=float(last_prototype_loss),
+                total_loss=float(last_total_loss),
                 teacher_latency_ms=float(teacher_lat_ms),
                 student_post_conf=float(student_post_top1.conf) if student_post_top1 is not None else 0.0,
                 student_post_latency_ms=float(student_post_lat_ms),
@@ -1102,7 +1572,7 @@ def main() -> None:
                     accepted=bool(accepted),
                     update_applied=bool(updates_this_frame > 0),
                     buffer_size=len(buffer),
-                    det_loss=float(last_det_loss),
+                    loss_value=float(last_total_loss if math.isfinite(last_total_loss) else last_det_loss),
                 )
 
                 if float(args.mp4_scale) != 1.0:
@@ -1119,6 +1589,7 @@ def main() -> None:
                     "accepted": accepted_frames,
                     "updates": total_optimizer_updates,
                     "buf": len(buffer),
+                    "pmem": len(prototype_memory),
                     "last_bs": batch_size_used,
                 },
                 refresh=False,
@@ -1127,45 +1598,33 @@ def main() -> None:
     if progress is not None:
         progress.close()
 
+    student_feature_tap.clear()
+    student_feature_tap.close()
+    teacher_feature_tap.clear()
+    teacher_feature_tap.close()
+
     csv_path = out_dir / "adapt_log.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
-                "frame",
-                "path",
-                "teacher_top1_conf",
-                "accepted",
-                "num_pseudo_boxes_used",
-                "buffer_size",
-                "update_applied",
-                "updates_this_frame",
-                "batch_size_used",
-                "det_loss",
-                "teacher_latency_ms",
-                "student_post_conf",
-                "student_post_latency_ms",
-                "update_latency_ms",
-                "frame_latency_ms",
+                "frame", "path", "teacher_top1_conf", "accepted", "num_pseudo_boxes_used", "buffer_size",
+                "prototype_memory_size", "update_applied", "updates_this_frame", "batch_size_used",
+                "det_loss", "prototype_loss", "total_loss", "teacher_latency_ms", "student_post_conf",
+                "student_post_latency_ms", "update_latency_ms", "frame_latency_ms",
             ]
         )
         for row in logs:
             writer.writerow(
                 [
-                    row.frame,
-                    row.path,
-                    f"{row.teacher_conf:.6f}",
-                    row.accepted,
-                    row.num_pseudo_boxes_used,
-                    row.buffer_size,
-                    row.update_applied,
-                    row.updates_this_frame,
+                    row.frame, row.path, f"{row.teacher_conf:.6f}", row.accepted, row.num_pseudo_boxes_used,
+                    row.buffer_size, row.prototype_memory_size, row.update_applied, row.updates_this_frame,
                     row.batch_size_used,
                     f"{row.det_loss:.6f}" if math.isfinite(row.det_loss) else "",
-                    f"{row.teacher_latency_ms:.3f}",
-                    f"{row.student_post_conf:.6f}",
-                    f"{row.student_post_latency_ms:.3f}",
-                    f"{row.update_latency_ms:.3f}",
+                    f"{row.prototype_loss:.6f}" if math.isfinite(row.prototype_loss) else "",
+                    f"{row.total_loss:.6f}" if math.isfinite(row.total_loss) else "",
+                    f"{row.teacher_latency_ms:.3f}", f"{row.student_post_conf:.6f}",
+                    f"{row.student_post_latency_ms:.3f}", f"{row.update_latency_ms:.3f}",
                     f"{row.frame_latency_ms:.3f}",
                 ]
             )
@@ -1176,8 +1635,10 @@ def main() -> None:
     accepted_vals = np.array([r.accepted for r in logs], dtype=np.float32)
     update_applied_vals = np.array([r.update_applied for r in logs], dtype=np.float32)
     buffer_size_vals = np.array([r.buffer_size for r in logs], dtype=np.float32)
+    prototype_memory_size_vals = np.array([r.prototype_memory_size for r in logs], dtype=np.float32)
     batch_size_used_vals = np.array([r.batch_size_used for r in logs], dtype=np.float32)
     det_loss_vals = np.array([r.det_loss for r in logs], dtype=np.float32)
+    prototype_loss_vals = np.array([r.prototype_loss for r in logs], dtype=np.float32)
     update_latency_vals = np.array([r.update_latency_ms for r in logs], dtype=np.float32)
 
     conf_gap_vals = student_post_conf_vals - teacher_conf_vals
@@ -1222,11 +1683,11 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [buffer_size_vals],
-        ["buffer_size"],
-        "Replay Buffer Size",
+        [buffer_size_vals, prototype_memory_size_vals],
+        ["buffer_size", "prototype_memory_size"],
+        "Replay Buffer and Prototype Memory Size",
         "frame",
-        "buffer_size",
+        "memory_size",
         out_dir / "plot_buffer_size.png",
     )
     save_plot_lines(
@@ -1251,6 +1712,15 @@ def main() -> None:
         "det_loss",
         out_dir / "plot_det_loss.png",
     )
+    save_plot_lines(
+        det_loss_frames,
+        [prototype_loss_vals[update_mask]],
+        ["prototype_loss"],
+        "Prototype Loss on Update Frames",
+        "frame",
+        "prototype_loss",
+        out_dir / "plot_prototype_loss.png",
+    )
 
     save_plot_hist(conf_gap_vals, 40, "Confidence Gap Histogram", "conf_gap", out_dir / "hist_conf_gap.png")
     save_plot_hist(
@@ -1264,6 +1734,8 @@ def main() -> None:
     mean_teacher_conf = float(np.mean(teacher_conf_vals)) if logs else float("nan")
     mean_student_post_conf = float(np.mean(student_post_conf_vals)) if logs else float("nan")
     mean_update_loss = float(np.mean(update_losses)) if update_losses else float("nan")
+    mean_prototype_loss_updates = float(np.mean(prototype_losses)) if prototype_losses else float("nan")
+    mean_total_loss_updates = float(np.mean(total_losses)) if total_losses else float("nan")
     mean_buffer_size_updates = float(np.mean(buffer_sizes_on_updates)) if buffer_sizes_on_updates else float("nan")
 
     mean_conf_gap = float(np.mean(conf_gap_vals)) if logs else float("nan")
@@ -1274,6 +1746,24 @@ def main() -> None:
         float(np.mean(batch_size_used_vals[update_mask])) if np.any(update_mask) else float("nan")
     )
 
+    if prototype_audit_enabled:
+        write_prototype_audit_files(out_dir, prototype_audit_rows)
+
+    final_weights_path: Optional[Path] = None
+    if bool(args.save_final_weights):
+        student_model.eval()
+        final_weights_name = Path(str(args.final_weights_name)).name
+        if not final_weights_name.endswith(".pt"):
+            raise RuntimeError(
+                f"--final-weights-name must end with .pt for YOLO reload compatibility, got: {args.final_weights_name}"
+            )
+        final_weights_path = save_final_student_weights(
+            yolo_wrapper=student_yolo,
+            student_model=student_model,
+            out_path=out_dir / final_weights_name,
+        )
+        print(f"Saved final adapted student weights to: {final_weights_path}")
+
     summary_lines = [
         "Online Adaptation Summary",
         "",
@@ -1281,44 +1771,32 @@ def main() -> None:
         "",
         "optimizer_membership_by_module:",
         *optimizer_membership_lines,
+        *(
+            ["", "prototype_audit_modules:", *prototype_audit_module_lines]
+            if prototype_audit_module_lines
+            else []
+        ),
         "",
         f"weights={args.weights}",
         f"dataset={dataset_root}",
         f"total_frames={len(logs)}",
         f"accepted_frames={accepted_frames}",
+        f"prototype_memory_size={len(prototype_memory)}",
         f"updates_applied={updated_frames}",
         f"optimizer_update_steps={total_optimizer_updates}",
-        f"mean_teacher_conf={mean_teacher_conf:.6f}" if math.isfinite(mean_teacher_conf) else "mean_teacher_conf=n/a",
-        (
-            f"mean_student_post_conf={mean_student_post_conf:.6f}"
-            if math.isfinite(mean_student_post_conf)
-            else "mean_student_post_conf=n/a"
-        ),
-        f"mean_detection_loss_updates={mean_update_loss:.6f}" if math.isfinite(mean_update_loss) else "mean_detection_loss_updates=n/a",
-        (
-            f"mean_buffer_size_during_updates={mean_buffer_size_updates:.3f}"
-            if math.isfinite(mean_buffer_size_updates)
-            else "mean_buffer_size_during_updates=n/a"
-        ),
+        format_metric("mean_teacher_conf", mean_teacher_conf),
+        format_metric("mean_student_post_conf", mean_student_post_conf),
+        format_metric("mean_detection_loss_updates", mean_update_loss),
+        format_metric("mean_prototype_loss_updates", mean_prototype_loss_updates),
+        format_metric("mean_total_loss_updates", mean_total_loss_updates),
+        format_metric("mean_buffer_size_during_updates", mean_buffer_size_updates, ".3f"),
         "",
         "teacher_vs_student:",
-        f"  mean_conf_gap={mean_conf_gap:.6f}" if math.isfinite(mean_conf_gap) else "  mean_conf_gap=n/a",
-        f"  median_conf_gap={median_conf_gap:.6f}" if math.isfinite(median_conf_gap) else "  median_conf_gap=n/a",
-        (
-            f"  fraction_frames_student_gt_teacher={fraction_frames_student_gt_teacher:.6f}"
-            if math.isfinite(fraction_frames_student_gt_teacher)
-            else "  fraction_frames_student_gt_teacher=n/a"
-        ),
-        (
-            f"  fraction_frames_student_lt_teacher={fraction_frames_student_lt_teacher:.6f}"
-            if math.isfinite(fraction_frames_student_lt_teacher)
-            else "  fraction_frames_student_lt_teacher=n/a"
-        ),
-        (
-            f"  mean_batch_size_used_on_updates={mean_batch_size_used_on_updates:.6f}"
-            if math.isfinite(mean_batch_size_used_on_updates)
-            else "  mean_batch_size_used_on_updates=n/a"
-        ),
+        format_metric("mean_conf_gap", mean_conf_gap, prefix="  "),
+        format_metric("median_conf_gap", median_conf_gap, prefix="  "),
+        format_metric("fraction_frames_student_gt_teacher", fraction_frames_student_gt_teacher, prefix="  "),
+        format_metric("fraction_frames_student_lt_teacher", fraction_frames_student_lt_teacher, prefix="  "),
+        format_metric("mean_batch_size_used_on_updates", mean_batch_size_used_on_updates, prefix="  "),
         "",
         "buffer_config:",
         f"  buffer_size={int(args.buffer_size)}",
@@ -1326,10 +1804,16 @@ def main() -> None:
         f"  min_buffer_before_update={int(args.min_buffer_before_update)}",
         f"  buffer_sample_mode={args.buffer_sample_mode}",
         f"  max_updates_per_frame={int(args.max_updates_per_frame)}",
+        f"  prototype_memory_capacity={max(1, int(args.prototype_memory_size))}",
+        f"  prototype_layer={prototype_layer}",
+        f"  prototype_weight={float(args.prototype_weight):.6f}",
+        f"  prototype_topk={max(1, int(args.prototype_topk))}",
+        f"  prototype_distance={args.prototype_distance}",
         "",
         "outputs:",
         f"  csv={csv_path.name}",
         f"  summary={summary_path.name}",
+        *([f"  final_student_weights={final_weights_path.name}"] if final_weights_path is not None else []),
         "  plot_teacher_vs_student_conf.png",
         "  plot_conf_gap.png",
         "  plot_conf_gap_roll.png",
@@ -1337,9 +1821,17 @@ def main() -> None:
         "  plot_buffer_size.png",
         "  plot_batch_size_used.png",
         "  plot_det_loss.png",
+        "  plot_prototype_loss.png",
         "  hist_conf_gap.png",
         "  hist_update_latency.png",
     ]
+    if prototype_audit_enabled:
+        summary_lines.extend(
+            [
+                "  prototype_audit.csv",
+                "  prototype_audit_summary.txt",
+            ]
+        )
     if args.make_mp4:
         summary_lines.append("  mp4=adapt_overlay.mp4")
 
@@ -1360,11 +1852,10 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
 # PYTHONPATH=. python odad/online_adapt.py \
 #   --weights /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --output /home/hm25936/mae/odad/online_adapt_buffered_neckhead_full_v2 \
+#   --output /home/hm25936/mae/odad/online_adapt_buffered_final_model \
 #   --device cuda:0 \
 #   --imgsz 1024 \
 #   --teacher-conf-thresh 0.80 \
@@ -1372,13 +1863,15 @@ if __name__ == "__main__":
 #   --iou 0.45 \
 #   --lr 3e-4 \
 #   --ema-decay 0.999 \
-#   --update-scope neck_head \
+#   --update-scope head_only \
 #   --buffer-size 32 \
 #   --update-batch-size 4 \
 #   --min-buffer-before-update 4 \
 #   --buffer-sample-mode recent \
 #   --max-updates-per-frame 1 \
 #   --temporal-iou-gate 0.50 \
+#   --save-final-weights \
+#   --final-weights-name student_final.pt \
 #   --make-mp4 \
 #   --mp4-every 2 \
 #   --mp4-fps 12 \

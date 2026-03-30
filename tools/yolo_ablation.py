@@ -536,9 +536,10 @@ if __name__ == "__main__":
 #   --model baseline=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --model fda=/home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
 #   --model fda_mix=/home/hm25936/mae/runs/yolov8_fda_mix/baseline/weights/best.pt \
+#   --model odad=/home/hm25936/mae/odad/online_adapt_buffered_final_model/student_final.pt \
 #   --dataset lab=/home/hm25936/datasets_for_yolo/lab_images_6000 \
 #   --dataset real=/home/hm25936/datasets_for_yolo/soho \
-#   --output /home/hm25936/mae/yolo_ablation_runs/compare_models_multi_ds \
+#   --output /home/hm25936/mae/yolo_ablation_runs/compare_models_odad_fda \
 #   --device cuda:0 \
 #   --conf 0.25 \
 #   --iou 0.45 \
