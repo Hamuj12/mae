@@ -536,10 +536,12 @@ if __name__ == "__main__":
 #   --model baseline=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --model fda=/home/hm25936/mae/runs/yolov8_fda/baseline/weights/best.pt \
 #   --model fda_mix=/home/hm25936/mae/runs/yolov8_fda_mix/baseline/weights/best.pt \
-#   --model odad=/home/hm25936/mae/odad/online_adapt_buffered_final_model/student_final.pt \
+#   --model odad_1500=/home/hm25936/mae/odad/online_adapt_reliable_persist2_full_clean/checkpoints/student_frame_001500.pt \
+#   --model odad_3000=/home/hm25936/mae/odad/online_adapt_reliable_persist2_full_clean/checkpoints/student_frame_003000.pt \
+#   --model odad_4500=/home/hm25936/mae/odad/online_adapt_reliable_persist2_full_clean/checkpoints/student_frame_004500.pt \
+#   --model odad_final=/home/hm25936/mae/odad/online_adapt_reliable_persist2_full_clean/student_final.pt \
 #   --dataset lab=/home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --dataset real=/home/hm25936/datasets_for_yolo/soho \
-#   --output /home/hm25936/mae/yolo_ablation_runs/compare_models_odad_fda \
+#   --output /home/hm25936/mae/yolo_ablation_runs/compare_models_odad_persist \
 #   --device cuda:0 \
 #   --conf 0.25 \
 #   --iou 0.45 \

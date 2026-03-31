@@ -7,11 +7,16 @@ startup:
   prototype_layer=21
   prototype_layer_module=C2f
   prototype_memory_capacity=128
-  prototype_weight=1.000000
+  prototype_weight=0.000000
   prototype_topk=4
   prototype_distance=cosine
   prototype_audit=0
   prototype_audit_max_updates=100
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  save_checkpoints_every=500
   save_final_weights=1
   final_weights_name=student_final.pt
   unfrozen_modules=[22:Detect]
@@ -39,24 +44,32 @@ optimizer_membership_by_module:
 
 weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
 dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
-total_frames=50
-accepted_frames=2
-prototype_memory_size=2
-updates_applied=0
-optimizer_update_steps=0
-mean_teacher_conf=0.698890
-mean_student_post_conf=0.698890
-mean_detection_loss_updates=n/a
-mean_prototype_loss_updates=n/a
-mean_total_loss_updates=n/a
-mean_buffer_size_during_updates=n/a
+total_frames=6735
+accepted_frames=2111
+prototype_memory_size=128
+updates_applied=6660
+optimizer_update_steps=6660
+mean_teacher_conf=0.527994
+mean_student_post_conf=0.572887
+mean_detection_loss_updates=7.041747
+mean_prototype_loss_updates=0.000000
+mean_total_loss_updates=7.041747
+mean_buffer_size_during_updates=31.932
 
 teacher_vs_student:
-  mean_conf_gap=0.000000
-  median_conf_gap=0.000000
-  fraction_frames_student_gt_teacher=0.000000
-  fraction_frames_student_lt_teacher=0.000000
-  mean_batch_size_used_on_updates=n/a
+  mean_conf_gap=0.044893
+  median_conf_gap=0.003827
+  fraction_frames_student_gt_teacher=0.588716
+  fraction_frames_student_lt_teacher=0.400148
+  mean_accept_rate_roll=0.306300
+  mean_batch_size_used_on_updates=4.000000
+
+reliability_gates:
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  number_of_checkpoints_saved=13
 
 buffer_config:
   buffer_size=32
@@ -66,7 +79,7 @@ buffer_config:
   max_updates_per_frame=1
   prototype_memory_capacity=128
   prototype_layer=21
-  prototype_weight=1.000000
+  prototype_weight=0.000000
   prototype_topk=4
   prototype_distance=cosine
 
@@ -77,6 +90,10 @@ outputs:
   plot_teacher_vs_student_conf.png
   plot_conf_gap.png
   plot_conf_gap_roll.png
+  plot_teacher_conf_roll.png
+  plot_student_conf_roll.png
+  plot_accept_rate_roll.png
+  plot_update_count_roll.png
   plot_accept_update_flags.png
   plot_buffer_size.png
   plot_batch_size_used.png
@@ -84,3 +101,19 @@ outputs:
   plot_prototype_loss.png
   hist_conf_gap.png
   hist_update_latency.png
+
+intermediate_checkpoints:
+  checkpoints/student_frame_000500.pt
+  checkpoints/student_frame_001000.pt
+  checkpoints/student_frame_001500.pt
+  checkpoints/student_frame_002000.pt
+  checkpoints/student_frame_002500.pt
+  checkpoints/student_frame_003000.pt
+  checkpoints/student_frame_003500.pt
+  checkpoints/student_frame_004000.pt
+  checkpoints/student_frame_004500.pt
+  checkpoints/student_frame_005000.pt
+  checkpoints/student_frame_005500.pt
+  checkpoints/student_frame_006000.pt
+  checkpoints/student_frame_006500.pt
+  mp4=adapt_overlay.mp4

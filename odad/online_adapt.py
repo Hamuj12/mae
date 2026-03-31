@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Online teacher-student adaptation with buffered replay updates.
 
-This keeps a conservative pseudo-label gate and an EMA teacher, while updating
-the student from replayed mini-batches using detection loss plus a compact
-prototype-memory alignment term.
+This keeps a conservative pseudo-label gate, optional temporal reliability
+checks, and an EMA teacher while updating the student from replayed
+mini-batches using detection loss plus a compact prototype-memory alignment
+term.
 """
 
 from __future__ import annotations
@@ -107,6 +108,15 @@ class FrameLog:
     path: str
     teacher_conf: float
     accepted: int
+    accepted_final: int
+    passed_base_gate: int
+    passed_motion_gate: int
+    passed_persistence_gate: int
+    persistence_count: int
+    temporal_iou: float
+    persistence_iou: float
+    center_shift_frac: float
+    area_ratio: float
     num_pseudo_boxes_used: int
     buffer_size: int
     prototype_memory_size: int
@@ -147,6 +157,26 @@ class PrototypeAuditRow:
 
 
 PROTOTYPE_AUDIT_MODULE_INDICES = (21, 22)
+
+
+@dataclass
+class PersistenceState:
+    cls_id: int
+    xyxy: Tuple[float, float, float, float]
+    count: int
+
+
+@dataclass
+class GateDecision:
+    passed_base_gate: int
+    passed_motion_gate: int
+    passed_persistence_gate: int
+    accepted_final: int
+    persistence_count: int
+    temporal_iou: float
+    persistence_iou: float
+    center_shift_frac: float
+    area_ratio: float
 
 
 class ReplayBuffer:
@@ -260,7 +290,7 @@ def near_border(box: Tuple[float, float, float, float], width: int, height: int,
     return (x1 < mx) or (y1 < my) or (x2 > (width - mx)) or (y2 > (height - my))
 
 
-def should_accept_pseudo(
+def evaluate_base_gate(
     top1: Optional[Top1Det],
     prev_teacher_box: Optional[Tuple[float, float, float, float]],
     img_w: int,
@@ -270,24 +300,120 @@ def should_accept_pseudo(
     max_area_frac: float,
     border_margin_frac: float,
     temporal_iou_gate: float,
-) -> bool:
+) -> Tuple[bool, float]:
+    temporal_iou = float("nan")
     if top1 is None:
-        return False
+        return False, temporal_iou
     if top1.conf < conf_thresh:
-        return False
+        return False, temporal_iou
 
     af = area_fraction(top1.xyxy, img_w, img_h)
     if af < min_area_frac or af > max_area_frac:
-        return False
+        return False, temporal_iou
 
     if near_border(top1.xyxy, img_w, img_h, border_margin_frac):
-        return False
+        return False, temporal_iou
 
     if prev_teacher_box is not None and temporal_iou_gate > 0:
-        if xyxy_iou(top1.xyxy, prev_teacher_box) < temporal_iou_gate:
-            return False
+        temporal_iou = xyxy_iou(top1.xyxy, prev_teacher_box)
+        if temporal_iou < temporal_iou_gate:
+            return False, temporal_iou
 
-    return True
+    return True, temporal_iou
+
+
+def box_center(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+
+
+def box_area(box: Tuple[float, float, float, float]) -> float:
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def center_shift_fraction(
+    box_a: Tuple[float, float, float, float],
+    box_b: Tuple[float, float, float, float],
+    img_w: int,
+    img_h: int,
+) -> float:
+    ax, ay = box_center(box_a)
+    bx, by = box_center(box_b)
+    dx = (ax - bx) / max(1.0, float(img_w))
+    dy = (ay - by) / max(1.0, float(img_h))
+    return float(math.sqrt(dx * dx + dy * dy))
+
+
+def symmetric_area_ratio(
+    box_a: Tuple[float, float, float, float],
+    box_b: Tuple[float, float, float, float],
+) -> float:
+    area_a = box_area(box_a)
+    area_b = box_area(box_b)
+    larger = max(area_a, area_b)
+    smaller = max(min(area_a, area_b), 1e-12)
+    return float(larger / smaller) if larger > 0.0 else 1.0
+
+
+def evaluate_motion_gate(
+    top1: Optional[Top1Det],
+    prev_teacher_box: Optional[Tuple[float, float, float, float]],
+    img_w: int,
+    img_h: int,
+    max_center_shift_frac: float,
+    max_area_ratio: float,
+    enabled: bool,
+) -> Tuple[bool, float, float]:
+    center_shift_frac = float("nan")
+    area_ratio = float("nan")
+    if top1 is None:
+        return False, center_shift_frac, area_ratio
+    if prev_teacher_box is None or not enabled:
+        return True, center_shift_frac, area_ratio
+
+    center_shift_frac = center_shift_fraction(top1.xyxy, prev_teacher_box, img_w=img_w, img_h=img_h)
+    area_ratio = symmetric_area_ratio(top1.xyxy, prev_teacher_box)
+
+    if max_center_shift_frac > 0 and center_shift_frac > max_center_shift_frac:
+        return False, center_shift_frac, area_ratio
+    if max_area_ratio > 0 and area_ratio > max_area_ratio:
+        return False, center_shift_frac, area_ratio
+    return True, center_shift_frac, area_ratio
+
+
+def update_persistence_state(
+    state: Optional[PersistenceState],
+    top1: Optional[Top1Det],
+    candidate_valid: bool,
+    persistence_frames: int,
+    persistence_iou: float,
+) -> Tuple[Optional[PersistenceState], int, float, bool]:
+    required_frames = max(1, int(persistence_frames))
+    if top1 is None or not candidate_valid:
+        return None, 0, float("nan"), False
+
+    if required_frames <= 1:
+        next_state = PersistenceState(
+            cls_id=int(top1.cls_id),
+            xyxy=top1.xyxy,
+            count=1,
+        )
+        return next_state, 1, float("nan"), True
+
+    persistence_overlap = float("nan")
+    if state is None or int(state.cls_id) != int(top1.cls_id):
+        count = 1
+    else:
+        persistence_overlap = xyxy_iou(top1.xyxy, state.xyxy)
+        count = state.count + 1 if persistence_overlap >= persistence_iou else 1
+
+    next_state = PersistenceState(
+        cls_id=int(top1.cls_id),
+        xyxy=top1.xyxy,
+        count=int(count),
+    )
+    return next_state, int(count), persistence_overlap, bool(count >= required_frames)
 
 
 def letterbox_image(
@@ -1014,11 +1140,35 @@ def format_metric(name: str, value: float, fmt: str = ".6f", prefix: str = "") -
     return f"{prefix}{name}={value:{fmt}}" if math.isfinite(value) else f"{prefix}{name}=n/a"
 
 
-def save_final_student_weights(yolo_wrapper: YOLO, student_model: nn.Module, out_path: Path) -> Path:
+def strip_runtime_hooks(model: nn.Module) -> None:
+    for module in model.modules():
+        for attr in (
+            "_forward_hooks",
+            "_forward_pre_hooks",
+            "_backward_hooks",
+            "_backward_pre_hooks",
+            "_state_dict_hooks",
+            "_state_dict_pre_hooks",
+            "_load_state_dict_pre_hooks",
+            "_load_state_dict_post_hooks",
+        ):
+            hook_map = getattr(module, attr, None)
+            if hook_map is not None:
+                hook_map.clear()
+
+
+def save_student_weights_checkpoint(
+    yolo_wrapper: YOLO,
+    student_model: nn.Module,
+    out_path: Path,
+    checkpoint_type: str,
+    frame_idx: Optional[int] = None,
+) -> Path:
     base_ckpt = getattr(yolo_wrapper, "ckpt", None)
     ckpt = dict(base_ckpt) if isinstance(base_ckpt, dict) else {}
 
     export_model = deepcopy(student_model).to("cpu").eval()
+    strip_runtime_hooks(export_model)
     if hasattr(export_model, "args"):
         model_args = getattr(export_model, "args")
         if isinstance(model_args, dict):
@@ -1047,13 +1197,26 @@ def save_final_student_weights(yolo_wrapper: YOLO, student_model: nn.Module, out
             "docs": "https://docs.ultralytics.com",
         }
     )
+    ckpt["odad_adaptation"] = {
+        "checkpoint_type": str(checkpoint_type),
+        "frame_idx": None if frame_idx is None else int(frame_idx),
+    }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         torch.save(ckpt, out_path)
     except Exception as exc:
-        raise RuntimeError(f"Failed to save final adapted student weights to {out_path}: {exc}") from exc
+        raise RuntimeError(f"Failed to save adapted student weights to {out_path}: {exc}") from exc
     return out_path
+
+
+def save_final_student_weights(yolo_wrapper: YOLO, student_model: nn.Module, out_path: Path) -> Path:
+    return save_student_weights_checkpoint(
+        yolo_wrapper=yolo_wrapper,
+        student_model=student_model,
+        out_path=out_path,
+        checkpoint_type="final",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1153,6 +1316,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-area-frac", type=float, default=0.80, help="Max accepted bbox area fraction")
     p.add_argument("--border-margin-frac", type=float, default=0.02, help="Reject boxes too close to border")
     p.add_argument("--temporal-iou-gate", type=float, default=0.30, help="Require teacher IoU(prev,current) >= gate")
+    p.add_argument(
+        "--persistence-frames",
+        type=int,
+        default=1,
+        help="Number of consecutive stable frames required before a pseudo-label is accepted. 1 preserves current behavior.",
+    )
+    p.add_argument(
+        "--persistence-iou",
+        type=float,
+        default=0.50,
+        help="Minimum IoU between consecutive teacher boxes for persistence tracking.",
+    )
+    p.add_argument(
+        "--max-center-shift-frac",
+        type=float,
+        default=0.20,
+        help="Maximum normalized center shift allowed between consecutive teacher boxes for acceptance sanity checks.",
+    )
+    p.add_argument(
+        "--max-area-ratio",
+        type=float,
+        default=2.5,
+        help="Maximum allowed ratio between consecutive box areas for acceptance sanity checks.",
+    )
+    p.add_argument(
+        "--save-checkpoints-every",
+        type=int,
+        default=0,
+        help="If >0, save student checkpoints every N frames.",
+    )
 
     p.add_argument("--seed", type=int, default=0, help="RNG seed")
 
@@ -1319,6 +1512,11 @@ def main() -> None:
         f"  prototype_distance={args.prototype_distance}",
         f"  prototype_audit={int(prototype_audit_enabled)}",
         f"  prototype_audit_max_updates={max(0, int(args.prototype_audit_max_updates))}",
+        f"  persistence_frames={max(1, int(args.persistence_frames))}",
+        f"  persistence_iou={float(args.persistence_iou):.3f}",
+        f"  max_center_shift_frac={float(args.max_center_shift_frac):.3f}",
+        f"  max_area_ratio={float(args.max_area_ratio):.3f}",
+        f"  save_checkpoints_every={max(0, int(args.save_checkpoints_every))}",
         f"  save_final_weights={int(bool(args.save_final_weights))}",
         f"  final_weights_name={args.final_weights_name}",
         f"  unfrozen_modules=[{', '.join(unfrozen_modules)}]",
@@ -1400,8 +1598,13 @@ def main() -> None:
     total_losses: List[float] = []
     buffer_sizes_on_updates: List[int] = []
     prototype_audit_rows: List[PrototypeAuditRow] = []
+    checkpoint_paths: List[Path] = []
 
     prev_teacher_box: Optional[Tuple[float, float, float, float]] = None
+    persistence_state: Optional[PersistenceState] = None
+    persistence_frames = max(1, int(args.persistence_frames))
+    # Keep the control path aligned with the historical baseline when persistence is off.
+    motion_gate_enabled = persistence_frames > 1
 
     progress = make_progress_iter(len(images))
     for idx, img_path in enumerate(images):
@@ -1421,7 +1624,7 @@ def main() -> None:
             feature_tap=teacher_feature_tap,
         )
 
-        accepted = should_accept_pseudo(
+        passed_base_gate, temporal_iou = evaluate_base_gate(
             top1=teacher_top1,
             prev_teacher_box=prev_teacher_box,
             img_w=w,
@@ -1432,6 +1635,34 @@ def main() -> None:
             border_margin_frac=float(args.border_margin_frac),
             temporal_iou_gate=float(args.temporal_iou_gate),
         )
+        passed_motion_gate, center_shift_frac, area_ratio = evaluate_motion_gate(
+            top1=teacher_top1,
+            prev_teacher_box=prev_teacher_box,
+            img_w=w,
+            img_h=h,
+            max_center_shift_frac=float(args.max_center_shift_frac),
+            max_area_ratio=float(args.max_area_ratio),
+            enabled=motion_gate_enabled,
+        )
+        persistence_state, persistence_count, persistence_iou, passed_persistence_gate = update_persistence_state(
+            state=persistence_state,
+            top1=teacher_top1,
+            candidate_valid=bool(passed_base_gate and passed_motion_gate),
+            persistence_frames=persistence_frames,
+            persistence_iou=float(args.persistence_iou),
+        )
+        gate_decision = GateDecision(
+            passed_base_gate=int(passed_base_gate),
+            passed_motion_gate=int(passed_motion_gate),
+            passed_persistence_gate=int(passed_persistence_gate),
+            accepted_final=int(bool(passed_base_gate and passed_motion_gate and passed_persistence_gate)),
+            persistence_count=int(persistence_count),
+            temporal_iou=float(temporal_iou),
+            persistence_iou=float(persistence_iou),
+            center_shift_frac=float(center_shift_frac),
+            area_ratio=float(area_ratio),
+        )
+        accepted = bool(gate_decision.accepted_final)
 
         if accepted and teacher_top1 is not None:
             accepted_frames += 1
@@ -1541,6 +1772,15 @@ def main() -> None:
                 path=str(img_path),
                 teacher_conf=float(teacher_top1.conf) if teacher_top1 is not None else 0.0,
                 accepted=int(accepted),
+                accepted_final=int(gate_decision.accepted_final),
+                passed_base_gate=int(gate_decision.passed_base_gate),
+                passed_motion_gate=int(gate_decision.passed_motion_gate),
+                passed_persistence_gate=int(gate_decision.passed_persistence_gate),
+                persistence_count=int(gate_decision.persistence_count),
+                temporal_iou=float(gate_decision.temporal_iou),
+                persistence_iou=float(gate_decision.persistence_iou),
+                center_shift_frac=float(gate_decision.center_shift_frac),
+                area_ratio=float(gate_decision.area_ratio),
                 num_pseudo_boxes_used=int(num_pseudo_boxes_used),
                 buffer_size=len(buffer),
                 prototype_memory_size=len(prototype_memory),
@@ -1595,6 +1835,16 @@ def main() -> None:
                 refresh=False,
             )
 
+        if int(args.save_checkpoints_every) > 0 and (idx + 1) % int(args.save_checkpoints_every) == 0:
+            checkpoint_path = save_student_weights_checkpoint(
+                yolo_wrapper=student_yolo,
+                student_model=student_model,
+                out_path=out_dir / "checkpoints" / f"student_frame_{idx + 1:06d}.pt",
+                checkpoint_type="intermediate",
+                frame_idx=idx,
+            )
+            checkpoint_paths.append(checkpoint_path)
+
     if progress is not None:
         progress.close()
 
@@ -1608,7 +1858,9 @@ def main() -> None:
         writer = csv.writer(f)
         writer.writerow(
             [
-                "frame", "path", "teacher_top1_conf", "accepted", "num_pseudo_boxes_used", "buffer_size",
+                "frame", "path", "teacher_top1_conf", "accepted", "accepted_final", "passed_base_gate",
+                "passed_motion_gate", "passed_persistence_gate", "persistence_count", "temporal_iou",
+                "persistence_iou", "center_shift_frac", "area_ratio", "num_pseudo_boxes_used", "buffer_size",
                 "prototype_memory_size", "update_applied", "updates_this_frame", "batch_size_used",
                 "det_loss", "prototype_loss", "total_loss", "teacher_latency_ms", "student_post_conf",
                 "student_post_latency_ms", "update_latency_ms", "frame_latency_ms",
@@ -1617,7 +1869,14 @@ def main() -> None:
         for row in logs:
             writer.writerow(
                 [
-                    row.frame, row.path, f"{row.teacher_conf:.6f}", row.accepted, row.num_pseudo_boxes_used,
+                    row.frame, row.path, f"{row.teacher_conf:.6f}", row.accepted, row.accepted_final,
+                    row.passed_base_gate, row.passed_motion_gate, row.passed_persistence_gate,
+                    row.persistence_count,
+                    f"{row.temporal_iou:.6f}" if math.isfinite(row.temporal_iou) else "",
+                    f"{row.persistence_iou:.6f}" if math.isfinite(row.persistence_iou) else "",
+                    f"{row.center_shift_frac:.6f}" if math.isfinite(row.center_shift_frac) else "",
+                    f"{row.area_ratio:.6f}" if math.isfinite(row.area_ratio) else "",
+                    row.num_pseudo_boxes_used,
                     row.buffer_size, row.prototype_memory_size, row.update_applied, row.updates_this_frame,
                     row.batch_size_used,
                     f"{row.det_loss:.6f}" if math.isfinite(row.det_loss) else "",
@@ -1637,6 +1896,7 @@ def main() -> None:
     buffer_size_vals = np.array([r.buffer_size for r in logs], dtype=np.float32)
     prototype_memory_size_vals = np.array([r.prototype_memory_size for r in logs], dtype=np.float32)
     batch_size_used_vals = np.array([r.batch_size_used for r in logs], dtype=np.float32)
+    updates_this_frame_vals = np.array([r.updates_this_frame for r in logs], dtype=np.float32)
     det_loss_vals = np.array([r.det_loss for r in logs], dtype=np.float32)
     prototype_loss_vals = np.array([r.prototype_loss for r in logs], dtype=np.float32)
     update_latency_vals = np.array([r.update_latency_ms for r in logs], dtype=np.float32)
@@ -1644,6 +1904,10 @@ def main() -> None:
     conf_gap_vals = student_post_conf_vals - teacher_conf_vals
     conf_gap_roll_window = max(5, min(100, max(1, len(logs) // 10)))
     conf_gap_roll = rolling_mean(conf_gap_vals, conf_gap_roll_window)
+    teacher_conf_roll = rolling_mean(teacher_conf_vals, conf_gap_roll_window)
+    student_conf_roll = rolling_mean(student_post_conf_vals, conf_gap_roll_window)
+    accept_rate_roll = rolling_mean(accepted_vals, conf_gap_roll_window)
+    update_count_roll = rolling_mean(updates_this_frame_vals, conf_gap_roll_window)
 
     save_plot_lines(
         frames,
@@ -1671,6 +1935,42 @@ def main() -> None:
         "frame",
         "conf_gap",
         out_dir / "plot_conf_gap_roll.png",
+    )
+    save_plot_lines(
+        frames,
+        [teacher_conf_roll],
+        [f"rolling_mean(window={conf_gap_roll_window})"],
+        "Rolling Teacher Confidence",
+        "frame",
+        "confidence",
+        out_dir / "plot_teacher_conf_roll.png",
+    )
+    save_plot_lines(
+        frames,
+        [student_conf_roll],
+        [f"rolling_mean(window={conf_gap_roll_window})"],
+        "Rolling Student Confidence",
+        "frame",
+        "confidence",
+        out_dir / "plot_student_conf_roll.png",
+    )
+    save_plot_lines(
+        frames,
+        [accept_rate_roll],
+        [f"rolling_mean(window={conf_gap_roll_window})"],
+        "Rolling Acceptance Rate",
+        "frame",
+        "accept_rate",
+        out_dir / "plot_accept_rate_roll.png",
+    )
+    save_plot_lines(
+        frames,
+        [update_count_roll],
+        [f"rolling_mean(window={conf_gap_roll_window})"],
+        "Rolling Update Count",
+        "frame",
+        "updates_per_frame",
+        out_dir / "plot_update_count_roll.png",
     )
     save_plot_lines(
         frames,
@@ -1742,6 +2042,7 @@ def main() -> None:
     median_conf_gap = float(np.median(conf_gap_vals)) if logs else float("nan")
     fraction_frames_student_gt_teacher = float(np.mean(conf_gap_vals > 0.0)) if logs else float("nan")
     fraction_frames_student_lt_teacher = float(np.mean(conf_gap_vals < 0.0)) if logs else float("nan")
+    mean_accept_rate_roll = float(np.mean(accept_rate_roll)) if logs else float("nan")
     mean_batch_size_used_on_updates = (
         float(np.mean(batch_size_used_vals[update_mask])) if np.any(update_mask) else float("nan")
     )
@@ -1796,7 +2097,15 @@ def main() -> None:
         format_metric("median_conf_gap", median_conf_gap, prefix="  "),
         format_metric("fraction_frames_student_gt_teacher", fraction_frames_student_gt_teacher, prefix="  "),
         format_metric("fraction_frames_student_lt_teacher", fraction_frames_student_lt_teacher, prefix="  "),
+        format_metric("mean_accept_rate_roll", mean_accept_rate_roll, prefix="  "),
         format_metric("mean_batch_size_used_on_updates", mean_batch_size_used_on_updates, prefix="  "),
+        "",
+        "reliability_gates:",
+        f"  persistence_frames={persistence_frames}",
+        f"  persistence_iou={float(args.persistence_iou):.3f}",
+        f"  max_center_shift_frac={float(args.max_center_shift_frac):.3f}",
+        f"  max_area_ratio={float(args.max_area_ratio):.3f}",
+        f"  number_of_checkpoints_saved={len(checkpoint_paths)}",
         "",
         "buffer_config:",
         f"  buffer_size={int(args.buffer_size)}",
@@ -1817,6 +2126,10 @@ def main() -> None:
         "  plot_teacher_vs_student_conf.png",
         "  plot_conf_gap.png",
         "  plot_conf_gap_roll.png",
+        "  plot_teacher_conf_roll.png",
+        "  plot_student_conf_roll.png",
+        "  plot_accept_rate_roll.png",
+        "  plot_update_count_roll.png",
         "  plot_accept_update_flags.png",
         "  plot_buffer_size.png",
         "  plot_batch_size_used.png",
@@ -1825,6 +2138,14 @@ def main() -> None:
         "  hist_conf_gap.png",
         "  hist_update_latency.png",
     ]
+    if checkpoint_paths:
+        summary_lines.extend(
+            [
+                "",
+                "intermediate_checkpoints:",
+                *[f"  {path.relative_to(out_dir)}" for path in checkpoint_paths],
+            ]
+        )
     if prototype_audit_enabled:
         summary_lines.extend(
             [
