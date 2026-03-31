@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Online teacher-student adaptation with buffered replay updates.
-
-This keeps a conservative pseudo-label gate, optional temporal reliability
-checks, and an EMA teacher while updating the student from replayed
-mini-batches using detection loss plus a compact prototype-memory alignment
-term.
-"""
+"""Online teacher-student ODAD with persist2 replay gating and top-k teacher candidate selection."""
 
 from __future__ import annotations
 
@@ -22,12 +16,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
+import matplotlib
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -82,10 +75,11 @@ class Top1Det:
     conf: float
     cls_id: int
     xyxy: Tuple[float, float, float, float]
+    rank: int = 1
 
 
 @dataclass
-class MemoryEntry:
+class ReplayEntry:
     frame_idx: int
     path: str
     width: int
@@ -95,11 +89,9 @@ class MemoryEntry:
 
 
 @dataclass
-class PrototypeEntry:
-    frame_idx: int
-    pseudo_cls: int
-    teacher_conf: float
-    vector: torch.Tensor
+class ObjectMemoryEntry:
+    cls_id: int
+    embedding: torch.Tensor
 
 
 @dataclass
@@ -112,6 +104,12 @@ class FrameLog:
     passed_base_gate: int
     passed_motion_gate: int
     passed_persistence_gate: int
+    teacher_num_candidates: int
+    teacher_selected_rank: int
+    teacher_selected_score: float
+    teacher_selected_score_conf: float
+    teacher_selected_score_temporal: float
+    teacher_selected_score_memory: float
     persistence_count: int
     temporal_iou: float
     persistence_iou: float
@@ -119,44 +117,17 @@ class FrameLog:
     area_ratio: float
     num_pseudo_boxes_used: int
     buffer_size: int
-    prototype_memory_size: int
+    update_event_triggered: int
     update_applied: int
     updates_this_frame: int
     batch_size_used: int
     det_loss: float
-    prototype_loss: float
     total_loss: float
     teacher_latency_ms: float
     student_post_conf: float
     student_post_latency_ms: float
     update_latency_ms: float
     frame_latency_ms: float
-
-
-@dataclass
-class ModuleParamSummary:
-    idx: int
-    class_name: str
-    total_params: int
-    trainable_params: int
-    optimizer_params: int
-
-
-@dataclass
-class PrototypeAuditRow:
-    update_step: int
-    frame: int
-    prototype_memory_size: int
-    det_loss: float
-    prototype_loss: float
-    total_loss: float
-    grad_21: float
-    grad_22: float
-    delta_21: float
-    delta_22: float
-
-
-PROTOTYPE_AUDIT_MODULE_INDICES = (21, 22)
 
 
 @dataclass
@@ -167,30 +138,29 @@ class PersistenceState:
 
 
 @dataclass
-class GateDecision:
-    passed_base_gate: int
-    passed_motion_gate: int
-    passed_persistence_gate: int
-    accepted_final: int
-    persistence_count: int
-    temporal_iou: float
-    persistence_iou: float
-    center_shift_frac: float
-    area_ratio: float
+class CandidateSelectionResult:
+    selected: Optional[Top1Det]
+    num_candidates: int
+    selected_rank: int
+    selected_score: float
+    score_conf: float
+    score_temporal: float
+    score_memory: float
+    selected_embedding: Optional[torch.Tensor] = None
 
 
 class ReplayBuffer:
     def __init__(self, max_size: int, rng: random.Random) -> None:
-        self._entries: Deque[MemoryEntry] = deque(maxlen=max(1, int(max_size)))
+        self._entries: Deque[ReplayEntry] = deque(maxlen=max(1, int(max_size)))
         self._rng = rng
 
     def __len__(self) -> int:
         return len(self._entries)
 
-    def add(self, entry: MemoryEntry) -> None:
+    def add(self, entry: ReplayEntry) -> None:
         self._entries.append(entry)
 
-    def sample(self, batch_size: int, mode: str) -> List[MemoryEntry]:
+    def sample(self, batch_size: int, mode: str) -> List[ReplayEntry]:
         if not self._entries:
             return []
         k = min(max(1, int(batch_size)), len(self._entries))
@@ -212,37 +182,15 @@ class LayerFeatureTap:
     def clear(self) -> None:
         self._latest = None
 
-    def take_pooled(self) -> torch.Tensor:
+    def take_feature_map(self) -> torch.Tensor:
         output = self._latest
         self._latest = None
         if output is None:
-            raise RuntimeError(f"Prototype layer {self.layer_idx} produced no captured output.")
-        return pool_feature_output(output)
+            raise RuntimeError(f"Feature tap layer {self.layer_idx} produced no captured output.")
+        return extract_feature_map(output)
 
     def close(self) -> None:
         self._handle.remove()
-
-
-def retrieve_prototype_targets(
-    prototypes: Sequence[PrototypeEntry],
-    queries: torch.Tensor,
-    topk: int,
-    distance: str,
-) -> Optional[torch.Tensor]:
-    if not prototypes:
-        return None
-
-    memory = torch.stack([entry.vector for entry in prototypes], dim=0).to(device=queries.device, dtype=queries.dtype)
-    k = min(max(1, int(topk)), memory.shape[0])
-    if distance == "cosine":
-        query_scores = F.normalize(queries, dim=1, eps=1e-12)
-        memory_scores = F.normalize(memory, dim=1, eps=1e-12)
-        indices = (query_scores @ memory_scores.T).topk(k, dim=1, largest=True).indices
-    elif distance == "l2":
-        indices = torch.cdist(queries, memory, p=2).topk(k, dim=1, largest=False).indices
-    else:  # pragma: no cover
-        raise RuntimeError(f"Unsupported prototype distance: {distance}")
-    return memory[indices].mean(dim=1)
 
 
 def list_test_images(dataset_root: Path) -> List[Path]:
@@ -281,6 +229,30 @@ def area_fraction(box: Tuple[float, float, float, float], width: int, height: in
     return float(box_area / img_area)
 
 
+def box_width_height(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1), max(0.0, y2 - y1)
+
+
+def box_meets_embedding_size(
+    box: Tuple[float, float, float, float],
+    width: int,
+    height: int,
+    min_box_frac: float,
+) -> bool:
+    threshold = max(0.0, float(min_box_frac))
+    if threshold <= 0.0:
+        return True
+    box_w, box_h = box_width_height(box)
+    width_frac = box_w / max(1.0, float(width))
+    height_frac = box_h / max(1.0, float(height))
+    return bool(
+        width_frac >= threshold
+        or height_frac >= threshold
+        or area_fraction(box, width=width, height=height) >= (threshold * threshold)
+    )
+
+
 def near_border(box: Tuple[float, float, float, float], width: int, height: int, margin_frac: float) -> bool:
     if margin_frac <= 0:
         return False
@@ -288,6 +260,29 @@ def near_border(box: Tuple[float, float, float, float], width: int, height: int,
     mx = margin_frac * width
     my = margin_frac * height
     return (x1 < mx) or (y1 < my) or (x2 > (width - mx)) or (y2 > (height - my))
+
+
+def evaluate_detection_sanity(
+    top1: Optional[Top1Det],
+    img_w: int,
+    img_h: int,
+    conf_thresh: float,
+    min_area_frac: float,
+    max_area_frac: float,
+    border_margin_frac: float,
+) -> bool:
+    if top1 is None:
+        return False
+    if top1.conf < conf_thresh:
+        return False
+
+    af = area_fraction(top1.xyxy, img_w, img_h)
+    if af < min_area_frac or af > max_area_frac:
+        return False
+
+    if near_border(top1.xyxy, img_w, img_h, border_margin_frac):
+        return False
+    return True
 
 
 def evaluate_base_gate(
@@ -302,16 +297,15 @@ def evaluate_base_gate(
     temporal_iou_gate: float,
 ) -> Tuple[bool, float]:
     temporal_iou = float("nan")
-    if top1 is None:
-        return False, temporal_iou
-    if top1.conf < conf_thresh:
-        return False, temporal_iou
-
-    af = area_fraction(top1.xyxy, img_w, img_h)
-    if af < min_area_frac or af > max_area_frac:
-        return False, temporal_iou
-
-    if near_border(top1.xyxy, img_w, img_h, border_margin_frac):
+    if not evaluate_detection_sanity(
+        top1=top1,
+        img_w=img_w,
+        img_h=img_h,
+        conf_thresh=conf_thresh,
+        min_area_frac=min_area_frac,
+        max_area_frac=max_area_frac,
+        border_margin_frac=border_margin_frac,
+    ):
         return False, temporal_iou
 
     if prev_teacher_box is not None and temporal_iou_gate > 0:
@@ -493,11 +487,11 @@ def pil_to_model_tensor(img_rgb: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).unsqueeze(0)
 
 
-def pool_feature_output(output: Any) -> torch.Tensor:
+def extract_feature_map(output: Any) -> torch.Tensor:
     tensors: List[torch.Tensor] = []
 
     def visit(value: Any) -> None:
-        if isinstance(value, torch.Tensor) and value.ndim >= 2:
+        if isinstance(value, torch.Tensor) and value.ndim == 4:
             tensors.append(value)
         elif isinstance(value, (list, tuple)):
             for item in value:
@@ -508,47 +502,74 @@ def pool_feature_output(output: Any) -> torch.Tensor:
 
     visit(output)
     if not tensors:
-        raise RuntimeError(f"Unable to pool prototype features from output type {type(output)}.")
+        raise RuntimeError(f"Unable to find a 4D object-memory feature map in output type {type(output)}.")
 
     batch_size = int(tensors[0].shape[0])
-    pooled_chunks: List[torch.Tensor] = []
     for tensor in tensors:
         if int(tensor.shape[0]) != batch_size:
-            raise RuntimeError("Prototype feature tensors had inconsistent batch dimensions.")
-        reduce_dims = tuple(range(2, tensor.ndim))
-        pooled = tensor.mean(dim=reduce_dims) if reduce_dims else tensor
-        pooled_chunks.append(pooled.reshape(batch_size, -1))
-    return torch.cat(pooled_chunks, dim=1)
+            raise RuntimeError("Object-memory feature tensors had inconsistent batch dimensions.")
+    tensors.sort(key=lambda tensor: int(tensor.shape[-2]) * int(tensor.shape[-1]), reverse=True)
+    return tensors[0]
 
 
-def top1_from_results(results: Any) -> Optional[Top1Det]:
+def teacher_candidates_from_results(
+    results: Any,
+    topk: int,
+    conf_floor: float,
+    allow_top1_fallback: bool,
+) -> Tuple[Optional[Top1Det], List[Top1Det]]:
     if not results:
-        return None
-    r = results[0]
-    boxes = r.boxes
+        return None, []
+    result = results[0]
+    boxes = result.boxes
     if boxes is None or boxes.xyxy is None or boxes.xyxy.shape[0] == 0:
-        return None
+        return None, []
 
     confs = boxes.conf.detach().cpu().numpy()
     xyxy = boxes.xyxy.detach().cpu().numpy()
     cls_vals = boxes.cls.detach().cpu().numpy() if getattr(boxes, "cls", None) is not None else None
+    order = np.argsort(-confs)
+    if order.size == 0:
+        return None, []
 
-    idx = int(np.argmax(confs))
-    cls_id = int(cls_vals[idx]) if cls_vals is not None else 0
-    x1, y1, x2, y2 = map(float, xyxy[idx].tolist())
-    return Top1Det(conf=float(confs[idx]), cls_id=cls_id, xyxy=(x1, y1, x2, y2))
+    def build_det(idx: int, rank: int) -> Top1Det:
+        cls_id = int(cls_vals[idx]) if cls_vals is not None else 0
+        x1, y1, x2, y2 = map(float, xyxy[idx].tolist())
+        return Top1Det(conf=float(confs[idx]), cls_id=cls_id, xyxy=(x1, y1, x2, y2), rank=int(rank))
+
+    raw_top1 = build_det(int(order[0]), rank=1)
+    candidates: List[Top1Det] = []
+    limit = max(1, int(topk))
+    for rank, idx in enumerate(order.tolist(), start=1):
+        idx_int = int(idx)
+        if float(confs[idx_int]) < float(conf_floor):
+            break
+        candidates.append(build_det(idx_int, rank=rank))
+        if len(candidates) >= limit:
+            break
+
+    if allow_top1_fallback and raw_top1 is not None and not candidates:
+        candidates = [raw_top1]
+    return raw_top1, candidates
 
 
-def predict_top1_wrapper(
+def top1_from_results(results: Any) -> Optional[Top1Det]:
+    raw_top1, _ = teacher_candidates_from_results(
+        results=results,
+        topk=1,
+        conf_floor=-1.0,
+        allow_top1_fallback=False,
+    )
+    return raw_top1
+
+
+def predict_results_with_latency(
     yolo_wrapper: YOLO,
     source: Any,
     device: str,
     conf: float,
     iou: float,
-    feature_tap: Optional[LayerFeatureTap] = None,
-) -> Tuple[Optional[Top1Det], float, Optional[torch.Tensor]]:
-    if feature_tap is not None:
-        feature_tap.clear()
+) -> Tuple[Any, float]:
     use_cuda_timing = device.startswith("cuda") and torch.cuda.is_available()
     starter = ender = None
     if use_cuda_timing:
@@ -574,14 +595,386 @@ def predict_top1_wrapper(
     else:
         latency_ms = (time.time() - t0) * 1000.0
 
-    prototype = None
-    if feature_tap is not None:
-        pooled = feature_tap.take_pooled()
-        if pooled.shape[0] != 1:
-            raise RuntimeError(f"Expected a single prototype vector, got batch dimension {pooled.shape[0]}.")
-        prototype = pooled[0].detach().to(device="cpu", dtype=torch.float32).view(-1).contiguous()
+    return results, latency_ms
 
-    return top1_from_results(results), latency_ms, prototype
+
+def predict_top1_wrapper(
+    yolo_wrapper: YOLO,
+    source: Any,
+    device: str,
+    conf: float,
+    iou: float,
+) -> Tuple[Optional[Top1Det], float]:
+    results, latency_ms = predict_results_with_latency(
+        yolo_wrapper=yolo_wrapper,
+        source=source,
+        device=device,
+        conf=conf,
+        iou=iou,
+    )
+    return top1_from_results(results), latency_ms
+
+
+def predict_teacher_candidates_wrapper(
+    yolo_wrapper: YOLO,
+    source: Any,
+    device: str,
+    conf: float,
+    iou: float,
+    topk: int,
+    conf_floor: float,
+    allow_top1_fallback: bool,
+) -> Tuple[Optional[Top1Det], List[Top1Det], float]:
+    results, latency_ms = predict_results_with_latency(
+        yolo_wrapper=yolo_wrapper,
+        source=source,
+        device=device,
+        conf=conf,
+        iou=iou,
+    )
+    raw_top1, candidates = teacher_candidates_from_results(
+        results=results,
+        topk=topk,
+        conf_floor=conf_floor,
+        allow_top1_fallback=allow_top1_fallback,
+    )
+    return raw_top1, candidates, latency_ms
+
+
+def normalize_embedding_vector(embedding: torch.Tensor) -> torch.Tensor:
+    vector = embedding.detach().to(device="cpu", dtype=torch.float32).view(-1).contiguous()
+    if vector.numel() == 0:
+        raise RuntimeError("Object-memory embeddings must be non-empty.")
+    return torch.nn.functional.normalize(vector, dim=0, eps=1e-12)
+
+
+def extract_object_roi_embedding(
+    feature_map: torch.Tensor,
+    box_xyxy: Tuple[float, float, float, float],
+    img_w: int,
+    img_h: int,
+    imgsz: int,
+    gain: float,
+    pad_left: int,
+    pad_top: int,
+    min_box_frac: float,
+) -> Optional[torch.Tensor]:
+    if feature_map.ndim != 4 or int(feature_map.shape[0]) != 1:
+        raise RuntimeError(f"Expected a single-image 4D feature map, got shape={tuple(feature_map.shape)}")
+    if not box_meets_embedding_size(box_xyxy, width=img_w, height=img_h, min_box_frac=min_box_frac):
+        return None
+
+    x1_l, y1_l, x2_l, y2_l = (
+        box_xyxy[0] * gain + pad_left,
+        box_xyxy[1] * gain + pad_top,
+        box_xyxy[2] * gain + pad_left,
+        box_xyxy[3] * gain + pad_top,
+    )
+    feat_h = int(feature_map.shape[-2])
+    feat_w = int(feature_map.shape[-1])
+    scale_x = feat_w / max(1.0, float(imgsz))
+    scale_y = feat_h / max(1.0, float(imgsz))
+
+    x1_idx = max(0, min(feat_w - 1, int(math.floor(x1_l * scale_x))))
+    y1_idx = max(0, min(feat_h - 1, int(math.floor(y1_l * scale_y))))
+    x2_idx = max(x1_idx + 1, min(feat_w, int(math.ceil(x2_l * scale_x))))
+    y2_idx = max(y1_idx + 1, min(feat_h, int(math.ceil(y2_l * scale_y))))
+    roi = feature_map[:, :, y1_idx:y2_idx, x1_idx:x2_idx]
+    if roi.numel() == 0:
+        return None
+    pooled = torch.nn.functional.adaptive_avg_pool2d(roi, output_size=(1, 1)).flatten(1)
+    return pooled[0]
+
+
+def extract_object_embedding_for_box(
+    teacher_model: nn.Module,
+    feature_tap: LayerFeatureTap,
+    img_rgb: Image.Image,
+    box_xyxy: Tuple[float, float, float, float],
+    imgsz: int,
+    device: str,
+    min_box_frac: float,
+) -> Optional[torch.Tensor]:
+    img_w, img_h = img_rgb.size
+    if not box_meets_embedding_size(box_xyxy, width=img_w, height=img_h, min_box_frac=min_box_frac):
+        return None
+
+    letterboxed, gain, pad_left, pad_top = letterbox_image(img_rgb, size=imgsz)
+    feature_tap.clear()
+    input_tensor = pil_to_model_tensor(letterboxed).to(device)
+    with torch.inference_mode():
+        _ = teacher_model(input_tensor)
+    feature_map = feature_tap.take_feature_map()
+    embedding = extract_object_roi_embedding(
+        feature_map=feature_map,
+        box_xyxy=box_xyxy,
+        img_w=img_w,
+        img_h=img_h,
+        imgsz=imgsz,
+        gain=gain,
+        pad_left=pad_left,
+        pad_top=pad_top,
+        min_box_frac=min_box_frac,
+    )
+    if embedding is None:
+        return None
+    return embedding.detach().to(device="cpu", dtype=torch.float32).view(-1).contiguous()
+
+
+def extract_candidate_embeddings(
+    teacher_model: nn.Module,
+    feature_tap: LayerFeatureTap,
+    img_rgb: Image.Image,
+    candidates: Sequence[Top1Det],
+    imgsz: int,
+    device: str,
+    min_box_frac: float,
+) -> Dict[int, torch.Tensor]:
+    if not candidates:
+        return {}
+
+    img_w, img_h = img_rgb.size
+    letterboxed, gain, pad_left, pad_top = letterbox_image(img_rgb, size=imgsz)
+    feature_tap.clear()
+    input_tensor = pil_to_model_tensor(letterboxed).to(device)
+    with torch.inference_mode():
+        _ = teacher_model(input_tensor)
+    feature_map = feature_tap.take_feature_map()
+
+    embeddings: Dict[int, torch.Tensor] = {}
+    for candidate in candidates:
+        embedding = extract_object_roi_embedding(
+            feature_map=feature_map,
+            box_xyxy=candidate.xyxy,
+            img_w=img_w,
+            img_h=img_h,
+            imgsz=imgsz,
+            gain=gain,
+            pad_left=pad_left,
+            pad_top=pad_top,
+            min_box_frac=min_box_frac,
+        )
+        if embedding is not None:
+            embeddings[int(candidate.rank)] = embedding.detach().to(device="cpu", dtype=torch.float32).view(-1)
+    return embeddings
+
+
+def compute_memory_similarity_score(
+    query_embedding: Optional[torch.Tensor],
+    memory_bank: Sequence[ObjectMemoryEntry],
+    cls_id: int,
+) -> float:
+    if query_embedding is None or not memory_bank:
+        return float("nan")
+
+    same_class_embeddings = [
+        normalize_embedding_vector(entry.embedding)
+        for entry in memory_bank
+        if int(entry.cls_id) == int(cls_id)
+    ]
+    if not same_class_embeddings:
+        return float("nan")
+
+    query = normalize_embedding_vector(query_embedding).view(1, -1)
+    memory = torch.stack(same_class_embeddings, dim=0).to(dtype=query.dtype)
+    if memory.ndim != 2 or memory.shape[1] != query.shape[1]:
+        raise RuntimeError(
+            f"Object-memory embedding mismatch: query_dim={query.shape[1]} memory_dim={memory.shape[1] if memory.ndim == 2 else 'n/a'}"
+        )
+    scores = query @ memory.T
+    return float(torch.max(scores).item())
+
+
+def compute_temporal_consistency_score(
+    box_xyxy: Tuple[float, float, float, float],
+    prev_box_xyxy: Optional[Tuple[float, float, float, float]],
+    img_w: int,
+    img_h: int,
+    max_center_shift_frac: float,
+    max_area_ratio: float,
+) -> Tuple[float, float, float, float]:
+    if prev_box_xyxy is None:
+        return 0.0, float("nan"), float("nan"), float("nan")
+
+    iou = xyxy_iou(box_xyxy, prev_box_xyxy)
+    center_shift = center_shift_fraction(box_xyxy, prev_box_xyxy, img_w=img_w, img_h=img_h)
+    area_ratio = symmetric_area_ratio(box_xyxy, prev_box_xyxy)
+
+    shift_factor = 1.0
+    if max_center_shift_frac > 0:
+        shift_factor = max(0.0, 1.0 - max(0.0, center_shift / max_center_shift_frac))
+
+    area_factor = 1.0
+    if max_area_ratio > 0:
+        if max_area_ratio <= 1.0:
+            area_factor = 1.0 if area_ratio <= max_area_ratio else 0.0
+        else:
+            area_budget = max(1e-6, max_area_ratio - 1.0)
+            area_factor = max(0.0, 1.0 - max(0.0, area_ratio - 1.0) / area_budget)
+
+    temporal_score = float(iou * shift_factor * area_factor)
+    return temporal_score, float(iou), float(center_shift), float(area_ratio)
+
+
+def score_teacher_candidate(
+    candidate: Top1Det,
+    prev_reference_box: Optional[Tuple[float, float, float, float]],
+    img_w: int,
+    img_h: int,
+    max_center_shift_frac: float,
+    max_area_ratio: float,
+    score_mode: str,
+    conf_weight: float,
+    temporal_weight: float,
+    memory_weight: float,
+    memory_score: float,
+) -> Tuple[float, float, float]:
+    mode = str(score_mode)
+    conf_term = float(candidate.conf)
+    temporal_term = 0.0
+    if mode in {"conf_temporal", "conf_temporal_memory"}:
+        temporal_term, _iou, _center_shift, _area_ratio = compute_temporal_consistency_score(
+            box_xyxy=candidate.xyxy,
+            prev_box_xyxy=prev_reference_box,
+            img_w=img_w,
+            img_h=img_h,
+            max_center_shift_frac=max_center_shift_frac,
+            max_area_ratio=max_area_ratio,
+        )
+
+    total = float(conf_weight) * conf_term
+    if mode in {"conf_temporal", "conf_temporal_memory"}:
+        total += float(temporal_weight) * float(temporal_term)
+    if mode == "conf_temporal_memory" and math.isfinite(memory_score):
+        total += float(memory_weight) * float(memory_score)
+    elif mode not in {"conf_only", "conf_temporal", "conf_temporal_memory"}:  # pragma: no cover
+        raise RuntimeError(f"Unsupported teacher candidate score mode: {score_mode}")
+    return float(total), float(conf_term), float(temporal_term)
+
+
+def select_teacher_candidate(
+    candidates: Sequence[Top1Det],
+    prev_reference_box: Optional[Tuple[float, float, float, float]],
+    img_w: int,
+    img_h: int,
+    max_center_shift_frac: float,
+    max_area_ratio: float,
+    score_mode: str,
+    conf_weight: float,
+    temporal_weight: float,
+    memory_weight: float,
+    min_score: float,
+    memory_bank: Sequence[ObjectMemoryEntry],
+    candidate_embeddings: Optional[Dict[int, torch.Tensor]],
+) -> CandidateSelectionResult:
+    if not candidates:
+        return CandidateSelectionResult(
+            selected=None,
+            num_candidates=0,
+            selected_rank=0,
+            selected_score=float("nan"),
+            score_conf=float("nan"),
+            score_temporal=float("nan"),
+            score_memory=float("nan"),
+            selected_embedding=None,
+        )
+
+    if len(candidates) == 1:
+        only = candidates[0]
+        only_embedding = candidate_embeddings.get(int(only.rank)) if candidate_embeddings is not None else None
+        memory_score = compute_memory_similarity_score(
+            query_embedding=only_embedding,
+            memory_bank=memory_bank,
+            cls_id=int(only.cls_id),
+        )
+        selected_score, score_conf, score_temporal = score_teacher_candidate(
+            candidate=only,
+            prev_reference_box=prev_reference_box,
+            img_w=img_w,
+            img_h=img_h,
+            max_center_shift_frac=max_center_shift_frac,
+            max_area_ratio=max_area_ratio,
+            score_mode=score_mode,
+            conf_weight=conf_weight,
+            temporal_weight=temporal_weight,
+            memory_weight=memory_weight,
+            memory_score=memory_score,
+        )
+        return CandidateSelectionResult(
+            selected=only,
+            num_candidates=len(candidates),
+            selected_rank=int(only.rank),
+            selected_score=float(selected_score),
+            score_conf=float(score_conf),
+            score_temporal=float(score_temporal),
+            score_memory=float(memory_score),
+            selected_embedding=only_embedding,
+        )
+
+    best_candidate: Optional[Top1Det] = None
+    best_embedding: Optional[torch.Tensor] = None
+    best_total = float("-inf")
+    best_conf_term = float("nan")
+    best_temporal_term = float("nan")
+    best_memory_term = float("nan")
+
+    for candidate in candidates:
+        embedding = candidate_embeddings.get(int(candidate.rank)) if candidate_embeddings is not None else None
+        memory_score = compute_memory_similarity_score(
+            query_embedding=embedding,
+            memory_bank=memory_bank,
+            cls_id=int(candidate.cls_id),
+        )
+        total, conf_term, temporal_term = score_teacher_candidate(
+            candidate=candidate,
+            prev_reference_box=prev_reference_box,
+            img_w=img_w,
+            img_h=img_h,
+            max_center_shift_frac=max_center_shift_frac,
+            max_area_ratio=max_area_ratio,
+            score_mode=score_mode,
+            conf_weight=conf_weight,
+            temporal_weight=temporal_weight,
+            memory_weight=memory_weight,
+            memory_score=memory_score,
+        )
+        if (
+            best_candidate is None
+            or total > best_total
+            or (
+                math.isclose(total, best_total, rel_tol=0.0, abs_tol=1e-12)
+                and (candidate.conf > best_candidate.conf or candidate.rank < best_candidate.rank)
+            )
+        ):
+            best_candidate = candidate
+            best_embedding = embedding
+            best_total = float(total)
+            best_conf_term = float(conf_term)
+            best_temporal_term = float(temporal_term)
+            best_memory_term = float(memory_score)
+
+    if best_candidate is None or best_total < float(min_score):
+        return CandidateSelectionResult(
+            selected=None,
+            num_candidates=len(candidates),
+            selected_rank=0,
+            selected_score=float("nan"),
+            score_conf=float("nan"),
+            score_temporal=float("nan"),
+            score_memory=float("nan"),
+            selected_embedding=None,
+        )
+
+    return CandidateSelectionResult(
+        selected=best_candidate,
+        num_candidates=len(candidates),
+        selected_rank=int(best_candidate.rank),
+        selected_score=float(best_total),
+        score_conf=float(best_conf_term),
+        score_temporal=float(best_temporal_term),
+        score_memory=float(best_memory_term),
+        selected_embedding=best_embedding,
+    )
 
 
 def unwrap_core_and_layers(model: nn.Module) -> Tuple[nn.Module, List[nn.Module]]:
@@ -653,168 +1046,25 @@ def compute_unfrozen_indices(
 def param_id_set_for_indices(layers: List[nn.Module], indices: Sequence[int]) -> set[int]:
     out: set[int] = set()
     for idx in indices:
-        for p in layers[idx].parameters():
-            out.add(id(p))
+        for param in layers[idx].parameters():
+            out.add(id(param))
     return out
 
 
-def build_module_param_summaries(layers: List[nn.Module], optimizer_param_ids: set[int]) -> List[ModuleParamSummary]:
-    out: List[ModuleParamSummary] = []
-    for idx, module in enumerate(layers):
-        params = list(module.parameters())
-        if not params:
-            continue
-        total_params = int(sum(p.numel() for p in params))
-        trainable_params = int(sum(p.numel() for p in params if p.requires_grad))
-        optimizer_params = int(sum(p.numel() for p in params if id(p) in optimizer_param_ids))
-        out.append(
-            ModuleParamSummary(
-                idx=idx,
-                class_name=module.__class__.__name__,
-                total_params=total_params,
-                trainable_params=trainable_params,
-                optimizer_params=optimizer_params,
-            )
-        )
-    return out
-
-
-def apply_freeze_policy(model: nn.Module, layers: List[nn.Module], unfrozen_indices: List[int]) -> None:
-    for p in model.parameters():
-        p.requires_grad = False
+def apply_freeze_policy(model: nn.Module, layers: List[nn.Module], unfrozen_indices: Sequence[int]) -> None:
+    for param in model.parameters():
+        param.requires_grad = False
     for idx in unfrozen_indices:
-        for p in layers[idx].parameters():
-            p.requires_grad = True
-
-
-def collect_module_params(layers: List[nn.Module], indices: Sequence[int]) -> Dict[int, List[torch.nn.Parameter]]:
-    out: Dict[int, List[torch.nn.Parameter]] = {}
-    for idx in indices:
-        if idx < 0 or idx >= len(layers):
-            raise RuntimeError(f"Prototype audit expects module idx {idx}, but model has {len(layers)} layers.")
-        out[int(idx)] = list(layers[idx].parameters())
-    return out
-
-
-def snapshot_params(params: Sequence[torch.nn.Parameter]) -> List[torch.Tensor]:
-    return [p.detach().clone() for p in params]
-
-
-def grad_l2(params: Sequence[torch.nn.Parameter]) -> float:
-    total = 0.0
-    for param in params:
-        if param.grad is None:
-            continue
-        grad = param.grad.detach()
-        total += float(torch.sum(grad * grad).item())
-    return math.sqrt(total) if total > 0.0 else 0.0
-
-
-def delta_l2(params: Sequence[torch.nn.Parameter], before: Sequence[torch.Tensor]) -> float:
-    total = 0.0
-    for param, before_param in zip(params, before):
-        delta = param.detach() - before_param
-        total += float(torch.sum(delta * delta).item())
-    return math.sqrt(total) if total > 0.0 else 0.0
-
-
-def write_prototype_audit_files(out_dir: Path, rows: Sequence[PrototypeAuditRow]) -> None:
-    csv_path = out_dir / "prototype_audit.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "update_step",
-                "frame",
-                "prototype_memory_size",
-                "det_loss",
-                "prototype_loss",
-                "total_loss",
-                "grad_21",
-                "grad_22",
-                "delta_21",
-                "delta_22",
-            ]
-        )
-        for row in rows:
-            writer.writerow(
-                [
-                    row.update_step,
-                    row.frame,
-                    row.prototype_memory_size,
-                    f"{row.det_loss:.6f}",
-                    f"{row.prototype_loss:.6f}",
-                    f"{row.total_loss:.6f}",
-                    f"{row.grad_21:.6f}",
-                    f"{row.grad_22:.6f}",
-                    f"{row.delta_21:.6f}",
-                    f"{row.delta_22:.6f}",
-                ]
-            )
-
-    eps = 1e-12
-
-    def arr(values: Sequence[float]) -> np.ndarray:
-        return np.array(list(values), dtype=np.float32)
-
-    def mean_or_nan(values: np.ndarray) -> float:
-        return float(np.mean(values)) if values.size else float("nan")
-
-    def median_or_nan(values: np.ndarray) -> float:
-        return float(np.median(values)) if values.size else float("nan")
-
-    def max_or_nan(values: np.ndarray) -> float:
-        return float(np.max(values)) if values.size else float("nan")
-
-    def frac_nonzero(values: np.ndarray) -> float:
-        return float(np.mean(values > eps)) if values.size else float("nan")
-
-    grad_21_vals = arr([row.grad_21 for row in rows])
-    grad_22_vals = arr([row.grad_22 for row in rows])
-    delta_21_vals = arr([row.delta_21 for row in rows])
-    delta_22_vals = arr([row.delta_22 for row in rows])
-    prototype_loss_vals = arr([row.prototype_loss for row in rows])
-    total_loss_vals = arr([row.total_loss for row in rows])
-
-    summary_lines = [
-        "Prototype Audit Summary",
-        "",
-        f"audited_update_steps={len(rows)}",
-        f"audited_modules={list(PROTOTYPE_AUDIT_MODULE_INDICES)}",
-        "",
-        "module_21:",
-        format_metric("mean_grad_l2", mean_or_nan(grad_21_vals), prefix="  "),
-        format_metric("median_grad_l2", median_or_nan(grad_21_vals), prefix="  "),
-        format_metric("max_grad_l2", max_or_nan(grad_21_vals), prefix="  "),
-        format_metric("mean_delta_l2", mean_or_nan(delta_21_vals), prefix="  "),
-        format_metric("median_delta_l2", median_or_nan(delta_21_vals), prefix="  "),
-        format_metric("max_delta_l2", max_or_nan(delta_21_vals), prefix="  "),
-        format_metric("fraction_nonzero_grad", frac_nonzero(grad_21_vals), prefix="  "),
-        format_metric("fraction_nonzero_delta", frac_nonzero(delta_21_vals), prefix="  "),
-        "",
-        "module_22:",
-        format_metric("mean_grad_l2", mean_or_nan(grad_22_vals), prefix="  "),
-        format_metric("median_grad_l2", median_or_nan(grad_22_vals), prefix="  "),
-        format_metric("max_grad_l2", max_or_nan(grad_22_vals), prefix="  "),
-        format_metric("mean_delta_l2", mean_or_nan(delta_22_vals), prefix="  "),
-        format_metric("median_delta_l2", median_or_nan(delta_22_vals), prefix="  "),
-        format_metric("max_delta_l2", max_or_nan(delta_22_vals), prefix="  "),
-        format_metric("fraction_nonzero_grad", frac_nonzero(grad_22_vals), prefix="  "),
-        format_metric("fraction_nonzero_delta", frac_nonzero(delta_22_vals), prefix="  "),
-        "",
-        "losses:",
-        format_metric("mean_prototype_loss", mean_or_nan(prototype_loss_vals), prefix="  "),
-        format_metric("mean_total_loss", mean_or_nan(total_loss_vals), prefix="  "),
-    ]
-    (out_dir / "prototype_audit_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+        for param in layers[idx].parameters():
+            param.requires_grad = True
 
 
 def update_teacher_ema(teacher_model: nn.Module, student_model: nn.Module, decay: float) -> None:
     with torch.no_grad():
-        t_state = teacher_model.state_dict()
-        s_state = student_model.state_dict()
-        for key, teacher_val in t_state.items():
-            student_val = s_state[key]
+        teacher_state = teacher_model.state_dict()
+        student_state = student_model.state_dict()
+        for key, teacher_val in teacher_state.items():
+            student_val = student_state[key]
             if torch.is_floating_point(teacher_val):
                 teacher_val.mul_(decay).add_(student_val.detach(), alpha=(1.0 - decay))
             else:
@@ -835,7 +1085,7 @@ def unpack_loss_pair(loss_out_obj: Any) -> Tuple[Optional[torch.Tensor], Any]:
 
 
 def build_training_batch(
-    entries: Sequence[MemoryEntry],
+    entries: Sequence[ReplayEntry],
     imgsz: int,
     device: str,
     rng: random.Random,
@@ -869,30 +1119,12 @@ def build_training_batch(
         cls_vals.append([float(entry.pseudo_cls)])
         box_vals.append([x_c, y_c, bw, bh])
 
-    img = torch.cat(img_tensors, dim=0).to(device)
-    batch = {
-        "img": img,
+    return {
+        "img": torch.cat(img_tensors, dim=0).to(device),
         "batch_idx": torch.tensor(batch_idx_vals, dtype=torch.long, device=device),
         "cls": torch.tensor(cls_vals, dtype=torch.float32, device=device),
         "bboxes": torch.tensor(box_vals, dtype=torch.float32, device=device),
     }
-    return batch
-
-
-def compute_prototype_alignment_loss(
-    student_embeddings: torch.Tensor,
-    prototype_targets: Optional[torch.Tensor],
-    distance: str,
-) -> torch.Tensor:
-    if prototype_targets is None or prototype_targets.numel() == 0:
-        return student_embeddings.new_zeros(())
-    if distance == "cosine":
-        student_norm = F.normalize(student_embeddings, dim=1, eps=1e-12)
-        target_norm = F.normalize(prototype_targets, dim=1, eps=1e-12)
-        return (1.0 - (student_norm * target_norm).sum(dim=1)).mean()
-    if distance == "l2":
-        return F.mse_loss(student_embeddings, prototype_targets)
-    raise RuntimeError(f"Unsupported prototype distance: {distance}")
 
 
 def run_detection_update(
@@ -901,35 +1133,12 @@ def run_detection_update(
     optimizer: torch.optim.Optimizer,
     optim_params: Sequence[torch.nn.Parameter],
     batch: Dict[str, torch.Tensor],
-    prototype_memory: Sequence[PrototypeEntry],
-    student_feature_tap: LayerFeatureTap,
     grad_clip: float,
-    prototype_weight: float,
-    prototype_topk: int,
-    prototype_distance: str,
-    audit_enabled: bool = False,
-    audit_rows: Optional[List[PrototypeAuditRow]] = None,
-    audit_module_params: Optional[Dict[int, Sequence[torch.nn.Parameter]]] = None,
-    audit_max_updates: int = 0,
-    audit_update_step: int = 0,
-    audit_frame_idx: int = -1,
-    audit_prototype_memory_size: int = 0,
-) -> Tuple[float, float, float]:
-    capture_audit = (
-        bool(audit_enabled)
-        and audit_rows is not None
-        and audit_module_params is not None
-        and len(audit_rows) < max(0, int(audit_max_updates))
-    )
-    params_before = (
-        {idx: snapshot_params(params) for idx, params in audit_module_params.items()} if capture_audit else None
-    )
-
+) -> Tuple[float, float]:
     with torch.inference_mode(False):
         with torch.enable_grad():
             student_model.train()
             optimizer.zero_grad(set_to_none=True)
-            student_feature_tap.clear()
             preds = student_model(batch["img"])
 
             if hasattr(student_model, "loss"):
@@ -938,68 +1147,27 @@ def run_detection_update(
                 loss_out = criterion(preds, batch)
 
             loss, _loss_items = unpack_loss_pair(loss_out)
-
             if loss is None:
-                same_forward_fallback = criterion(preds, batch)
-                loss, _loss_items = unpack_loss_pair(same_forward_fallback)
+                fallback = criterion(preds, batch)
+                loss, _loss_items = unpack_loss_pair(fallback)
 
             if loss is None and hasattr(student_model, "loss"):
                 fallback = student_model.loss(batch)
                 loss, _loss_items = unpack_loss_pair(fallback)
 
             if loss is None:
-                raise RuntimeError(f"Unable to obtain differentiable detection loss; output type={type(loss_out)}")
-
-            det_loss_scalar = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
-            prototype_loss = det_loss_scalar.new_zeros(())
-            if len(prototype_memory) > 0 and (float(prototype_weight) > 0.0 or bool(audit_enabled)):
-                student_embeddings = student_feature_tap.take_pooled()
-                prototype_targets = retrieve_prototype_targets(
-                    prototype_memory,
-                    queries=student_embeddings,
-                    topk=int(prototype_topk),
-                    distance=str(prototype_distance),
+                raise RuntimeError(
+                    f"Unable to obtain differentiable detection loss; output type={type(loss_out)}"
                 )
-                prototype_loss = compute_prototype_alignment_loss(
-                    student_embeddings=student_embeddings,
-                    prototype_targets=prototype_targets,
-                    distance=str(prototype_distance),
-                )
-            else:
-                student_feature_tap.clear()
 
-            total_loss = det_loss_scalar + float(prototype_weight) * prototype_loss
-            total_loss.backward()
-            grad_norms = {idx: grad_l2(params) for idx, params in audit_module_params.items()} if capture_audit else {}
-
+            det_loss = loss.sum() if isinstance(loss, torch.Tensor) and loss.ndim > 0 else loss
+            det_loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(optim_params, grad_clip)
             optimizer.step()
 
-            if capture_audit and params_before is not None and audit_rows is not None:
-                delta_norms = {
-                    idx: delta_l2(audit_module_params[idx], params_before[idx]) for idx in audit_module_params
-                }
-                audit_rows.append(
-                    PrototypeAuditRow(
-                        update_step=int(audit_update_step),
-                        frame=int(audit_frame_idx),
-                        prototype_memory_size=int(audit_prototype_memory_size),
-                        det_loss=float(det_loss_scalar.detach().cpu()),
-                        prototype_loss=float(prototype_loss.detach().cpu()),
-                        total_loss=float(total_loss.detach().cpu()),
-                        grad_21=float(grad_norms.get(21, 0.0)),
-                        grad_22=float(grad_norms.get(22, 0.0)),
-                        delta_21=float(delta_norms.get(21, 0.0)),
-                        delta_22=float(delta_norms.get(22, 0.0)),
-                    )
-                )
-
-    return (
-        float(det_loss_scalar.detach().cpu()),
-        float(prototype_loss.detach().cpu()),
-        float(total_loss.detach().cpu()),
-    )
+    det_loss_value = float(det_loss.detach().cpu())
+    return det_loss_value, det_loss_value
 
 
 def try_load_font(size: int = 16) -> ImageFont.ImageFont:
@@ -1069,6 +1237,63 @@ def make_triptych(
     return out
 
 
+def save_selected_rank_example_image(
+    out_dir: Path,
+    frame_idx: int,
+    img_rgb: Image.Image,
+    raw_top1: Top1Det,
+    selected_candidate: Optional[Top1Det],
+    selected_score: float,
+    score_conf: float,
+    score_temporal: float,
+    score_memory: float,
+    score_mode: str,
+) -> Path:
+    diag_dir = out_dir / "selected_rank_gt1"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    out = img_rgb.copy()
+    draw = ImageDraw.Draw(out)
+    font = try_load_font(18)
+
+    x1, y1, x2, y2 = raw_top1.xyxy
+    draw.rectangle([x1, y1, x2, y2], outline=(255, 96, 96), width=4)
+    draw.text(
+        (x1 + 4, max(0, y1 - 24)),
+        f"top1 conf={raw_top1.conf:.3f} cls={raw_top1.cls_id}",
+        fill=(255, 96, 96),
+        font=font,
+    )
+    if selected_candidate is not None:
+        sx1, sy1, sx2, sy2 = selected_candidate.xyxy
+        draw.rectangle([sx1, sy1, sx2, sy2], outline=(80, 255, 120), width=4)
+        draw.text(
+            (sx1 + 4, min(out.size[1] - 20, sy2 + 4)),
+            f"rank={selected_candidate.rank} conf={selected_candidate.conf:.3f}",
+            fill=(80, 255, 120),
+            font=font,
+        )
+
+    draw.rectangle([0, 0, out.size[0], 30], fill=(0, 0, 0))
+    selected_rank_text = str(selected_candidate.rank) if selected_candidate is not None else "n/a"
+    draw.text((8, 6), f"selected rank>1 frame={frame_idx} rank={selected_rank_text}", fill=(255, 255, 255), font=font)
+
+    footer_top = max(0, out.size[1] - 46)
+    draw.rectangle([0, footer_top, out.size[0], out.size[1]], fill=(0, 0, 0))
+    footer = (
+        f"score={selected_score:.3f} conf={score_conf:.3f} "
+        f"temporal={score_temporal:.3f} memory={score_memory:.3f}"
+    )
+    draw.text((8, footer_top + 8), footer, fill=(255, 255, 255), font=font)
+    draw.text((8, footer_top + 26), f"mode={score_mode}", fill=(255, 255, 255), font=font)
+
+    score_tag = f"{selected_score:.3f}".replace(".", "p")
+    rank_tag = selected_rank_text
+    out_path = diag_dir / f"selected_rank_{int(frame_idx):06d}_r{rank_tag}_{score_tag}.jpg"
+    out.save(out_path, quality=95)
+    return out_path
+
+
 def make_progress_iter(total: int):
     if tqdm is None:
         return None
@@ -1082,13 +1307,13 @@ def rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
         return x.astype(np.float32).copy()
     out = np.empty_like(x, dtype=np.float32)
     running_sum = 0.0
-    q: Deque[float] = deque()
-    for i, v in enumerate(x.astype(np.float32)):
-        q.append(float(v))
-        running_sum += float(v)
-        if len(q) > window:
-            running_sum -= q.popleft()
-        out[i] = running_sum / float(len(q))
+    queue: Deque[float] = deque()
+    for i, value in enumerate(x.astype(np.float32)):
+        queue.append(float(value))
+        running_sum += float(value)
+        if len(queue) > window:
+            running_sum -= queue.popleft()
+        out[i] = running_sum / float(len(queue))
     return out
 
 
@@ -1102,7 +1327,8 @@ def save_plot_lines(
     out_path: Path,
 ) -> None:
     fig = plt.figure(figsize=(10, 4))
-    if x.size == 0 or not ys:
+    finite_series = [y for y in ys if y.size > 0 and np.any(np.isfinite(y))]
+    if x.size == 0 or not finite_series:
         plt.title(title)
         plt.text(0.5, 0.5, "no data", ha="center", va="center", transform=plt.gca().transAxes)
         plt.axis("off")
@@ -1136,8 +1362,56 @@ def save_plot_hist(values: np.ndarray, bins: int, title: str, xlabel: str, out_p
     plt.close(fig)
 
 
+def mean_or_nan(values: Sequence[float]) -> float:
+    finite = [float(v) for v in values if math.isfinite(float(v))]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+def rolling_mean_ignore_nan(x: np.ndarray, window: int) -> np.ndarray:
+    if x.size == 0:
+        return x.astype(np.float32)
+    if window <= 1:
+        return x.astype(np.float32).copy()
+    out = np.full_like(x, np.nan, dtype=np.float32)
+    running_sum = 0.0
+    valid_count = 0
+    queue: Deque[float] = deque()
+    for i, value in enumerate(x.astype(np.float32)):
+        value_f = float(value)
+        queue.append(value_f)
+        if math.isfinite(value_f):
+            running_sum += value_f
+            valid_count += 1
+        if len(queue) > window:
+            dropped = float(queue.popleft())
+            if math.isfinite(dropped):
+                running_sum -= dropped
+                valid_count -= 1
+        if valid_count > 0:
+            out[i] = running_sum / float(valid_count)
+    return out
+
+
 def format_metric(name: str, value: float, fmt: str = ".6f", prefix: str = "") -> str:
     return f"{prefix}{name}={value:{fmt}}" if math.isfinite(value) else f"{prefix}{name}=n/a"
+
+
+def resolve_update_schedule(
+    max_updates_per_frame: int,
+    update_every_frames: int,
+    updates_per_event: int,
+) -> Tuple[int, int]:
+    cadence = max(1, int(update_every_frames))
+    steps_per_event = max(1, int(updates_per_event))
+    legacy_steps = max(1, int(max_updates_per_frame))
+    if steps_per_event == 1 and legacy_steps != 1:
+        steps_per_event = legacy_steps
+    return cadence, steps_per_event
+
+
+def should_trigger_update_event(frame_idx: int, update_every_frames: int) -> bool:
+    cadence = max(1, int(update_every_frames))
+    return cadence <= 1 or ((int(frame_idx) + 1) % cadence == 0)
 
 
 def strip_runtime_hooks(model: nn.Module) -> None:
@@ -1220,154 +1494,187 @@ def save_final_student_weights(yolo_wrapper: YOLO, student_model: nn.Module, out
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Online teacher-student adaptation with buffered replay updates.")
-    p.add_argument("--weights", type=str, required=True, help="Path to YOLO weights (.pt)")
-    p.add_argument("--dataset", type=str, required=True, help="YOLO-root dataset path (expects images/test)")
-    p.add_argument("--output", type=str, default="online_adapt_out", help="Output directory")
-    p.add_argument("--device", type=str, default="cuda:0", help="cuda:0 or cpu")
-    p.add_argument("--imgsz", type=int, default=1024, help="Training image size (letterbox target)")
+    parser = argparse.ArgumentParser(
+        description="Online teacher-student ODAD with persist2 replay gating and top-k teacher candidate selection."
+    )
+    parser.add_argument("--weights", type=str, required=True, help="Path to YOLO weights (.pt)")
+    parser.add_argument("--dataset", type=str, required=True, help="YOLO-root dataset path (expects images/test)")
+    parser.add_argument("--output", type=str, default="online_adapt_out", help="Output directory")
+    parser.add_argument("--device", type=str, default="cuda:0", help="cuda:0 or cpu")
+    parser.add_argument("--imgsz", type=int, default=1024, help="Training image size (letterbox target)")
 
-    p.add_argument("--teacher-conf-thresh", type=float, default=0.70, help="Pseudo-label acceptance threshold")
-    p.add_argument("--infer-conf", type=float, default=0.001, help="Inference conf for teacher/student top1")
-    p.add_argument("--iou", type=float, default=0.45, help="IoU threshold for NMS")
-    p.add_argument("--max-frames", type=int, default=0, help="0 = all frames, else first N frames")
-    p.add_argument("--warmup", type=int, default=10, help="Warmup teacher forwards before adaptation")
+    parser.add_argument("--teacher-conf-thresh", type=float, default=0.80, help="Pseudo-label acceptance threshold")
+    parser.add_argument(
+        "--infer-conf",
+        "--infer_conf",
+        dest="infer_conf",
+        type=float,
+        default=0.001,
+        help="Inference conf for teacher/student top1",
+    )
+    parser.add_argument("--iou", type=float, default=0.45, help="IoU threshold for NMS")
+    parser.add_argument("--max-frames", type=int, default=0, help="0 = all frames, else first N frames")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup teacher forwards before adaptation")
 
-    p.add_argument("--lr", type=float, default=1e-4, help="Student optimizer learning rate")
-    p.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
-    p.add_argument("--weight-decay", type=float, default=5e-4, help="SGD weight decay")
-    p.add_argument("--ema-decay", type=float, default=0.999, help="Teacher EMA decay")
-    p.add_argument("--grad-clip", type=float, default=10.0, help="Gradient clipping max norm")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Student optimizer learning rate")
+    parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
+    parser.add_argument("--weight-decay", type=float, default=5e-4, help="SGD weight decay")
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="Teacher EMA decay")
+    parser.add_argument("--grad-clip", type=float, default=10.0, help="Gradient clipping max norm")
 
-    p.add_argument(
+    parser.add_argument(
         "--update-scope",
         type=str,
         default="head_only",
         choices=["head_only", "neck_head"],
         help="Student trainable region: head_only or neck_head",
     )
-    p.add_argument(
+    parser.add_argument(
         "--neck-start-idx",
         type=int,
         default=-1,
         help="Manual neck start index override; >=0 disables YAML auto-detection",
     )
 
-    p.add_argument("--buffer-size", type=int, default=32, help="Replay buffer capacity")
-    p.add_argument("--update-batch-size", type=int, default=4, help="Mini-batch size sampled from replay buffer")
-    p.add_argument(
+    parser.add_argument("--buffer-size", type=int, default=32, help="Replay buffer capacity")
+    parser.add_argument("--update-batch-size", type=int, default=4, help="Mini-batch size sampled from replay buffer")
+    parser.add_argument(
         "--min-buffer-before-update",
         type=int,
         default=4,
         help="Minimum number of buffered entries required before updates are allowed",
     )
-    p.add_argument(
+    parser.add_argument(
         "--buffer-sample-mode",
         type=str,
         default="recent",
         choices=["recent", "random"],
         help="Replay sampling strategy",
     )
-    p.add_argument("--max-updates-per-frame", type=int, default=1, help="Max optimizer updates per stream frame")
-    p.add_argument(
-        "--prototype-memory-size",
-        type=int,
-        default=128,
-        help="Maximum number of stored prototype-memory entries.",
-    )
-    p.add_argument(
-        "--prototype-layer",
-        type=int,
-        default=21,
-        help="Layer index used to build compact prototype embeddings.",
-    )
-    p.add_argument(
-        "--prototype-weight",
-        type=float,
-        default=1.0,
-        help="Weight for prototype-alignment loss.",
-    )
-    p.add_argument(
-        "--prototype-topk",
-        type=int,
-        default=4,
-        help="Number of nearest prototypes to retrieve for each replayed sample.",
-    )
-    p.add_argument(
-        "--prototype-distance",
-        type=str,
-        default="cosine",
-        choices=["cosine", "l2"],
-        help="Distance/similarity metric for prototype retrieval.",
-    )
-    p.add_argument(
-        "--prototype-audit",
-        action="store_true",
-        help="Enable compact prototype gradient/update audit.",
-    )
-    p.add_argument(
-        "--prototype-audit-max-updates",
-        type=int,
-        default=100,
-        help="Maximum number of optimizer update steps to include in the audit.",
-    )
-
-    p.add_argument("--min-area-frac", type=float, default=0.001, help="Min accepted bbox area fraction")
-    p.add_argument("--max-area-frac", type=float, default=0.80, help="Max accepted bbox area fraction")
-    p.add_argument("--border-margin-frac", type=float, default=0.02, help="Reject boxes too close to border")
-    p.add_argument("--temporal-iou-gate", type=float, default=0.30, help="Require teacher IoU(prev,current) >= gate")
-    p.add_argument(
-        "--persistence-frames",
+    parser.add_argument(
+        "--max-updates-per-frame",
         type=int,
         default=1,
-        help="Number of consecutive stable frames required before a pseudo-label is accepted. 1 preserves current behavior.",
+        help="Legacy compatibility knob for the old per-frame update path; values >1 act as updates-per-event when that flag stays at 1.",
     )
-    p.add_argument(
+    parser.add_argument(
+        "--update-every-frames",
+        type=int,
+        default=1,
+        help="Run optimizer updates only every N stream frames once the buffer is warm. 1 preserves current behavior.",
+    )
+    parser.add_argument(
+        "--updates-per-event",
+        type=int,
+        default=1,
+        help="Number of optimizer steps to run when an update event is triggered.",
+    )
+
+    parser.add_argument("--min-area-frac", type=float, default=0.001, help="Min accepted bbox area fraction")
+    parser.add_argument("--max-area-frac", type=float, default=0.80, help="Max accepted bbox area fraction")
+    parser.add_argument("--border-margin-frac", type=float, default=0.02, help="Reject boxes too close to border")
+    parser.add_argument("--temporal-iou-gate", type=float, default=0.50, help="Require teacher IoU(prev,current) >= gate")
+    parser.add_argument(
+        "--persistence-frames",
+        type=int,
+        default=2,
+        help="Number of consecutive stable frames required before a pseudo-label is accepted.",
+    )
+    parser.add_argument(
         "--persistence-iou",
         type=float,
         default=0.50,
         help="Minimum IoU between consecutive teacher boxes for persistence tracking.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--max-center-shift-frac",
         type=float,
         default=0.20,
-        help="Maximum normalized center shift allowed between consecutive teacher boxes for acceptance sanity checks.",
+        help="Maximum normalized center shift allowed between consecutive teacher boxes.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--max-area-ratio",
         type=float,
         default=2.5,
-        help="Maximum allowed ratio between consecutive box areas for acceptance sanity checks.",
+        help="Maximum allowed ratio between consecutive box areas.",
     )
-    p.add_argument(
+    parser.add_argument(
+        "--teacher-topk",
+        type=int,
+        default=1,
+        help="Number of teacher detections to consider per frame. 1 preserves current behavior.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-conf-floor",
+        type=float,
+        default=0.25,
+        help="Minimum confidence required for a teacher detection to enter the candidate set.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-score-mode",
+        type=str,
+        default="conf_temporal",
+        choices=["conf_only", "conf_temporal", "conf_temporal_memory"],
+        help="How to score top-k teacher candidates.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-conf-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the confidence term in candidate scoring.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-temporal-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the temporal consistency term in candidate scoring.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-memory-weight",
+        type=float,
+        default=0.5,
+        help="Weight for the object-memory similarity term in candidate scoring when enabled.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-min-score",
+        type=float,
+        default=0.0,
+        help="Optional minimum final candidate score required before selection.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-min-box-frac",
+        type=float,
+        default=0.01,
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
         "--save-checkpoints-every",
         type=int,
         default=0,
         help="If >0, save student checkpoints every N frames.",
     )
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed")
 
-    p.add_argument("--seed", type=int, default=0, help="RNG seed")
-
-    p.add_argument("--make-mp4", action="store_true", help="Write adaptation overlay MP4")
-    p.add_argument("--mp4-every", type=int, default=1, help="Use every k-th frame in MP4")
-    p.add_argument("--mp4-max", type=int, default=0, help="Max frames in MP4, 0 = no limit")
-    p.add_argument("--mp4-fps", type=int, default=12, help="MP4 fps")
-    p.add_argument("--mp4-scale", type=float, default=0.75, help="Downscale MP4 frames by this factor")
-    p.add_argument(
+    parser.add_argument("--make-mp4", action="store_true", help="Write adaptation overlay MP4")
+    parser.add_argument("--mp4-every", type=int, default=1, help="Use every k-th frame in MP4")
+    parser.add_argument("--mp4-max", type=int, default=0, help="Max frames in MP4, 0 = no limit")
+    parser.add_argument("--mp4-fps", type=int, default=12, help="MP4 fps")
+    parser.add_argument("--mp4-scale", type=float, default=0.75, help="Downscale MP4 frames by this factor")
+    parser.add_argument(
         "--save-final-weights",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Save the final adapted student weights at the end of the run.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--final-weights-name",
         type=str,
         default="student_final.pt",
         help="Filename for the saved final adapted student checkpoint.",
     )
 
-    return p.parse_args()
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -1386,6 +1693,8 @@ def main() -> None:
     images = list_test_images(dataset_root)
     if int(args.max_frames) > 0:
         images = images[: int(args.max_frames)]
+    if not images:
+        raise RuntimeError("No images available after applying --max-frames.")
 
     student_yolo = YOLO(args.weights)
     teacher_yolo = YOLO(args.weights)
@@ -1402,38 +1711,13 @@ def main() -> None:
     teacher_head_idx = find_head_idx(teacher_layers)
     if head_idx != teacher_head_idx:
         raise RuntimeError(f"Student/teacher head mismatch: student={head_idx}, teacher={teacher_head_idx}")
-    prototype_layer = int(args.prototype_layer)
-    if prototype_layer < 0 or prototype_layer >= len(layers):
-        raise RuntimeError(f"Invalid prototype_layer={prototype_layer}; expected range [0, {len(layers) - 1}].")
-    if prototype_layer >= len(teacher_layers):
-        raise RuntimeError(
-            f"Teacher prototype layer index {prototype_layer} is out of range for {len(teacher_layers)} layers."
-        )
+    teacher_topk = max(1, int(args.teacher_topk))
+    teacher_candidate_score_mode = str(args.teacher_candidate_score_mode)
+    teacher_candidate_memory_enabled = teacher_candidate_score_mode == "conf_temporal_memory"
+    teacher_candidate_memory_layer = max(0, head_idx - 1)
+    teacher_candidate_min_box_frac = max(0.0, float(args.teacher_candidate_min_box_frac))
 
     neck_start_idx = resolve_neck_start_idx(core_model, int(args.neck_start_idx))
-    head_only_indices = compute_unfrozen_indices(
-        update_scope="head_only",
-        neck_start_idx=neck_start_idx,
-        head_idx=head_idx,
-        n_layers=len(layers),
-    )
-    head_only_param_ids = param_id_set_for_indices(layers, head_only_indices)
-
-    neck_head_param_ids: Optional[set[int]] = None
-    if neck_start_idx is not None:
-        neck_head_indices = compute_unfrozen_indices(
-            update_scope="neck_head",
-            neck_start_idx=neck_start_idx,
-            head_idx=head_idx,
-            n_layers=len(layers),
-        )
-        neck_head_param_ids = param_id_set_for_indices(layers, neck_head_indices)
-        if head_only_param_ids == neck_head_param_ids:
-            raise RuntimeError(
-                "head_only and neck_head result in identical trainable parameter sets; "
-                "check neck_start_idx/model layout before running this ablation."
-            )
-
     unfrozen_indices = compute_unfrozen_indices(
         update_scope=str(args.update_scope),
         neck_start_idx=neck_start_idx,
@@ -1448,17 +1732,21 @@ def main() -> None:
                 f"update_scope=head_only expects Detect head, found {head_module_name} at idx={head_idx}."
             )
 
-    apply_freeze_policy(student_model, layers, unfrozen_indices)
+    apply_freeze_policy(
+        model=student_model,
+        layers=layers,
+        unfrozen_indices=unfrozen_indices,
+    )
     expected_trainable_param_ids = param_id_set_for_indices(layers, unfrozen_indices)
-    actual_trainable_param_ids = {id(p) for p in student_model.parameters() if p.requires_grad}
+    actual_trainable_param_ids = {id(param) for param in student_model.parameters() if param.requires_grad}
     if expected_trainable_param_ids != actual_trainable_param_ids:
         raise RuntimeError(
-            "Freeze policy mismatch: actual trainable parameters do not match expected unfrozen modules."
+            "Freeze policy mismatch: actual trainable parameters do not match expected trainable modules."
         )
 
-    optim_params = [p for p in student_model.parameters() if p.requires_grad]
+    optim_params = [param for param in student_model.parameters() if param.requires_grad]
     if not optim_params:
-        raise RuntimeError("No trainable parameters found after freeze policy")
+        raise RuntimeError("No trainable parameters found after freeze policy.")
 
     optimizer = torch.optim.SGD(
         optim_params,
@@ -1467,36 +1755,14 @@ def main() -> None:
         weight_decay=float(args.weight_decay),
     )
 
-    optimizer_param_ids = {id(p) for p in optim_params}
-    if optimizer_param_ids != actual_trainable_param_ids:
-        raise RuntimeError("Optimizer parameter set does not match trainable parameter set.")
-
-    module_param_summaries = build_module_param_summaries(layers, optimizer_param_ids)
-    if str(args.update_scope) == "head_only":
-        non_head_trainable = [m for m in module_param_summaries if m.idx != head_idx and m.trainable_params > 0]
-        if non_head_trainable:
-            bad = ", ".join(f"{m.idx}:{m.class_name}" for m in non_head_trainable)
-            raise RuntimeError(f"update_scope=head_only leaked trainable params outside Detect: {bad}")
-
+    trainable_params = int(sum(param.numel() for param in optim_params))
     unfrozen_modules = [f"{idx}:{layers[idx].__class__.__name__}" for idx in unfrozen_indices]
-    trainable_params = int(sum(p.numel() for p in optim_params))
-    optimizer_total_params = int(sum(p.numel() for p in optim_params))
-    optimizer_membership_lines = [
-        (
-            f"  [{m.idx}:{m.class_name}] "
-            f"trainable={m.trainable_params} optimizer={m.optimizer_params} total={m.total_params}"
-        )
-        for m in module_param_summaries
-    ]
-    prototype_audit_enabled = bool(args.prototype_audit)
-    prototype_audit_module_params: Optional[Dict[int, List[torch.nn.Parameter]]] = None
-    prototype_audit_module_lines: List[str] = []
-    if prototype_audit_enabled:
-        prototype_audit_module_params = collect_module_params(layers, PROTOTYPE_AUDIT_MODULE_INDICES)
-        prototype_audit_module_lines = [
-            f"  [{idx}:{layers[idx].__class__.__name__}] params={sum(p.numel() for p in params)}"
-            for idx, params in prototype_audit_module_params.items()
-        ]
+    persistence_frames = max(1, int(args.persistence_frames))
+    update_every_frames, updates_per_event = resolve_update_schedule(
+        max_updates_per_frame=int(args.max_updates_per_frame),
+        update_every_frames=int(args.update_every_frames),
+        updates_per_event=int(args.updates_per_event),
+    )
 
     summary_path = out_dir / "summary.txt"
     startup_lines = [
@@ -1504,36 +1770,35 @@ def main() -> None:
         f"  update_scope={args.update_scope}",
         f"  neck_start_idx={neck_start_idx if neck_start_idx is not None else 'n/a'}",
         f"  head_idx={head_idx}",
-        f"  prototype_layer={prototype_layer}",
-        f"  prototype_layer_module={layers[prototype_layer].__class__.__name__}",
-        f"  prototype_memory_capacity={max(1, int(args.prototype_memory_size))}",
-        f"  prototype_weight={float(args.prototype_weight):.6f}",
-        f"  prototype_topk={max(1, int(args.prototype_topk))}",
-        f"  prototype_distance={args.prototype_distance}",
-        f"  prototype_audit={int(prototype_audit_enabled)}",
-        f"  prototype_audit_max_updates={max(0, int(args.prototype_audit_max_updates))}",
-        f"  persistence_frames={max(1, int(args.persistence_frames))}",
+        f"  teacher_conf_thresh={float(args.teacher_conf_thresh):.3f}",
+        f"  temporal_iou_gate={float(args.temporal_iou_gate):.3f}",
+        f"  persistence_frames={persistence_frames}",
         f"  persistence_iou={float(args.persistence_iou):.3f}",
         f"  max_center_shift_frac={float(args.max_center_shift_frac):.3f}",
         f"  max_area_ratio={float(args.max_area_ratio):.3f}",
+        f"  teacher_topk={teacher_topk}",
+        f"  teacher_candidate_conf_floor={float(args.teacher_candidate_conf_floor):.3f}",
+        f"  teacher_candidate_score_mode={teacher_candidate_score_mode}",
+        f"  teacher_candidate_conf_weight={float(args.teacher_candidate_conf_weight):.3f}",
+        f"  teacher_candidate_temporal_weight={float(args.teacher_candidate_temporal_weight):.3f}",
+        f"  teacher_candidate_memory_weight={float(args.teacher_candidate_memory_weight):.3f}",
+        f"  teacher_candidate_min_score={float(args.teacher_candidate_min_score):.3f}",
+        f"  teacher_candidate_memory_enabled={int(teacher_candidate_memory_enabled)}",
+        f"  teacher_candidate_memory_layer={teacher_candidate_memory_layer}",
+        f"  teacher_candidate_min_box_frac={teacher_candidate_min_box_frac:.4f}",
+        f"  update_every_frames={update_every_frames}",
+        f"  updates_per_event={updates_per_event}",
+        f"  max_updates_per_frame_legacy={max(1, int(args.max_updates_per_frame))}",
         f"  save_checkpoints_every={max(0, int(args.save_checkpoints_every))}",
         f"  save_final_weights={int(bool(args.save_final_weights))}",
         f"  final_weights_name={args.final_weights_name}",
         f"  unfrozen_modules=[{', '.join(unfrozen_modules)}]",
         f"  trainable_params={trainable_params}",
-        f"  optimizer_total_params={optimizer_total_params}",
     ]
 
     print("Startup configuration:")
     for line in startup_lines[1:]:
         print(line)
-    print("optimizer_membership_by_module:")
-    for line in optimizer_membership_lines:
-        print(line)
-    if prototype_audit_module_lines:
-        print("prototype_audit_modules:")
-        for line in prototype_audit_module_lines:
-            print(line)
 
     summary_path.write_text(
         "\n".join(
@@ -1541,14 +1806,6 @@ def main() -> None:
                 "Online Adaptation Summary",
                 "",
                 *startup_lines,
-                "",
-                "optimizer_membership_by_module:",
-                *optimizer_membership_lines,
-                *(
-                    ["", "prototype_audit_modules:", *prototype_audit_module_lines]
-                    if prototype_audit_module_lines
-                    else []
-                ),
                 "",
                 "status=running",
             ]
@@ -1583,27 +1840,30 @@ def main() -> None:
 
     rng = random.Random(int(args.seed))
     buffer = ReplayBuffer(max_size=int(args.buffer_size), rng=rng)
-    prototype_memory: Deque[PrototypeEntry] = deque(maxlen=max(1, int(args.prototype_memory_size)))
-    student_feature_tap = LayerFeatureTap(layers[prototype_layer], layer_idx=prototype_layer)
-    teacher_feature_tap = LayerFeatureTap(teacher_layers[prototype_layer], layer_idx=prototype_layer)
+    object_memory_bank: Deque[ObjectMemoryEntry] = deque(maxlen=max(1, int(args.buffer_size)))
+    teacher_feature_tap = (
+        LayerFeatureTap(teacher_layers[teacher_candidate_memory_layer], layer_idx=teacher_candidate_memory_layer)
+        if teacher_candidate_memory_enabled
+        else None
+    )
 
     logs: List[FrameLog] = []
     mp4_frames: List[np.ndarray] = []
 
     accepted_frames = 0
     updated_frames = 0
+    number_of_update_events = 0
     total_optimizer_updates = 0
     update_losses: List[float] = []
-    prototype_losses: List[float] = []
     total_losses: List[float] = []
     buffer_sizes_on_updates: List[int] = []
-    prototype_audit_rows: List[PrototypeAuditRow] = []
     checkpoint_paths: List[Path] = []
+    selected_rank_example_paths: List[Path] = []
+    max_selected_rank_examples = 8
+    selected_rank_gt1_frames = 0
 
-    prev_teacher_box: Optional[Tuple[float, float, float, float]] = None
+    prev_selected_box: Optional[Tuple[float, float, float, float]] = None
     persistence_state: Optional[PersistenceState] = None
-    persistence_frames = max(1, int(args.persistence_frames))
-    # Keep the control path aligned with the historical baseline when persistence is off.
     motion_gate_enabled = persistence_frames > 1
 
     progress = make_progress_iter(len(images))
@@ -1615,18 +1875,67 @@ def main() -> None:
             w, h = img_rgb.size
 
         teacher_model.eval()
-        teacher_top1, teacher_lat_ms, teacher_proto = predict_top1_wrapper(
-            teacher_yolo,
+        raw_teacher_top1, teacher_candidates, teacher_lat_ms = predict_teacher_candidates_wrapper(
+            yolo_wrapper=teacher_yolo,
             source=str(img_path),
             device=str(args.device),
             conf=float(args.infer_conf),
             iou=float(args.iou),
-            feature_tap=teacher_feature_tap,
+            topk=teacher_topk,
+            conf_floor=float(args.teacher_candidate_conf_floor),
+            allow_top1_fallback=teacher_topk <= 1,
         )
+        candidate_embeddings = (
+            extract_candidate_embeddings(
+                teacher_model=teacher_model,
+                feature_tap=teacher_feature_tap,
+                img_rgb=img_rgb,
+                candidates=teacher_candidates,
+                imgsz=int(args.imgsz),
+                device=str(args.device),
+                min_box_frac=teacher_candidate_min_box_frac,
+            )
+            if teacher_candidate_memory_enabled and teacher_feature_tap is not None and teacher_candidates
+            else None
+        )
+        selection = select_teacher_candidate(
+            candidates=teacher_candidates,
+            prev_reference_box=prev_selected_box,
+            img_w=w,
+            img_h=h,
+            max_center_shift_frac=float(args.max_center_shift_frac),
+            max_area_ratio=float(args.max_area_ratio),
+            score_mode=teacher_candidate_score_mode,
+            conf_weight=float(args.teacher_candidate_conf_weight),
+            temporal_weight=float(args.teacher_candidate_temporal_weight),
+            memory_weight=float(args.teacher_candidate_memory_weight),
+            min_score=float(args.teacher_candidate_min_score),
+            memory_bank=list(object_memory_bank),
+            candidate_embeddings=candidate_embeddings,
+        )
+        teacher_top1 = selection.selected
+
+        if selection.selected_rank > 1:
+            selected_rank_gt1_frames += 1
+            if len(selected_rank_example_paths) < max_selected_rank_examples and raw_teacher_top1 is not None:
+                selected_rank_example_paths.append(
+                    save_selected_rank_example_image(
+                        out_dir=out_dir,
+                        frame_idx=idx,
+                        img_rgb=img_rgb,
+                        raw_top1=raw_teacher_top1,
+                        selected_candidate=teacher_top1,
+                        selected_score=float(selection.selected_score),
+                        score_conf=float(selection.score_conf),
+                        score_temporal=float(selection.score_temporal),
+                        score_memory=float(selection.score_memory),
+                        score_mode=teacher_candidate_score_mode,
+                    )
+                )
 
         passed_base_gate, temporal_iou = evaluate_base_gate(
             top1=teacher_top1,
-            prev_teacher_box=prev_teacher_box,
+            prev_teacher_box=prev_selected_box,
             img_w=w,
             img_h=h,
             conf_thresh=float(args.teacher_conf_thresh),
@@ -1637,7 +1946,7 @@ def main() -> None:
         )
         passed_motion_gate, center_shift_frac, area_ratio = evaluate_motion_gate(
             top1=teacher_top1,
-            prev_teacher_box=prev_teacher_box,
+            prev_teacher_box=prev_selected_box,
             img_w=w,
             img_h=h,
             max_center_shift_frac=float(args.max_center_shift_frac),
@@ -1651,23 +1960,12 @@ def main() -> None:
             persistence_frames=persistence_frames,
             persistence_iou=float(args.persistence_iou),
         )
-        gate_decision = GateDecision(
-            passed_base_gate=int(passed_base_gate),
-            passed_motion_gate=int(passed_motion_gate),
-            passed_persistence_gate=int(passed_persistence_gate),
-            accepted_final=int(bool(passed_base_gate and passed_motion_gate and passed_persistence_gate)),
-            persistence_count=int(persistence_count),
-            temporal_iou=float(temporal_iou),
-            persistence_iou=float(persistence_iou),
-            center_shift_frac=float(center_shift_frac),
-            area_ratio=float(area_ratio),
-        )
-        accepted = bool(gate_decision.accepted_final)
-
-        if accepted and teacher_top1 is not None:
+        accepted = bool(passed_base_gate and passed_motion_gate and passed_persistence_gate)
+        accepted_final = bool(accepted)
+        if accepted_final and teacher_top1 is not None:
             accepted_frames += 1
             buffer.add(
-                MemoryEntry(
+                ReplayEntry(
                     frame_idx=idx,
                     path=str(img_path),
                     width=w,
@@ -1676,32 +1974,48 @@ def main() -> None:
                     pseudo_cls=int(teacher_top1.cls_id),
                 )
             )
-            if teacher_proto is None:
-                raise RuntimeError(f"Accepted frame {idx} did not produce a prototype at layer {prototype_layer}.")
-            prototype_memory.append(
-                PrototypeEntry(
-                    frame_idx=idx,
-                    pseudo_cls=int(teacher_top1.cls_id),
-                    teacher_conf=float(teacher_top1.conf),
-                    vector=teacher_proto,
-                )
-            )
+            if teacher_candidate_memory_enabled:
+                selected_embedding = selection.selected_embedding
+                if selected_embedding is None and teacher_feature_tap is not None:
+                    selected_embedding = extract_object_embedding_for_box(
+                        teacher_model=teacher_model,
+                        feature_tap=teacher_feature_tap,
+                        img_rgb=img_rgb,
+                        box_xyxy=teacher_top1.xyxy,
+                        imgsz=int(args.imgsz),
+                        device=str(args.device),
+                        min_box_frac=teacher_candidate_min_box_frac,
+                    )
+                if selected_embedding is not None:
+                    object_memory_bank.append(
+                        ObjectMemoryEntry(
+                            cls_id=int(teacher_top1.cls_id),
+                            embedding=selected_embedding,
+                        )
+                    )
 
         updates_this_frame = 0
         batch_size_used = 0
         num_pseudo_boxes_used = 0
         last_det_loss = float("nan")
-        last_prototype_loss = float("nan")
         last_total_loss = float("nan")
         update_latency_ms = 0.0
+        buffer_warm = len(buffer) >= int(args.min_buffer_before_update)
+        update_event_triggered = int(buffer_warm and should_trigger_update_event(idx, update_every_frames))
 
-        if len(buffer) >= int(args.min_buffer_before_update):
-            for _ in range(max(1, int(args.max_updates_per_frame))):
+        if update_event_triggered:
+            number_of_update_events += 1
+            # Replay admission stays continuous; only optimizer steps are cadence-gated.
+            for _ in range(updates_per_event):
                 sampled = buffer.sample(batch_size=int(args.update_batch_size), mode=str(args.buffer_sample_mode))
                 if not sampled:
                     break
 
-                apply_freeze_policy(student_model, layers, unfrozen_indices)
+                apply_freeze_policy(
+                    model=student_model,
+                    layers=layers,
+                    unfrozen_indices=unfrozen_indices,
+                )
 
                 update_t0 = time.time()
                 batch = build_training_batch(
@@ -1710,25 +2024,13 @@ def main() -> None:
                     device=str(args.device),
                     rng=rng,
                 )
-                det_loss, prototype_loss, total_loss = run_detection_update(
+                det_loss, total_loss = run_detection_update(
                     student_model=student_model,
                     criterion=criterion,
                     optimizer=optimizer,
                     optim_params=optim_params,
                     batch=batch,
-                    prototype_memory=prototype_memory,
-                    student_feature_tap=student_feature_tap,
                     grad_clip=float(args.grad_clip),
-                    prototype_weight=float(args.prototype_weight),
-                    prototype_topk=int(args.prototype_topk),
-                    prototype_distance=str(args.prototype_distance),
-                    audit_enabled=prototype_audit_enabled,
-                    audit_rows=prototype_audit_rows,
-                    audit_module_params=prototype_audit_module_params,
-                    audit_max_updates=int(args.prototype_audit_max_updates),
-                    audit_update_step=total_optimizer_updates + 1,
-                    audit_frame_idx=idx,
-                    audit_prototype_memory_size=len(prototype_memory),
                 )
                 update_latency_ms += (time.time() - update_t0) * 1000.0
 
@@ -1742,10 +2044,8 @@ def main() -> None:
                 total_optimizer_updates += 1
 
                 last_det_loss = float(det_loss)
-                last_prototype_loss = float(prototype_loss)
                 last_total_loss = float(total_loss)
                 update_losses.append(float(det_loss))
-                prototype_losses.append(float(prototype_loss))
                 total_losses.append(float(total_loss))
                 batch_size_used = len(sampled)
                 num_pseudo_boxes_used += len(sampled)
@@ -1755,14 +2055,13 @@ def main() -> None:
             updated_frames += 1
 
         student_model.eval()
-        student_post_top1, student_post_lat_ms, _ = predict_top1_wrapper(
-            student_yolo,
+        student_post_top1, student_post_lat_ms = predict_top1_wrapper(
+            yolo_wrapper=student_yolo,
             source=str(img_path),
             device=str(args.device),
             conf=float(args.infer_conf),
             iou=float(args.iou),
         )
-        student_feature_tap.clear()
 
         frame_latency_ms = (time.time() - frame_t0) * 1000.0
 
@@ -1772,23 +2071,28 @@ def main() -> None:
                 path=str(img_path),
                 teacher_conf=float(teacher_top1.conf) if teacher_top1 is not None else 0.0,
                 accepted=int(accepted),
-                accepted_final=int(gate_decision.accepted_final),
-                passed_base_gate=int(gate_decision.passed_base_gate),
-                passed_motion_gate=int(gate_decision.passed_motion_gate),
-                passed_persistence_gate=int(gate_decision.passed_persistence_gate),
-                persistence_count=int(gate_decision.persistence_count),
-                temporal_iou=float(gate_decision.temporal_iou),
-                persistence_iou=float(gate_decision.persistence_iou),
-                center_shift_frac=float(gate_decision.center_shift_frac),
-                area_ratio=float(gate_decision.area_ratio),
+                accepted_final=int(accepted_final),
+                passed_base_gate=int(passed_base_gate),
+                passed_motion_gate=int(passed_motion_gate),
+                passed_persistence_gate=int(passed_persistence_gate),
+                teacher_num_candidates=int(selection.num_candidates),
+                teacher_selected_rank=int(selection.selected_rank),
+                teacher_selected_score=float(selection.selected_score),
+                teacher_selected_score_conf=float(selection.score_conf),
+                teacher_selected_score_temporal=float(selection.score_temporal),
+                teacher_selected_score_memory=float(selection.score_memory),
+                persistence_count=int(persistence_count),
+                temporal_iou=float(temporal_iou),
+                persistence_iou=float(persistence_iou),
+                center_shift_frac=float(center_shift_frac),
+                area_ratio=float(area_ratio),
                 num_pseudo_boxes_used=int(num_pseudo_boxes_used),
                 buffer_size=len(buffer),
-                prototype_memory_size=len(prototype_memory),
+                update_event_triggered=int(update_event_triggered),
                 update_applied=int(updates_this_frame > 0),
                 updates_this_frame=int(updates_this_frame),
                 batch_size_used=int(batch_size_used),
                 det_loss=float(last_det_loss),
-                prototype_loss=float(last_prototype_loss),
                 total_loss=float(last_total_loss),
                 teacher_latency_ms=float(teacher_lat_ms),
                 student_post_conf=float(student_post_top1.conf) if student_post_top1 is not None else 0.0,
@@ -1798,28 +2102,26 @@ def main() -> None:
             )
         )
 
-        prev_teacher_box = teacher_top1.xyxy if teacher_top1 is not None else None
+        prev_selected_box = teacher_top1.xyxy if teacher_top1 is not None else None
 
         if args.make_mp4:
-            use_mp4 = (idx % max(1, int(args.mp4_every)) == 0)
-            under_cap = (int(args.mp4_max) <= 0) or (len(mp4_frames) < int(args.mp4_max))
+            use_mp4 = idx % max(1, int(args.mp4_every)) == 0
+            under_cap = int(args.mp4_max) <= 0 or len(mp4_frames) < int(args.mp4_max)
             if use_mp4 and under_cap:
                 triptych = make_triptych(
                     img_rgb=img_rgb,
                     frame_idx=idx,
                     teacher_top1=teacher_top1,
                     student_top1=student_post_top1,
-                    accepted=bool(accepted),
+                    accepted=accepted_final,
                     update_applied=bool(updates_this_frame > 0),
                     buffer_size=len(buffer),
                     loss_value=float(last_total_loss if math.isfinite(last_total_loss) else last_det_loss),
                 )
-
                 if float(args.mp4_scale) != 1.0:
                     new_w = max(1, int(round(triptych.size[0] * float(args.mp4_scale))))
                     new_h = max(1, int(round(triptych.size[1] * float(args.mp4_scale))))
                     triptych = triptych.resize((new_w, new_h), Image.Resampling.BILINEAR)
-
                 mp4_frames.append(np.array(triptych))
 
         if progress is not None:
@@ -1829,7 +2131,7 @@ def main() -> None:
                     "accepted": accepted_frames,
                     "updates": total_optimizer_updates,
                     "buf": len(buffer),
-                    "pmem": len(prototype_memory),
+                    "rank2+": selected_rank_gt1_frames,
                     "last_bs": batch_size_used,
                 },
                 refresh=False,
@@ -1847,72 +2149,125 @@ def main() -> None:
 
     if progress is not None:
         progress.close()
-
-    student_feature_tap.clear()
-    student_feature_tap.close()
-    teacher_feature_tap.clear()
-    teacher_feature_tap.close()
+    if teacher_feature_tap is not None:
+        teacher_feature_tap.close()
 
     csv_path = out_dir / "adapt_log.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
-                "frame", "path", "teacher_top1_conf", "accepted", "accepted_final", "passed_base_gate",
-                "passed_motion_gate", "passed_persistence_gate", "persistence_count", "temporal_iou",
-                "persistence_iou", "center_shift_frac", "area_ratio", "num_pseudo_boxes_used", "buffer_size",
-                "prototype_memory_size", "update_applied", "updates_this_frame", "batch_size_used",
-                "det_loss", "prototype_loss", "total_loss", "teacher_latency_ms", "student_post_conf",
-                "student_post_latency_ms", "update_latency_ms", "frame_latency_ms",
+                "frame",
+                "path",
+                "teacher_conf",
+                "accepted",
+                "accepted_final",
+                "passed_base_gate",
+                "passed_motion_gate",
+                "passed_persistence_gate",
+                "teacher_num_candidates",
+                "teacher_selected_rank",
+                "teacher_selected_score",
+                "teacher_selected_score_conf",
+                "teacher_selected_score_temporal",
+                "teacher_selected_score_memory",
+                "persistence_count",
+                "temporal_iou",
+                "persistence_iou",
+                "center_shift_frac",
+                "area_ratio",
+                "num_pseudo_boxes_used",
+                "buffer_size",
+                "update_event_triggered",
+                "update_applied",
+                "updates_this_frame",
+                "batch_size_used",
+                "det_loss",
+                "total_loss",
+                "teacher_latency_ms",
+                "student_post_conf",
+                "student_post_latency_ms",
+                "update_latency_ms",
+                "frame_latency_ms",
             ]
         )
         for row in logs:
             writer.writerow(
                 [
-                    row.frame, row.path, f"{row.teacher_conf:.6f}", row.accepted, row.accepted_final,
-                    row.passed_base_gate, row.passed_motion_gate, row.passed_persistence_gate,
+                    row.frame,
+                    row.path,
+                    f"{row.teacher_conf:.6f}",
+                    row.accepted,
+                    row.accepted_final,
+                    row.passed_base_gate,
+                    row.passed_motion_gate,
+                    row.passed_persistence_gate,
+                    row.teacher_num_candidates,
+                    row.teacher_selected_rank,
+                    f"{row.teacher_selected_score:.6f}" if math.isfinite(row.teacher_selected_score) else "",
+                    (
+                        f"{row.teacher_selected_score_conf:.6f}"
+                        if math.isfinite(row.teacher_selected_score_conf)
+                        else ""
+                    ),
+                    (
+                        f"{row.teacher_selected_score_temporal:.6f}"
+                        if math.isfinite(row.teacher_selected_score_temporal)
+                        else ""
+                    ),
+                    (
+                        f"{row.teacher_selected_score_memory:.6f}"
+                        if math.isfinite(row.teacher_selected_score_memory)
+                        else ""
+                    ),
                     row.persistence_count,
                     f"{row.temporal_iou:.6f}" if math.isfinite(row.temporal_iou) else "",
                     f"{row.persistence_iou:.6f}" if math.isfinite(row.persistence_iou) else "",
                     f"{row.center_shift_frac:.6f}" if math.isfinite(row.center_shift_frac) else "",
                     f"{row.area_ratio:.6f}" if math.isfinite(row.area_ratio) else "",
                     row.num_pseudo_boxes_used,
-                    row.buffer_size, row.prototype_memory_size, row.update_applied, row.updates_this_frame,
+                    row.buffer_size,
+                    row.update_event_triggered,
+                    row.update_applied,
+                    row.updates_this_frame,
                     row.batch_size_used,
                     f"{row.det_loss:.6f}" if math.isfinite(row.det_loss) else "",
-                    f"{row.prototype_loss:.6f}" if math.isfinite(row.prototype_loss) else "",
                     f"{row.total_loss:.6f}" if math.isfinite(row.total_loss) else "",
-                    f"{row.teacher_latency_ms:.3f}", f"{row.student_post_conf:.6f}",
-                    f"{row.student_post_latency_ms:.3f}", f"{row.update_latency_ms:.3f}",
+                    f"{row.teacher_latency_ms:.3f}",
+                    f"{row.student_post_conf:.6f}",
+                    f"{row.student_post_latency_ms:.3f}",
+                    f"{row.update_latency_ms:.3f}",
                     f"{row.frame_latency_ms:.3f}",
                 ]
             )
 
-    frames = np.array([r.frame for r in logs], dtype=np.int32)
-    teacher_conf_vals = np.array([r.teacher_conf for r in logs], dtype=np.float32)
-    student_post_conf_vals = np.array([r.student_post_conf for r in logs], dtype=np.float32)
-    accepted_vals = np.array([r.accepted for r in logs], dtype=np.float32)
-    update_applied_vals = np.array([r.update_applied for r in logs], dtype=np.float32)
-    buffer_size_vals = np.array([r.buffer_size for r in logs], dtype=np.float32)
-    prototype_memory_size_vals = np.array([r.prototype_memory_size for r in logs], dtype=np.float32)
-    batch_size_used_vals = np.array([r.batch_size_used for r in logs], dtype=np.float32)
-    updates_this_frame_vals = np.array([r.updates_this_frame for r in logs], dtype=np.float32)
-    det_loss_vals = np.array([r.det_loss for r in logs], dtype=np.float32)
-    prototype_loss_vals = np.array([r.prototype_loss for r in logs], dtype=np.float32)
-    update_latency_vals = np.array([r.update_latency_ms for r in logs], dtype=np.float32)
+    frames = np.array([row.frame for row in logs], dtype=np.int32)
+    teacher_conf_vals = np.array([row.teacher_conf for row in logs], dtype=np.float32)
+    accepted_vals = np.array([row.accepted for row in logs], dtype=np.float32)
+    accepted_final_vals = np.array([row.accepted_final for row in logs], dtype=np.float32)
+    student_post_conf_vals = np.array([row.student_post_conf for row in logs], dtype=np.float32)
+    update_event_triggered_vals = np.array([row.update_event_triggered for row in logs], dtype=np.float32)
+    update_applied_vals = np.array([row.update_applied for row in logs], dtype=np.float32)
+    buffer_size_vals = np.array([row.buffer_size for row in logs], dtype=np.float32)
+    teacher_num_candidates_vals = np.array([row.teacher_num_candidates for row in logs], dtype=np.float32)
+    teacher_selected_rank_vals = np.array([row.teacher_selected_rank for row in logs], dtype=np.float32)
+    teacher_selected_score_vals = np.array([row.teacher_selected_score for row in logs], dtype=np.float32)
+    teacher_selected_score_memory_vals = np.array(
+        [row.teacher_selected_score_memory for row in logs],
+        dtype=np.float32,
+    )
+    batch_size_used_vals = np.array([row.batch_size_used for row in logs], dtype=np.float32)
+    updates_this_frame_vals = np.array([row.updates_this_frame for row in logs], dtype=np.float32)
+    det_loss_vals = np.array([row.det_loss for row in logs], dtype=np.float32)
+    update_latency_vals = np.array([row.update_latency_ms for row in logs], dtype=np.float32)
 
     conf_gap_vals = student_post_conf_vals - teacher_conf_vals
-    conf_gap_roll_window = max(5, min(100, max(1, len(logs) // 10)))
-    conf_gap_roll = rolling_mean(conf_gap_vals, conf_gap_roll_window)
-    teacher_conf_roll = rolling_mean(teacher_conf_vals, conf_gap_roll_window)
-    student_conf_roll = rolling_mean(student_post_conf_vals, conf_gap_roll_window)
-    accept_rate_roll = rolling_mean(accepted_vals, conf_gap_roll_window)
-    update_count_roll = rolling_mean(updates_this_frame_vals, conf_gap_roll_window)
+    roll_window = max(5, min(100, max(1, len(logs) // 10)))
 
     save_plot_lines(
         frames,
         [teacher_conf_vals, student_post_conf_vals],
-        ["teacher_top1_conf", "student_post_conf"],
+        ["teacher_conf", "student_post_conf"],
         "Teacher vs Student Confidence",
         "frame",
         "confidence",
@@ -1921,7 +2276,7 @@ def main() -> None:
     save_plot_lines(
         frames,
         [conf_gap_vals],
-        ["student_post_conf - teacher_top1_conf"],
+        ["student_post_conf - teacher_conf"],
         "Confidence Gap vs Frame",
         "frame",
         "conf_gap",
@@ -1929,8 +2284,8 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [conf_gap_roll],
-        [f"rolling_mean(window={conf_gap_roll_window})"],
+        [rolling_mean(conf_gap_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
         "Rolling Confidence Gap",
         "frame",
         "conf_gap",
@@ -1938,8 +2293,8 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [teacher_conf_roll],
-        [f"rolling_mean(window={conf_gap_roll_window})"],
+        [rolling_mean(teacher_conf_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
         "Rolling Teacher Confidence",
         "frame",
         "confidence",
@@ -1947,8 +2302,8 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [student_conf_roll],
-        [f"rolling_mean(window={conf_gap_roll_window})"],
+        [rolling_mean(student_post_conf_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
         "Rolling Student Confidence",
         "frame",
         "confidence",
@@ -1956,8 +2311,8 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [accept_rate_roll],
-        [f"rolling_mean(window={conf_gap_roll_window})"],
+        [rolling_mean(accepted_final_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
         "Rolling Acceptance Rate",
         "frame",
         "accept_rate",
@@ -1965,8 +2320,8 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [update_count_roll],
-        [f"rolling_mean(window={conf_gap_roll_window})"],
+        [rolling_mean(updates_this_frame_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
         "Rolling Update Count",
         "frame",
         "updates_per_frame",
@@ -1974,8 +2329,8 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [accepted_vals, update_applied_vals],
-        ["accepted", "update_applied"],
+        [accepted_vals, accepted_final_vals, update_event_triggered_vals, update_applied_vals],
+        ["accepted_base", "accepted_final", "update_event_triggered", "update_applied"],
         "Accept and Update Flags",
         "frame",
         "flag",
@@ -1983,12 +2338,30 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
-        [buffer_size_vals, prototype_memory_size_vals],
-        ["buffer_size", "prototype_memory_size"],
-        "Replay Buffer and Prototype Memory Size",
+        [buffer_size_vals],
+        ["buffer_size"],
+        "Replay Buffer Size",
         "frame",
-        "memory_size",
+        "entries",
         out_dir / "plot_buffer_size.png",
+    )
+    save_plot_lines(
+        frames,
+        [teacher_selected_rank_vals],
+        ["teacher_selected_rank"],
+        "Selected Teacher Rank",
+        "frame",
+        "rank",
+        out_dir / "plot_selected_rank.png",
+    )
+    save_plot_lines(
+        frames,
+        [rolling_mean_ignore_nan(teacher_selected_score_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
+        "Rolling Selected Candidate Score",
+        "frame",
+        "score",
+        out_dir / "plot_selected_score_roll.png",
     )
     save_plot_lines(
         frames,
@@ -2001,27 +2374,15 @@ def main() -> None:
     )
 
     update_mask = update_applied_vals > 0.5
-    det_loss_frames = frames[update_mask]
-    det_loss_updates = det_loss_vals[update_mask]
     save_plot_lines(
-        det_loss_frames,
-        [det_loss_updates],
+        frames[update_mask],
+        [det_loss_vals[update_mask]],
         ["det_loss"],
         "Detection Loss on Update Frames",
         "frame",
         "det_loss",
         out_dir / "plot_det_loss.png",
     )
-    save_plot_lines(
-        det_loss_frames,
-        [prototype_loss_vals[update_mask]],
-        ["prototype_loss"],
-        "Prototype Loss on Update Frames",
-        "frame",
-        "prototype_loss",
-        out_dir / "plot_prototype_loss.png",
-    )
-
     save_plot_hist(conf_gap_vals, 40, "Confidence Gap Histogram", "conf_gap", out_dir / "hist_conf_gap.png")
     save_plot_hist(
         update_latency_vals[update_mask],
@@ -2033,22 +2394,45 @@ def main() -> None:
 
     mean_teacher_conf = float(np.mean(teacher_conf_vals)) if logs else float("nan")
     mean_student_post_conf = float(np.mean(student_post_conf_vals)) if logs else float("nan")
-    mean_update_loss = float(np.mean(update_losses)) if update_losses else float("nan")
-    mean_prototype_loss_updates = float(np.mean(prototype_losses)) if prototype_losses else float("nan")
-    mean_total_loss_updates = float(np.mean(total_losses)) if total_losses else float("nan")
-    mean_buffer_size_updates = float(np.mean(buffer_sizes_on_updates)) if buffer_sizes_on_updates else float("nan")
+    mean_update_loss = mean_or_nan(update_losses)
+    mean_total_loss_updates = mean_or_nan(total_losses)
+    mean_buffer_size_updates = mean_or_nan(buffer_sizes_on_updates)
 
     mean_conf_gap = float(np.mean(conf_gap_vals)) if logs else float("nan")
     median_conf_gap = float(np.median(conf_gap_vals)) if logs else float("nan")
     fraction_frames_student_gt_teacher = float(np.mean(conf_gap_vals > 0.0)) if logs else float("nan")
     fraction_frames_student_lt_teacher = float(np.mean(conf_gap_vals < 0.0)) if logs else float("nan")
-    mean_accept_rate_roll = float(np.mean(accept_rate_roll)) if logs else float("nan")
+    mean_accept_rate_roll = float(np.mean(rolling_mean(accepted_final_vals, roll_window))) if logs else float("nan")
     mean_batch_size_used_on_updates = (
         float(np.mean(batch_size_used_vals[update_mask])) if np.any(update_mask) else float("nan")
     )
-
-    if prototype_audit_enabled:
-        write_prototype_audit_files(out_dir, prototype_audit_rows)
+    mean_updates_per_event = (
+        float(np.mean(updates_this_frame_vals[update_event_triggered_vals > 0.5]))
+        if np.any(update_event_triggered_vals > 0.5)
+        else float("nan")
+    )
+    selected_mask = teacher_selected_rank_vals > 0.5
+    mean_selected_rank = (
+        float(np.mean(teacher_selected_rank_vals[selected_mask]))
+        if np.any(selected_mask)
+        else float("nan")
+    )
+    fraction_selected_rank_gt1 = (
+        float(np.mean(teacher_selected_rank_vals[selected_mask] > 1.0))
+        if np.any(selected_mask)
+        else float("nan")
+    )
+    mean_selected_score = (
+        mean_or_nan(teacher_selected_score_vals[selected_mask].tolist())
+        if np.any(selected_mask)
+        else float("nan")
+    )
+    mean_selected_score_memory = (
+        mean_or_nan(teacher_selected_score_memory_vals[selected_mask].tolist())
+        if np.any(selected_mask)
+        else float("nan")
+    )
+    mean_num_candidates = float(np.mean(teacher_num_candidates_vals)) if logs else float("nan")
 
     final_weights_path: Optional[Path] = None
     if bool(args.save_final_weights):
@@ -2070,25 +2454,16 @@ def main() -> None:
         "",
         *startup_lines,
         "",
-        "optimizer_membership_by_module:",
-        *optimizer_membership_lines,
-        *(
-            ["", "prototype_audit_modules:", *prototype_audit_module_lines]
-            if prototype_audit_module_lines
-            else []
-        ),
-        "",
         f"weights={args.weights}",
         f"dataset={dataset_root}",
         f"total_frames={len(logs)}",
         f"accepted_frames={accepted_frames}",
-        f"prototype_memory_size={len(prototype_memory)}",
         f"updates_applied={updated_frames}",
+        f"number_of_update_events={number_of_update_events}",
         f"optimizer_update_steps={total_optimizer_updates}",
         format_metric("mean_teacher_conf", mean_teacher_conf),
         format_metric("mean_student_post_conf", mean_student_post_conf),
         format_metric("mean_detection_loss_updates", mean_update_loss),
-        format_metric("mean_prototype_loss_updates", mean_prototype_loss_updates),
         format_metric("mean_total_loss_updates", mean_total_loss_updates),
         format_metric("mean_buffer_size_during_updates", mean_buffer_size_updates, ".3f"),
         "",
@@ -2101,23 +2476,53 @@ def main() -> None:
         format_metric("mean_batch_size_used_on_updates", mean_batch_size_used_on_updates, prefix="  "),
         "",
         "reliability_gates:",
+        f"  teacher_conf_thresh={float(args.teacher_conf_thresh):.3f}",
+        f"  temporal_iou_gate={float(args.temporal_iou_gate):.3f}",
         f"  persistence_frames={persistence_frames}",
         f"  persistence_iou={float(args.persistence_iou):.3f}",
         f"  max_center_shift_frac={float(args.max_center_shift_frac):.3f}",
         f"  max_area_ratio={float(args.max_area_ratio):.3f}",
         f"  number_of_checkpoints_saved={len(checkpoint_paths)}",
         "",
+        "teacher_candidate_selection:",
+        f"  teacher_topk={teacher_topk}",
+        f"  teacher_candidate_conf_floor={float(args.teacher_candidate_conf_floor):.3f}",
+        f"  teacher_candidate_score_mode={teacher_candidate_score_mode}",
+        f"  teacher_candidate_conf_weight={float(args.teacher_candidate_conf_weight):.3f}",
+        f"  teacher_candidate_temporal_weight={float(args.teacher_candidate_temporal_weight):.3f}",
+        f"  teacher_candidate_memory_weight={float(args.teacher_candidate_memory_weight):.3f}",
+        f"  teacher_candidate_min_score={float(args.teacher_candidate_min_score):.3f}",
+        format_metric("mean_num_candidates", mean_num_candidates, prefix="  "),
+        format_metric("mean_selected_rank", mean_selected_rank, prefix="  "),
+        format_metric("fraction_selected_rank_gt1", fraction_selected_rank_gt1, prefix="  "),
+        format_metric("mean_selected_score", mean_selected_score, prefix="  "),
+        *(
+            [format_metric("mean_selected_score_memory", mean_selected_score_memory, prefix="  ")]
+            if teacher_candidate_memory_enabled
+            else []
+        ),
+        f"  selected_rank_gt1_frames={selected_rank_gt1_frames}",
+        f"  object_memory_size_final={len(object_memory_bank)}",
+        f"  object_memory_feature_layer={teacher_candidate_memory_layer}",
+        f"  object_memory_min_box_frac={teacher_candidate_min_box_frac:.4f}",
+        *(
+            [f"  selected_rank_gt1_examples_saved={len(selected_rank_example_paths)}"]
+            if selected_rank_example_paths
+            else []
+        ),
+        "",
+        "update_schedule:",
+        f"  update_every_frames={update_every_frames}",
+        f"  updates_per_event={updates_per_event}",
+        format_metric("mean_updates_per_event", mean_updates_per_event, prefix="  "),
+        f"  number_of_update_events={number_of_update_events}",
+        "",
         "buffer_config:",
         f"  buffer_size={int(args.buffer_size)}",
         f"  update_batch_size={int(args.update_batch_size)}",
         f"  min_buffer_before_update={int(args.min_buffer_before_update)}",
         f"  buffer_sample_mode={args.buffer_sample_mode}",
-        f"  max_updates_per_frame={int(args.max_updates_per_frame)}",
-        f"  prototype_memory_capacity={max(1, int(args.prototype_memory_size))}",
-        f"  prototype_layer={prototype_layer}",
-        f"  prototype_weight={float(args.prototype_weight):.6f}",
-        f"  prototype_topk={max(1, int(args.prototype_topk))}",
-        f"  prototype_distance={args.prototype_distance}",
+        f"  max_updates_per_frame_legacy={max(1, int(args.max_updates_per_frame))}",
         "",
         "outputs:",
         f"  csv={csv_path.name}",
@@ -2132,11 +2537,17 @@ def main() -> None:
         "  plot_update_count_roll.png",
         "  plot_accept_update_flags.png",
         "  plot_buffer_size.png",
+        "  plot_selected_rank.png",
+        "  plot_selected_score_roll.png",
         "  plot_batch_size_used.png",
         "  plot_det_loss.png",
-        "  plot_prototype_loss.png",
         "  hist_conf_gap.png",
         "  hist_update_latency.png",
+        *(
+            [f"  selected_rank_gt1_dir=selected_rank_gt1 ({len(selected_rank_example_paths)} saved)"]
+            if selected_rank_example_paths
+            else []
+        ),
     ]
     if checkpoint_paths:
         summary_lines.extend(
@@ -2144,13 +2555,6 @@ def main() -> None:
                 "",
                 "intermediate_checkpoints:",
                 *[f"  {path.relative_to(out_dir)}" for path in checkpoint_paths],
-            ]
-        )
-    if prototype_audit_enabled:
-        summary_lines.extend(
-            [
-                "  prototype_audit.csv",
-                "  prototype_audit_summary.txt",
             ]
         )
     if args.make_mp4:
@@ -2173,10 +2577,11 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# PYTHONPATH=. python odad/online_adapt.py \
+
+# PYTHONPATH=. /home/hm25936/miniforge3/envs/gpu_test/bin/python3 odad/online_adapt.py \
 #   --weights /home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt \
 #   --dataset /home/hm25936/datasets_for_yolo/lab_images_6000 \
-#   --output /home/hm25936/mae/odad/online_adapt_buffered_final_model \
+#   --output /home/hm25936/mae/odad/online_adapt_topk2_full \
 #   --device cuda:0 \
 #   --imgsz 1024 \
 #   --teacher-conf-thresh 0.80 \
@@ -2190,7 +2595,20 @@ if __name__ == "__main__":
 #   --min-buffer-before-update 4 \
 #   --buffer-sample-mode recent \
 #   --max-updates-per-frame 1 \
+#   --update-every-frames 1 \
+#   --updates-per-event 1 \
 #   --temporal-iou-gate 0.50 \
+#   --persistence-frames 2 \
+#   --persistence-iou 0.50 \
+#   --max-center-shift-frac 0.20 \
+#   --max-area-ratio 2.5 \
+#   --teacher-topk 2 \
+#   --teacher-candidate-conf-floor 0.25 \
+#   --teacher-candidate-score-mode conf_temporal \
+#   --teacher-candidate-conf-weight 1.0 \
+#   --teacher-candidate-temporal-weight 1.0 \
+#   --teacher-candidate-min-score 0.0 \
+#   --save-checkpoints-every 500 \
 #   --save-final-weights \
 #   --final-weights-name student_final.pt \
 #   --make-mp4 \
