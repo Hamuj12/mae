@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Online teacher-student ODAD with persist2 replay gating and top-k teacher candidate selection."""
+"""Online teacher-student ODAD with persist2 replay gating and memory-aware top-k teacher selection."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import matplotlib
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 matplotlib.use("Agg")
@@ -89,12 +90,6 @@ class ReplayEntry:
 
 
 @dataclass
-class ObjectMemoryEntry:
-    cls_id: int
-    embedding: torch.Tensor
-
-
-@dataclass
 class FrameLog:
     frame: int
     path: str
@@ -110,6 +105,7 @@ class FrameLog:
     teacher_selected_score_conf: float
     teacher_selected_score_temporal: float
     teacher_selected_score_memory: float
+    teacher_candidate_memory_size_active: int
     persistence_count: int
     temporal_iou: float
     persistence_iou: float
@@ -138,6 +134,15 @@ class PersistenceState:
 
 
 @dataclass
+class CandidateMemoryState:
+    frame_idx: int
+    cls_id: int
+    box_xyxy: Tuple[float, float, float, float]
+    conf: float
+    state_vector: np.ndarray
+
+
+@dataclass
 class CandidateSelectionResult:
     selected: Optional[Top1Det]
     num_candidates: int
@@ -146,7 +151,8 @@ class CandidateSelectionResult:
     score_conf: float
     score_temporal: float
     score_memory: float
-    selected_embedding: Optional[torch.Tensor] = None
+    memory_size_active: int
+    selected_state_vector: Optional[np.ndarray]
 
 
 class ReplayBuffer:
@@ -171,26 +177,6 @@ class ReplayBuffer:
             idxs = self._rng.sample(range(len(entries)), k=k)
             return [entries[i] for i in idxs]
         raise RuntimeError(f"Unsupported buffer sample mode: {mode}")
-
-
-class LayerFeatureTap:
-    def __init__(self, module: nn.Module, layer_idx: int) -> None:
-        self.layer_idx = int(layer_idx)
-        self._latest: Any = None
-        self._handle = module.register_forward_hook(lambda _module, _inputs, output: setattr(self, "_latest", output))
-
-    def clear(self) -> None:
-        self._latest = None
-
-    def take_feature_map(self) -> torch.Tensor:
-        output = self._latest
-        self._latest = None
-        if output is None:
-            raise RuntimeError(f"Feature tap layer {self.layer_idx} produced no captured output.")
-        return extract_feature_map(output)
-
-    def close(self) -> None:
-        self._handle.remove()
 
 
 def list_test_images(dataset_root: Path) -> List[Path]:
@@ -227,30 +213,6 @@ def area_fraction(box: Tuple[float, float, float, float], width: int, height: in
     box_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
     img_area = max(1.0, float(width * height))
     return float(box_area / img_area)
-
-
-def box_width_height(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
-    x1, y1, x2, y2 = box
-    return max(0.0, x2 - x1), max(0.0, y2 - y1)
-
-
-def box_meets_embedding_size(
-    box: Tuple[float, float, float, float],
-    width: int,
-    height: int,
-    min_box_frac: float,
-) -> bool:
-    threshold = max(0.0, float(min_box_frac))
-    if threshold <= 0.0:
-        return True
-    box_w, box_h = box_width_height(box)
-    width_frac = box_w / max(1.0, float(width))
-    height_frac = box_h / max(1.0, float(height))
-    return bool(
-        width_frac >= threshold
-        or height_frac >= threshold
-        or area_fraction(box, width=width, height=height) >= (threshold * threshold)
-    )
 
 
 def near_border(box: Tuple[float, float, float, float], width: int, height: int, margin_frac: float) -> bool:
@@ -487,31 +449,6 @@ def pil_to_model_tensor(img_rgb: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).unsqueeze(0)
 
 
-def extract_feature_map(output: Any) -> torch.Tensor:
-    tensors: List[torch.Tensor] = []
-
-    def visit(value: Any) -> None:
-        if isinstance(value, torch.Tensor) and value.ndim == 4:
-            tensors.append(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                visit(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                visit(item)
-
-    visit(output)
-    if not tensors:
-        raise RuntimeError(f"Unable to find a 4D object-memory feature map in output type {type(output)}.")
-
-    batch_size = int(tensors[0].shape[0])
-    for tensor in tensors:
-        if int(tensor.shape[0]) != batch_size:
-            raise RuntimeError("Object-memory feature tensors had inconsistent batch dimensions.")
-    tensors.sort(key=lambda tensor: int(tensor.shape[-2]) * int(tensor.shape[-1]), reverse=True)
-    return tensors[0]
-
-
 def teacher_candidates_from_results(
     results: Any,
     topk: int,
@@ -561,6 +498,45 @@ def top1_from_results(results: Any) -> Optional[Top1Det]:
         allow_top1_fallback=False,
     )
     return raw_top1
+
+
+def extract_feature_tensor(output: Any) -> Optional[torch.Tensor]:
+    tensors: List[torch.Tensor] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, torch.Tensor) and node.ndim == 4:
+            tensors.append(node)
+            return
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+            return
+        if isinstance(node, dict):
+            for item in node.values():
+                visit(item)
+
+    visit(output)
+    if not tensors:
+        return None
+    return max(tensors, key=lambda tensor: int(tensor.shape[-2]) * int(tensor.shape[-1]))
+
+
+class LayerFeatureTap:
+    def __init__(self, module: nn.Module) -> None:
+        self._last_feature: Optional[torch.Tensor] = None
+        self._handle = module.register_forward_hook(self._hook)
+
+    def _hook(self, _module: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+        self._last_feature = extract_feature_tensor(output)
+
+    def clear(self) -> None:
+        self._last_feature = None
+
+    def get(self) -> Optional[torch.Tensor]:
+        return self._last_feature
+
+    def close(self) -> None:
+        self._handle.remove()
 
 
 def predict_results_with_latency(
@@ -624,7 +600,10 @@ def predict_teacher_candidates_wrapper(
     topk: int,
     conf_floor: float,
     allow_top1_fallback: bool,
-) -> Tuple[Optional[Top1Det], List[Top1Det], float]:
+    feature_tap: Optional[LayerFeatureTap] = None,
+) -> Tuple[Optional[Top1Det], List[Top1Det], Optional[torch.Tensor], float]:
+    if feature_tap is not None:
+        feature_tap.clear()
     results, latency_ms = predict_results_with_latency(
         yolo_wrapper=yolo_wrapper,
         source=source,
@@ -638,151 +617,7 @@ def predict_teacher_candidates_wrapper(
         conf_floor=conf_floor,
         allow_top1_fallback=allow_top1_fallback,
     )
-    return raw_top1, candidates, latency_ms
-
-
-def normalize_embedding_vector(embedding: torch.Tensor) -> torch.Tensor:
-    vector = embedding.detach().to(device="cpu", dtype=torch.float32).view(-1).contiguous()
-    if vector.numel() == 0:
-        raise RuntimeError("Object-memory embeddings must be non-empty.")
-    return torch.nn.functional.normalize(vector, dim=0, eps=1e-12)
-
-
-def extract_object_roi_embedding(
-    feature_map: torch.Tensor,
-    box_xyxy: Tuple[float, float, float, float],
-    img_w: int,
-    img_h: int,
-    imgsz: int,
-    gain: float,
-    pad_left: int,
-    pad_top: int,
-    min_box_frac: float,
-) -> Optional[torch.Tensor]:
-    if feature_map.ndim != 4 or int(feature_map.shape[0]) != 1:
-        raise RuntimeError(f"Expected a single-image 4D feature map, got shape={tuple(feature_map.shape)}")
-    if not box_meets_embedding_size(box_xyxy, width=img_w, height=img_h, min_box_frac=min_box_frac):
-        return None
-
-    x1_l, y1_l, x2_l, y2_l = (
-        box_xyxy[0] * gain + pad_left,
-        box_xyxy[1] * gain + pad_top,
-        box_xyxy[2] * gain + pad_left,
-        box_xyxy[3] * gain + pad_top,
-    )
-    feat_h = int(feature_map.shape[-2])
-    feat_w = int(feature_map.shape[-1])
-    scale_x = feat_w / max(1.0, float(imgsz))
-    scale_y = feat_h / max(1.0, float(imgsz))
-
-    x1_idx = max(0, min(feat_w - 1, int(math.floor(x1_l * scale_x))))
-    y1_idx = max(0, min(feat_h - 1, int(math.floor(y1_l * scale_y))))
-    x2_idx = max(x1_idx + 1, min(feat_w, int(math.ceil(x2_l * scale_x))))
-    y2_idx = max(y1_idx + 1, min(feat_h, int(math.ceil(y2_l * scale_y))))
-    roi = feature_map[:, :, y1_idx:y2_idx, x1_idx:x2_idx]
-    if roi.numel() == 0:
-        return None
-    pooled = torch.nn.functional.adaptive_avg_pool2d(roi, output_size=(1, 1)).flatten(1)
-    return pooled[0]
-
-
-def extract_object_embedding_for_box(
-    teacher_model: nn.Module,
-    feature_tap: LayerFeatureTap,
-    img_rgb: Image.Image,
-    box_xyxy: Tuple[float, float, float, float],
-    imgsz: int,
-    device: str,
-    min_box_frac: float,
-) -> Optional[torch.Tensor]:
-    img_w, img_h = img_rgb.size
-    if not box_meets_embedding_size(box_xyxy, width=img_w, height=img_h, min_box_frac=min_box_frac):
-        return None
-
-    letterboxed, gain, pad_left, pad_top = letterbox_image(img_rgb, size=imgsz)
-    feature_tap.clear()
-    input_tensor = pil_to_model_tensor(letterboxed).to(device)
-    with torch.inference_mode():
-        _ = teacher_model(input_tensor)
-    feature_map = feature_tap.take_feature_map()
-    embedding = extract_object_roi_embedding(
-        feature_map=feature_map,
-        box_xyxy=box_xyxy,
-        img_w=img_w,
-        img_h=img_h,
-        imgsz=imgsz,
-        gain=gain,
-        pad_left=pad_left,
-        pad_top=pad_top,
-        min_box_frac=min_box_frac,
-    )
-    if embedding is None:
-        return None
-    return embedding.detach().to(device="cpu", dtype=torch.float32).view(-1).contiguous()
-
-
-def extract_candidate_embeddings(
-    teacher_model: nn.Module,
-    feature_tap: LayerFeatureTap,
-    img_rgb: Image.Image,
-    candidates: Sequence[Top1Det],
-    imgsz: int,
-    device: str,
-    min_box_frac: float,
-) -> Dict[int, torch.Tensor]:
-    if not candidates:
-        return {}
-
-    img_w, img_h = img_rgb.size
-    letterboxed, gain, pad_left, pad_top = letterbox_image(img_rgb, size=imgsz)
-    feature_tap.clear()
-    input_tensor = pil_to_model_tensor(letterboxed).to(device)
-    with torch.inference_mode():
-        _ = teacher_model(input_tensor)
-    feature_map = feature_tap.take_feature_map()
-
-    embeddings: Dict[int, torch.Tensor] = {}
-    for candidate in candidates:
-        embedding = extract_object_roi_embedding(
-            feature_map=feature_map,
-            box_xyxy=candidate.xyxy,
-            img_w=img_w,
-            img_h=img_h,
-            imgsz=imgsz,
-            gain=gain,
-            pad_left=pad_left,
-            pad_top=pad_top,
-            min_box_frac=min_box_frac,
-        )
-        if embedding is not None:
-            embeddings[int(candidate.rank)] = embedding.detach().to(device="cpu", dtype=torch.float32).view(-1)
-    return embeddings
-
-
-def compute_memory_similarity_score(
-    query_embedding: Optional[torch.Tensor],
-    memory_bank: Sequence[ObjectMemoryEntry],
-    cls_id: int,
-) -> float:
-    if query_embedding is None or not memory_bank:
-        return float("nan")
-
-    same_class_embeddings = [
-        normalize_embedding_vector(entry.embedding)
-        for entry in memory_bank
-        if int(entry.cls_id) == int(cls_id)
-    ]
-    if not same_class_embeddings:
-        return float("nan")
-
-    query = normalize_embedding_vector(query_embedding).view(1, -1)
-    memory = torch.stack(same_class_embeddings, dim=0).to(dtype=query.dtype)
-    if memory.ndim != 2 or memory.shape[1] != query.shape[1]:
-        raise RuntimeError(
-            f"Object-memory embedding mismatch: query_dim={query.shape[1]} memory_dim={memory.shape[1] if memory.ndim == 2 else 'n/a'}"
-        )
-    scores = query @ memory.T
-    return float(torch.max(scores).item())
+    return raw_top1, candidates, feature_tap.get() if feature_tap is not None else None, latency_ms
 
 
 def compute_temporal_consistency_score(
@@ -816,6 +651,169 @@ def compute_temporal_consistency_score(
     return temporal_score, float(iou), float(center_shift), float(area_ratio)
 
 
+def box_xyxy_to_norm_state(
+    box_xyxy: Tuple[float, float, float, float],
+    img_w: int,
+    img_h: int,
+) -> np.ndarray:
+    x1, y1, x2, y2 = box_xyxy
+    center_x = ((x1 + x2) * 0.5) / max(1.0, float(img_w))
+    center_y = ((y1 + y2) * 0.5) / max(1.0, float(img_h))
+    box_w = max(0.0, x2 - x1) / max(1.0, float(img_w))
+    box_h = max(0.0, y2 - y1) / max(1.0, float(img_h))
+    return np.array(
+        [
+            min(1.0, max(0.0, center_x)),
+            min(1.0, max(0.0, center_y)),
+            min(1.0, max(0.0, box_w)),
+            min(1.0, max(0.0, box_h)),
+        ],
+        dtype=np.float32,
+    )
+
+
+def normalize_state_vector(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-12:
+        return vec.astype(np.float32, copy=True)
+    return (vec / norm).astype(np.float32, copy=False)
+
+
+def project_box_to_feature_map(
+    box_xyxy: Tuple[float, float, float, float],
+    img_w: int,
+    img_h: int,
+    feat_w: int,
+    feat_h: int,
+) -> Tuple[int, int, int, int]:
+    gain = min(float(feat_w) / max(1.0, float(img_w)), float(feat_h) / max(1.0, float(img_h)))
+    pad_left = 0.5 * max(0.0, float(feat_w) - float(img_w) * gain)
+    pad_top = 0.5 * max(0.0, float(feat_h) - float(img_h) * gain)
+
+    x1, y1, x2, y2 = box_xyxy
+    fx1 = x1 * gain + pad_left
+    fy1 = y1 * gain + pad_top
+    fx2 = x2 * gain + pad_left
+    fy2 = y2 * gain + pad_top
+
+    x1i = max(0, min(feat_w - 1, int(math.floor(fx1))))
+    y1i = max(0, min(feat_h - 1, int(math.floor(fy1))))
+    x2i = max(x1i + 1, min(feat_w, int(math.ceil(fx2))))
+    y2i = max(y1i + 1, min(feat_h, int(math.ceil(fy2))))
+    return x1i, y1i, x2i, y2i
+
+
+def extract_candidate_feature_embedding(
+    feature_map: Optional[torch.Tensor],
+    box_xyxy: Tuple[float, float, float, float],
+    img_w: int,
+    img_h: int,
+    min_box_frac: float,
+    output_dim: int = 8,
+) -> np.ndarray:
+    if feature_map is None or feature_map.ndim != 4 or feature_map.shape[0] <= 0:
+        return np.zeros(output_dim, dtype=np.float32)
+    if area_fraction(box_xyxy, width=img_w, height=img_h) < float(min_box_frac):
+        return np.zeros(output_dim, dtype=np.float32)
+
+    fmap = feature_map[0]
+    feat_h = int(fmap.shape[-2])
+    feat_w = int(fmap.shape[-1])
+    if feat_h <= 0 or feat_w <= 0:
+        return np.zeros(output_dim, dtype=np.float32)
+
+    x1i, y1i, x2i, y2i = project_box_to_feature_map(
+        box_xyxy=box_xyxy,
+        img_w=img_w,
+        img_h=img_h,
+        feat_w=feat_w,
+        feat_h=feat_h,
+    )
+    roi = fmap[:, y1i:y2i, x1i:x2i]
+    if roi.numel() == 0:
+        return np.zeros(output_dim, dtype=np.float32)
+
+    pooled = roi.mean(dim=(1, 2))
+    if pooled.numel() > output_dim:
+        pooled = F.adaptive_avg_pool1d(pooled.view(1, 1, -1), output_dim).view(-1)
+    elif pooled.numel() < output_dim:
+        pooled = F.pad(pooled, (0, output_dim - int(pooled.numel())))
+    return pooled.detach().float().cpu().numpy().astype(np.float32, copy=False)
+
+
+def build_candidate_state_vector(
+    candidate: Top1Det,
+    img_w: int,
+    img_h: int,
+    feature_map: Optional[torch.Tensor],
+    use_feature: bool,
+    min_box_frac: float,
+) -> np.ndarray:
+    geom_and_conf = np.concatenate(
+        [
+            box_xyxy_to_norm_state(candidate.xyxy, img_w=img_w, img_h=img_h),
+            np.array([float(candidate.conf)], dtype=np.float32),
+        ],
+        axis=0,
+    )
+    geom_and_conf = normalize_state_vector(geom_and_conf)
+    if not use_feature:
+        return geom_and_conf
+
+    feature_vec = extract_candidate_feature_embedding(
+        feature_map=feature_map,
+        box_xyxy=candidate.xyxy,
+        img_w=img_w,
+        img_h=img_h,
+        min_box_frac=min_box_frac,
+    )
+    feature_vec = normalize_state_vector(feature_vec)
+    combined = np.concatenate(
+        [
+            geom_and_conf * math.sqrt(0.5),
+            feature_vec * math.sqrt(0.5),
+        ],
+        axis=0,
+    )
+    return normalize_state_vector(combined)
+
+
+def compute_candidate_memory_score(
+    candidate: Top1Det,
+    candidate_state_vector: np.ndarray,
+    memory_states: Sequence[CandidateMemoryState],
+    current_frame_idx: int,
+    memory_score_mode: str,
+) -> float:
+    if not memory_states:
+        return 0.0
+
+    similarities: List[float] = []
+    weighted_pairs: List[Tuple[float, float]] = []
+    for entry in memory_states:
+        if int(entry.cls_id) != int(candidate.cls_id):
+            sim = 0.0
+        else:
+            sim = float(np.clip(np.dot(candidate_state_vector, entry.state_vector), -1.0, 1.0))
+            sim = 0.5 * (sim + 1.0)
+        similarities.append(sim)
+        age = max(0, int(current_frame_idx) - int(entry.frame_idx))
+        weighted_pairs.append((sim, 1.0 / float(1 + age)))
+
+    mode = str(memory_score_mode)
+    if mode == "max":
+        return float(max(similarities))
+    if mode == "top2_mean":
+        top_vals = sorted(similarities, reverse=True)[:2]
+        return float(np.mean(top_vals)) if top_vals else 0.0
+    if mode == "recency_mean":
+        weight_sum = float(sum(weight for _sim, weight in weighted_pairs))
+        if weight_sum <= 0.0:
+            return 0.0
+        return float(sum(sim * weight for sim, weight in weighted_pairs) / weight_sum)
+    raise RuntimeError(f"Unsupported teacher candidate memory score mode: {memory_score_mode}")
+
+
 def score_teacher_candidate(
     candidate: Top1Det,
     prev_reference_box: Optional[Tuple[float, float, float, float]],
@@ -827,8 +825,8 @@ def score_teacher_candidate(
     conf_weight: float,
     temporal_weight: float,
     memory_weight: float,
-    memory_score: float,
-) -> Tuple[float, float, float]:
+    memory_term: float,
+) -> Tuple[float, float, float, float]:
     mode = str(score_mode)
     conf_term = float(candidate.conf)
     temporal_term = 0.0
@@ -845,11 +843,11 @@ def score_teacher_candidate(
     total = float(conf_weight) * conf_term
     if mode in {"conf_temporal", "conf_temporal_memory"}:
         total += float(temporal_weight) * float(temporal_term)
-    if mode == "conf_temporal_memory" and math.isfinite(memory_score):
-        total += float(memory_weight) * float(memory_score)
-    elif mode not in {"conf_only", "conf_temporal", "conf_temporal_memory"}:  # pragma: no cover
+    if mode == "conf_temporal_memory":
+        total += float(memory_weight) * float(memory_term)
+    elif mode not in {"conf_only", "conf_temporal"}:  # pragma: no cover
         raise RuntimeError(f"Unsupported teacher candidate score mode: {score_mode}")
-    return float(total), float(conf_term), float(temporal_term)
+    return float(total), float(conf_term), float(temporal_term), float(memory_term)
 
 
 def select_teacher_candidate(
@@ -864,8 +862,12 @@ def select_teacher_candidate(
     temporal_weight: float,
     memory_weight: float,
     min_score: float,
-    memory_bank: Sequence[ObjectMemoryEntry],
-    candidate_embeddings: Optional[Dict[int, torch.Tensor]],
+    current_frame_idx: int,
+    memory_states: Sequence[CandidateMemoryState],
+    memory_score_mode: str,
+    memory_feature_map: Optional[torch.Tensor],
+    memory_use_feature: bool,
+    memory_min_box_frac: float,
 ) -> CandidateSelectionResult:
     if not candidates:
         return CandidateSelectionResult(
@@ -876,56 +878,39 @@ def select_teacher_candidate(
             score_conf=float("nan"),
             score_temporal=float("nan"),
             score_memory=float("nan"),
-            selected_embedding=None,
-        )
-
-    if len(candidates) == 1:
-        only = candidates[0]
-        only_embedding = candidate_embeddings.get(int(only.rank)) if candidate_embeddings is not None else None
-        memory_score = compute_memory_similarity_score(
-            query_embedding=only_embedding,
-            memory_bank=memory_bank,
-            cls_id=int(only.cls_id),
-        )
-        selected_score, score_conf, score_temporal = score_teacher_candidate(
-            candidate=only,
-            prev_reference_box=prev_reference_box,
-            img_w=img_w,
-            img_h=img_h,
-            max_center_shift_frac=max_center_shift_frac,
-            max_area_ratio=max_area_ratio,
-            score_mode=score_mode,
-            conf_weight=conf_weight,
-            temporal_weight=temporal_weight,
-            memory_weight=memory_weight,
-            memory_score=memory_score,
-        )
-        return CandidateSelectionResult(
-            selected=only,
-            num_candidates=len(candidates),
-            selected_rank=int(only.rank),
-            selected_score=float(selected_score),
-            score_conf=float(score_conf),
-            score_temporal=float(score_temporal),
-            score_memory=float(memory_score),
-            selected_embedding=only_embedding,
+            memory_size_active=len(memory_states),
+            selected_state_vector=None,
         )
 
     best_candidate: Optional[Top1Det] = None
-    best_embedding: Optional[torch.Tensor] = None
     best_total = float("-inf")
     best_conf_term = float("nan")
     best_temporal_term = float("nan")
     best_memory_term = float("nan")
+    best_state_vector: Optional[np.ndarray] = None
+    memory_enabled = str(score_mode) == "conf_temporal_memory"
 
     for candidate in candidates:
-        embedding = candidate_embeddings.get(int(candidate.rank)) if candidate_embeddings is not None else None
-        memory_score = compute_memory_similarity_score(
-            query_embedding=embedding,
-            memory_bank=memory_bank,
-            cls_id=int(candidate.cls_id),
+        candidate_state_vector = build_candidate_state_vector(
+            candidate=candidate,
+            img_w=img_w,
+            img_h=img_h,
+            feature_map=memory_feature_map,
+            use_feature=memory_use_feature,
+            min_box_frac=memory_min_box_frac,
         )
-        total, conf_term, temporal_term = score_teacher_candidate(
+        memory_term = (
+            compute_candidate_memory_score(
+                candidate=candidate,
+                candidate_state_vector=candidate_state_vector,
+                memory_states=memory_states,
+                current_frame_idx=current_frame_idx,
+                memory_score_mode=memory_score_mode,
+            )
+            if memory_enabled
+            else float("nan")
+        )
+        total, conf_term, temporal_term, memory_term = score_teacher_candidate(
             candidate=candidate,
             prev_reference_box=prev_reference_box,
             img_w=img_w,
@@ -936,7 +921,7 @@ def select_teacher_candidate(
             conf_weight=conf_weight,
             temporal_weight=temporal_weight,
             memory_weight=memory_weight,
-            memory_score=memory_score,
+            memory_term=memory_term,
         )
         if (
             best_candidate is None
@@ -947,11 +932,11 @@ def select_teacher_candidate(
             )
         ):
             best_candidate = candidate
-            best_embedding = embedding
             best_total = float(total)
             best_conf_term = float(conf_term)
             best_temporal_term = float(temporal_term)
-            best_memory_term = float(memory_score)
+            best_memory_term = float(memory_term)
+            best_state_vector = candidate_state_vector
 
     if best_candidate is None or best_total < float(min_score):
         return CandidateSelectionResult(
@@ -962,7 +947,8 @@ def select_teacher_candidate(
             score_conf=float("nan"),
             score_temporal=float("nan"),
             score_memory=float("nan"),
-            selected_embedding=None,
+            memory_size_active=len(memory_states),
+            selected_state_vector=None,
         )
 
     return CandidateSelectionResult(
@@ -973,7 +959,8 @@ def select_teacher_candidate(
         score_conf=float(best_conf_term),
         score_temporal=float(best_temporal_term),
         score_memory=float(best_memory_term),
-        selected_embedding=best_embedding,
+        memory_size_active=len(memory_states),
+        selected_state_vector=best_state_vector,
     )
 
 
@@ -1085,12 +1072,12 @@ def unpack_loss_pair(loss_out_obj: Any) -> Tuple[Optional[torch.Tensor], Any]:
 
 
 def build_training_batch(
-    entries: Sequence[ReplayEntry],
+    target_entries: Sequence[ReplayEntry],
     imgsz: int,
     device: str,
     rng: random.Random,
 ) -> Dict[str, torch.Tensor]:
-    if not entries:
+    if not target_entries:
         raise RuntimeError("build_training_batch called with empty entries")
 
     img_tensors: List[torch.Tensor] = []
@@ -1098,9 +1085,10 @@ def build_training_batch(
     cls_vals: List[List[float]] = []
     box_vals: List[List[float]] = []
 
-    for i, entry in enumerate(entries):
+    for i, entry in enumerate(target_entries):
         with Image.open(entry.path) as im:
             img_rgb = im.convert("RGB")
+            img_w, img_h = img_rgb.size
 
         aug_rgb = strong_augment(img_rgb, rng)
         letterboxed, gain, pad_left, pad_top = letterbox_image(aug_rgb, imgsz)
@@ -1108,8 +1096,8 @@ def build_training_batch(
 
         x_c, y_c, bw, bh = xyxy_original_to_norm_xywh_letterboxed(
             box_xyxy=entry.pseudo_box,
-            orig_w=entry.width,
-            orig_h=entry.height,
+            orig_w=img_w,
+            orig_h=img_h,
             size=imgsz,
             gain=gain,
             pad_left=pad_left,
@@ -1278,14 +1266,15 @@ def save_selected_rank_example_image(
     selected_rank_text = str(selected_candidate.rank) if selected_candidate is not None else "n/a"
     draw.text((8, 6), f"selected rank>1 frame={frame_idx} rank={selected_rank_text}", fill=(255, 255, 255), font=font)
 
-    footer_top = max(0, out.size[1] - 46)
+    footer_top = max(0, out.size[1] - 64)
     draw.rectangle([0, footer_top, out.size[0], out.size[1]], fill=(0, 0, 0))
-    footer = (
-        f"score={selected_score:.3f} conf={score_conf:.3f} "
-        f"temporal={score_temporal:.3f} memory={score_memory:.3f}"
-    )
+    footer = f"score={selected_score:.3f} conf={score_conf:.3f} temporal={score_temporal:.3f}"
     draw.text((8, footer_top + 8), footer, fill=(255, 255, 255), font=font)
-    draw.text((8, footer_top + 26), f"mode={score_mode}", fill=(255, 255, 255), font=font)
+    memory_footer = (
+        f"memory={score_memory:.3f}" if math.isfinite(score_memory) else "memory=n/a"
+    )
+    draw.text((8, footer_top + 26), memory_footer, fill=(255, 255, 255), font=font)
+    draw.text((8, footer_top + 44), f"mode={score_mode}", fill=(255, 255, 255), font=font)
 
     score_tag = f"{selected_score:.3f}".replace(".", "p")
     rank_tag = selected_rank_text
@@ -1495,7 +1484,7 @@ def save_final_student_weights(yolo_wrapper: YOLO, student_model: nn.Module, out
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online teacher-student ODAD with persist2 replay gating and top-k teacher candidate selection."
+        description="Online teacher-student ODAD with persist2 replay gating and memory-aware top-k teacher selection."
     )
     parser.add_argument("--weights", type=str, required=True, help="Path to YOLO weights (.pt)")
     parser.add_argument("--dataset", type=str, required=True, help="YOLO-root dataset path (expects images/test)")
@@ -1633,19 +1622,43 @@ def parse_args() -> argparse.Namespace:
         "--teacher-candidate-memory-weight",
         type=float,
         default=0.5,
-        help="Weight for the object-memory similarity term in candidate scoring when enabled.",
+        help="Weight for the temporal-memory score term when memory scoring is enabled.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-memory-size",
+        type=int,
+        default=8,
+        help="Number of recent selected candidate states kept in temporal memory.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-memory-score-mode",
+        type=str,
+        default="top2_mean",
+        choices=["max", "top2_mean", "recency_mean"],
+        help="How to aggregate similarity to recent memory states.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-memory-layer",
+        type=int,
+        default=21,
+        help="Feature layer used for optional object-centric candidate embeddings.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-memory-use-feature",
+        action="store_true",
+        help="If enabled, include a compact object-centric feature embedding in the candidate memory state.",
+    )
+    parser.add_argument(
+        "--teacher-candidate-memory-min-box-frac",
+        type=float,
+        default=0.01,
+        help="Minimum normalized box size for reliable object-centric embedding extraction if feature memory is enabled.",
     )
     parser.add_argument(
         "--teacher-candidate-min-score",
         type=float,
         default=0.0,
         help="Optional minimum final candidate score required before selection.",
-    )
-    parser.add_argument(
-        "--teacher-candidate-min-box-frac",
-        type=float,
-        default=0.01,
-        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -1713,9 +1726,19 @@ def main() -> None:
         raise RuntimeError(f"Student/teacher head mismatch: student={head_idx}, teacher={teacher_head_idx}")
     teacher_topk = max(1, int(args.teacher_topk))
     teacher_candidate_score_mode = str(args.teacher_candidate_score_mode)
-    teacher_candidate_memory_enabled = teacher_candidate_score_mode == "conf_temporal_memory"
-    teacher_candidate_memory_layer = max(0, head_idx - 1)
-    teacher_candidate_min_box_frac = max(0.0, float(args.teacher_candidate_min_box_frac))
+    teacher_candidate_memory_size = max(1, int(args.teacher_candidate_memory_size))
+    teacher_candidate_memory_score_mode = str(args.teacher_candidate_memory_score_mode)
+    memory_score_enabled = teacher_candidate_score_mode == "conf_temporal_memory"
+    memory_use_feature = bool(args.teacher_candidate_memory_use_feature) and memory_score_enabled
+    if memory_use_feature:
+        memory_layer_idx = int(args.teacher_candidate_memory_layer)
+        if memory_layer_idx < 0 or memory_layer_idx >= len(teacher_layers):
+            raise RuntimeError(
+                f"Invalid --teacher-candidate-memory-layer={memory_layer_idx}; expected range [0, {len(teacher_layers) - 1}]."
+            )
+        teacher_feature_tap: Optional[LayerFeatureTap] = LayerFeatureTap(teacher_layers[memory_layer_idx])
+    else:
+        teacher_feature_tap = None
 
     neck_start_idx = resolve_neck_start_idx(core_model, int(args.neck_start_idx))
     unfrozen_indices = compute_unfrozen_indices(
@@ -1763,6 +1786,8 @@ def main() -> None:
         update_every_frames=int(args.update_every_frames),
         updates_per_event=int(args.updates_per_event),
     )
+    rng = random.Random(int(args.seed))
+    candidate_memory: Deque[CandidateMemoryState] = deque(maxlen=teacher_candidate_memory_size)
 
     summary_path = out_dir / "summary.txt"
     startup_lines = [
@@ -1782,10 +1807,12 @@ def main() -> None:
         f"  teacher_candidate_conf_weight={float(args.teacher_candidate_conf_weight):.3f}",
         f"  teacher_candidate_temporal_weight={float(args.teacher_candidate_temporal_weight):.3f}",
         f"  teacher_candidate_memory_weight={float(args.teacher_candidate_memory_weight):.3f}",
+        f"  teacher_candidate_memory_size={teacher_candidate_memory_size}",
+        f"  teacher_candidate_memory_score_mode={teacher_candidate_memory_score_mode}",
+        f"  teacher_candidate_memory_use_feature={int(memory_use_feature)}",
+        f"  teacher_candidate_memory_layer={int(args.teacher_candidate_memory_layer)}",
+        f"  teacher_candidate_memory_min_box_frac={float(args.teacher_candidate_memory_min_box_frac):.4f}",
         f"  teacher_candidate_min_score={float(args.teacher_candidate_min_score):.3f}",
-        f"  teacher_candidate_memory_enabled={int(teacher_candidate_memory_enabled)}",
-        f"  teacher_candidate_memory_layer={teacher_candidate_memory_layer}",
-        f"  teacher_candidate_min_box_frac={teacher_candidate_min_box_frac:.4f}",
         f"  update_every_frames={update_every_frames}",
         f"  updates_per_event={updates_per_event}",
         f"  max_updates_per_frame_legacy={max(1, int(args.max_updates_per_frame))}",
@@ -1838,14 +1865,7 @@ def main() -> None:
                 save=False,
             )
 
-    rng = random.Random(int(args.seed))
     buffer = ReplayBuffer(max_size=int(args.buffer_size), rng=rng)
-    object_memory_bank: Deque[ObjectMemoryEntry] = deque(maxlen=max(1, int(args.buffer_size)))
-    teacher_feature_tap = (
-        LayerFeatureTap(teacher_layers[teacher_candidate_memory_layer], layer_idx=teacher_candidate_memory_layer)
-        if teacher_candidate_memory_enabled
-        else None
-    )
 
     logs: List[FrameLog] = []
     mp4_frames: List[np.ndarray] = []
@@ -1857,6 +1877,7 @@ def main() -> None:
     update_losses: List[float] = []
     total_losses: List[float] = []
     buffer_sizes_on_updates: List[int] = []
+    batch_sizes_on_updates: List[int] = []
     checkpoint_paths: List[Path] = []
     selected_rank_example_paths: List[Path] = []
     max_selected_rank_examples = 8
@@ -1875,7 +1896,7 @@ def main() -> None:
             w, h = img_rgb.size
 
         teacher_model.eval()
-        raw_teacher_top1, teacher_candidates, teacher_lat_ms = predict_teacher_candidates_wrapper(
+        raw_teacher_top1, teacher_candidates, teacher_feature_map, teacher_lat_ms = predict_teacher_candidates_wrapper(
             yolo_wrapper=teacher_yolo,
             source=str(img_path),
             device=str(args.device),
@@ -1884,19 +1905,7 @@ def main() -> None:
             topk=teacher_topk,
             conf_floor=float(args.teacher_candidate_conf_floor),
             allow_top1_fallback=teacher_topk <= 1,
-        )
-        candidate_embeddings = (
-            extract_candidate_embeddings(
-                teacher_model=teacher_model,
-                feature_tap=teacher_feature_tap,
-                img_rgb=img_rgb,
-                candidates=teacher_candidates,
-                imgsz=int(args.imgsz),
-                device=str(args.device),
-                min_box_frac=teacher_candidate_min_box_frac,
-            )
-            if teacher_candidate_memory_enabled and teacher_feature_tap is not None and teacher_candidates
-            else None
+            feature_tap=teacher_feature_tap,
         )
         selection = select_teacher_candidate(
             candidates=teacher_candidates,
@@ -1910,8 +1919,12 @@ def main() -> None:
             temporal_weight=float(args.teacher_candidate_temporal_weight),
             memory_weight=float(args.teacher_candidate_memory_weight),
             min_score=float(args.teacher_candidate_min_score),
-            memory_bank=list(object_memory_bank),
-            candidate_embeddings=candidate_embeddings,
+            current_frame_idx=idx,
+            memory_states=list(candidate_memory),
+            memory_score_mode=teacher_candidate_memory_score_mode,
+            memory_feature_map=teacher_feature_map,
+            memory_use_feature=memory_use_feature,
+            memory_min_box_frac=float(args.teacher_candidate_memory_min_box_frac),
         )
         teacher_top1 = selection.selected
 
@@ -1962,6 +1975,21 @@ def main() -> None:
         )
         accepted = bool(passed_base_gate and passed_motion_gate and passed_persistence_gate)
         accepted_final = bool(accepted)
+        if (
+            teacher_top1 is not None
+            and selection.selected_state_vector is not None
+            and passed_base_gate
+            and passed_motion_gate
+        ):
+            candidate_memory.append(
+                CandidateMemoryState(
+                    frame_idx=idx,
+                    cls_id=int(teacher_top1.cls_id),
+                    box_xyxy=teacher_top1.xyxy,
+                    conf=float(teacher_top1.conf),
+                    state_vector=selection.selected_state_vector.copy(),
+                )
+            )
         if accepted_final and teacher_top1 is not None:
             accepted_frames += 1
             buffer.add(
@@ -1974,25 +2002,6 @@ def main() -> None:
                     pseudo_cls=int(teacher_top1.cls_id),
                 )
             )
-            if teacher_candidate_memory_enabled:
-                selected_embedding = selection.selected_embedding
-                if selected_embedding is None and teacher_feature_tap is not None:
-                    selected_embedding = extract_object_embedding_for_box(
-                        teacher_model=teacher_model,
-                        feature_tap=teacher_feature_tap,
-                        img_rgb=img_rgb,
-                        box_xyxy=teacher_top1.xyxy,
-                        imgsz=int(args.imgsz),
-                        device=str(args.device),
-                        min_box_frac=teacher_candidate_min_box_frac,
-                    )
-                if selected_embedding is not None:
-                    object_memory_bank.append(
-                        ObjectMemoryEntry(
-                            cls_id=int(teacher_top1.cls_id),
-                            embedding=selected_embedding,
-                        )
-                    )
 
         updates_this_frame = 0
         batch_size_used = 0
@@ -2007,8 +2016,8 @@ def main() -> None:
             number_of_update_events += 1
             # Replay admission stays continuous; only optimizer steps are cadence-gated.
             for _ in range(updates_per_event):
-                sampled = buffer.sample(batch_size=int(args.update_batch_size), mode=str(args.buffer_sample_mode))
-                if not sampled:
+                target_entries = buffer.sample(batch_size=int(args.update_batch_size), mode=str(args.buffer_sample_mode))
+                if not target_entries:
                     break
 
                 apply_freeze_policy(
@@ -2019,7 +2028,7 @@ def main() -> None:
 
                 update_t0 = time.time()
                 batch = build_training_batch(
-                    entries=sampled,
+                    target_entries=target_entries,
                     imgsz=int(args.imgsz),
                     device=str(args.device),
                     rng=rng,
@@ -2047,9 +2056,11 @@ def main() -> None:
                 last_total_loss = float(total_loss)
                 update_losses.append(float(det_loss))
                 total_losses.append(float(total_loss))
-                batch_size_used = len(sampled)
-                num_pseudo_boxes_used += len(sampled)
+                target_count_step = len(target_entries)
+                batch_size_used = target_count_step
+                num_pseudo_boxes_used += target_count_step
                 buffer_sizes_on_updates.append(len(buffer))
+                batch_sizes_on_updates.append(target_count_step)
 
         if updates_this_frame > 0:
             updated_frames += 1
@@ -2081,6 +2092,7 @@ def main() -> None:
                 teacher_selected_score_conf=float(selection.score_conf),
                 teacher_selected_score_temporal=float(selection.score_temporal),
                 teacher_selected_score_memory=float(selection.score_memory),
+                teacher_candidate_memory_size_active=int(selection.memory_size_active),
                 persistence_count=int(persistence_count),
                 temporal_iou=float(temporal_iou),
                 persistence_iou=float(persistence_iou),
@@ -2132,7 +2144,7 @@ def main() -> None:
                     "updates": total_optimizer_updates,
                     "buf": len(buffer),
                     "rank2+": selected_rank_gt1_frames,
-                    "last_bs": batch_size_used,
+                    "bs": batch_size_used,
                 },
                 refresh=False,
             )
@@ -2149,8 +2161,6 @@ def main() -> None:
 
     if progress is not None:
         progress.close()
-    if teacher_feature_tap is not None:
-        teacher_feature_tap.close()
 
     csv_path = out_dir / "adapt_log.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -2171,6 +2181,7 @@ def main() -> None:
                 "teacher_selected_score_conf",
                 "teacher_selected_score_temporal",
                 "teacher_selected_score_memory",
+                "teacher_candidate_memory_size_active",
                 "persistence_count",
                 "temporal_iou",
                 "persistence_iou",
@@ -2220,6 +2231,7 @@ def main() -> None:
                         if math.isfinite(row.teacher_selected_score_memory)
                         else ""
                     ),
+                    row.teacher_candidate_memory_size_active,
                     row.persistence_count,
                     f"{row.temporal_iou:.6f}" if math.isfinite(row.temporal_iou) else "",
                     f"{row.persistence_iou:.6f}" if math.isfinite(row.persistence_iou) else "",
@@ -2252,9 +2264,9 @@ def main() -> None:
     teacher_num_candidates_vals = np.array([row.teacher_num_candidates for row in logs], dtype=np.float32)
     teacher_selected_rank_vals = np.array([row.teacher_selected_rank for row in logs], dtype=np.float32)
     teacher_selected_score_vals = np.array([row.teacher_selected_score for row in logs], dtype=np.float32)
-    teacher_selected_score_memory_vals = np.array(
-        [row.teacher_selected_score_memory for row in logs],
-        dtype=np.float32,
+    teacher_selected_score_memory_vals = np.array([row.teacher_selected_score_memory for row in logs], dtype=np.float32)
+    teacher_candidate_memory_size_vals = np.array(
+        [row.teacher_candidate_memory_size_active for row in logs], dtype=np.float32
     )
     batch_size_used_vals = np.array([row.batch_size_used for row in logs], dtype=np.float32)
     updates_this_frame_vals = np.array([row.updates_this_frame for row in logs], dtype=np.float32)
@@ -2365,6 +2377,15 @@ def main() -> None:
     )
     save_plot_lines(
         frames,
+        [rolling_mean_ignore_nan(teacher_selected_score_memory_vals, roll_window)],
+        [f"rolling_mean(window={roll_window})"],
+        "Rolling Selected Memory Score",
+        "frame",
+        "memory_score",
+        out_dir / "plot_selected_memory_score_roll.png",
+    )
+    save_plot_lines(
+        frames,
         [batch_size_used_vals],
         ["batch_size_used"],
         "Batch Size Used",
@@ -2403,9 +2424,7 @@ def main() -> None:
     fraction_frames_student_gt_teacher = float(np.mean(conf_gap_vals > 0.0)) if logs else float("nan")
     fraction_frames_student_lt_teacher = float(np.mean(conf_gap_vals < 0.0)) if logs else float("nan")
     mean_accept_rate_roll = float(np.mean(rolling_mean(accepted_final_vals, roll_window))) if logs else float("nan")
-    mean_batch_size_used_on_updates = (
-        float(np.mean(batch_size_used_vals[update_mask])) if np.any(update_mask) else float("nan")
-    )
+    mean_batch_size_used_on_updates = mean_or_nan(batch_sizes_on_updates)
     mean_updates_per_event = (
         float(np.mean(updates_this_frame_vals[update_event_triggered_vals > 0.5]))
         if np.any(update_event_triggered_vals > 0.5)
@@ -2427,12 +2446,13 @@ def main() -> None:
         if np.any(selected_mask)
         else float("nan")
     )
-    mean_selected_score_memory = (
+    mean_selected_memory_score = (
         mean_or_nan(teacher_selected_score_memory_vals[selected_mask].tolist())
         if np.any(selected_mask)
         else float("nan")
     )
     mean_num_candidates = float(np.mean(teacher_num_candidates_vals)) if logs else float("nan")
+    mean_memory_size_active = float(np.mean(teacher_candidate_memory_size_vals)) if logs else float("nan")
 
     final_weights_path: Optional[Path] = None
     if bool(args.save_final_weights):
@@ -2491,20 +2511,17 @@ def main() -> None:
         f"  teacher_candidate_conf_weight={float(args.teacher_candidate_conf_weight):.3f}",
         f"  teacher_candidate_temporal_weight={float(args.teacher_candidate_temporal_weight):.3f}",
         f"  teacher_candidate_memory_weight={float(args.teacher_candidate_memory_weight):.3f}",
+        f"  teacher_candidate_memory_size={teacher_candidate_memory_size}",
+        f"  teacher_candidate_memory_score_mode={teacher_candidate_memory_score_mode}",
+        f"  teacher_candidate_memory_use_feature={int(memory_use_feature)}",
         f"  teacher_candidate_min_score={float(args.teacher_candidate_min_score):.3f}",
         format_metric("mean_num_candidates", mean_num_candidates, prefix="  "),
         format_metric("mean_selected_rank", mean_selected_rank, prefix="  "),
         format_metric("fraction_selected_rank_gt1", fraction_selected_rank_gt1, prefix="  "),
         format_metric("mean_selected_score", mean_selected_score, prefix="  "),
-        *(
-            [format_metric("mean_selected_score_memory", mean_selected_score_memory, prefix="  ")]
-            if teacher_candidate_memory_enabled
-            else []
-        ),
+        format_metric("mean_selected_memory_score", mean_selected_memory_score, prefix="  "),
+        format_metric("mean_memory_size_active", mean_memory_size_active, prefix="  "),
         f"  selected_rank_gt1_frames={selected_rank_gt1_frames}",
-        f"  object_memory_size_final={len(object_memory_bank)}",
-        f"  object_memory_feature_layer={teacher_candidate_memory_layer}",
-        f"  object_memory_min_box_frac={teacher_candidate_min_box_frac:.4f}",
         *(
             [f"  selected_rank_gt1_examples_saved={len(selected_rank_example_paths)}"]
             if selected_rank_example_paths
@@ -2539,6 +2556,7 @@ def main() -> None:
         "  plot_buffer_size.png",
         "  plot_selected_rank.png",
         "  plot_selected_score_roll.png",
+        "  plot_selected_memory_score_roll.png",
         "  plot_batch_size_used.png",
         "  plot_det_loss.png",
         "  hist_conf_gap.png",
@@ -2570,6 +2588,9 @@ def main() -> None:
             with imageio.get_writer(mp4_path, fps=int(args.mp4_fps), codec="libx264", quality=7) as writer:
                 for frame in mp4_frames:
                     writer.append_data(frame)
+
+    if teacher_feature_tap is not None:
+        teacher_feature_tap.close()
 
     print(f"Done. Wrote outputs to: {out_dir}")
 

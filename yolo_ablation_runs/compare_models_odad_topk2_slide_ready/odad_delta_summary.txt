@@ -1,0 +1,10 @@
+ODAD delta summary
+
+Dataset: Lab
+  ODAD final vs baseline: det_rate -2.2 pp, mean +0.117, median +0.204
+  Gap to FDA: det_rate -9.2 pp, mean -0.008, median +0.067
+  Gap to FDA-mix: det_rate -12.8 pp, mean -0.043, median +0.066
+  Checkpoint-to-checkpoint deltas:
+    ODAD 3.0k - ODAD 1.5k: det_rate +12.2 pp, mean +0.102
+    ODAD 4.5k - ODAD 3.0k: det_rate +2.2 pp, mean +0.031
+    ODAD final - ODAD 4.5k: det_rate +21.6 pp, mean +0.156

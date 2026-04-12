@@ -1,0 +1,8 @@
+dataset,model,det_rate_at_conf_pct,mean_top1_conf,median_top1_conf,p90_top1_conf,p99_top1_conf,std_top1_conf,delta_det_rate_vs_baseline_pp,delta_mean_top1_conf_vs_baseline,delta_det_rate_vs_odad_baseline_pp,delta_mean_top1_conf_vs_odad_baseline
+lab,baseline,88.00,0.6079,0.6818,0.8610,0.9081,0.2394,0.00,0.0000,,
+lab,fda,95.00,0.7324,0.8195,0.9214,0.9538,0.2168,7.00,0.1245,,
+lab,fda_mix,98.60,0.7681,0.8197,0.9215,0.9497,0.1686,10.60,0.1601,,
+lab,odad_1500,49.80,0.4359,0.2425,0.9949,0.9984,0.4104,-38.20,-0.1721,,
+lab,odad_3000,62.00,0.5376,0.5573,0.9974,0.9991,0.4014,-26.00,-0.0704,,
+lab,odad_4500,64.20,0.5687,0.6207,0.9946,0.9979,0.3996,-23.80,-0.0392,,
+lab,odad_final,85.80,0.7246,0.8860,0.9945,0.9980,0.3266,-2.20,0.1167,,
