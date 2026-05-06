@@ -1,0 +1,50 @@
+Shadow ODAD Manager Summary
+
+architecture:
+  active_model=stable inference model used on every stream frame
+  shadow_model=clean top-k2 ODAD learner updated in background
+  promotion=label-free same-window active-vs-shadow reliability/resource gate
+
+active_initial_weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+shadow_initial_weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+active_final_weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+frames=6735
+eval_window=500
+promotion_every_frames=500
+promotions=0
+rollbacks=6
+last_candidate_checkpoint=/home/hm25936/mae/odad/shadow_manager_full/checkpoints/shadow_frame_006500.pt
+last_promoted_checkpoint=n/a
+
+resource_metrics:
+  mean_active_inference_latency_ms=12.223
+  p90_active_inference_latency_ms=13.020
+  estimated_fps=81.816
+  mean_shadow_teacher_latency_ms=12.091
+  mean_shadow_student_latency_ms=12.251
+  mean_shadow_update_latency_ms=577.961
+  peak_cuda_allocated_mb=445.5
+  peak_cuda_reserved_mb=602.0
+  checkpoint_size_mb=5.913
+  trainable_params=751507
+
+promotion_rule:
+  score = det_rate - 0.5*weird - 0.75*box_jump - 0.5*high_conf_weird - 0.002*max_bad_streak + 0.001*max_good_streak
+  min_promotion_det_rate=0.950
+  promotion_det_margin=-0.010
+  max_promotion_latency_ms=0.000
+  max_promotion_memory_mb=0.000
+
+outputs:
+  manager_log.csv
+  promotion_events.csv
+  active_vs_shadow_window_metrics.csv
+  resource_metrics.csv
+  checkpoints/
+  promoted/
+  plots/
+
+last_active_vs_shadow_window:
+  active: det=0.8600 weird=0.8600 high_conf_weird=0.3700 box_jump=0.1060 max_bad=256 max_good=27 score=-0.319500
+  shadow: det=0.8600 weird=0.8600 high_conf_weird=0.3700 box_jump=0.1060 max_bad=256 max_good=27 score=-0.319500

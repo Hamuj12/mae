@@ -1,0 +1,104 @@
+Online Adaptation Summary
+
+startup:
+  update_scope=head_only
+  neck_start_idx=10
+  head_idx=22
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  update_every_frames=1
+  updates_per_event=1
+  max_updates_per_frame_legacy=1
+  save_checkpoints_every=0
+  save_final_weights=1
+  final_weights_name=student_final.pt
+  unfrozen_modules=[22:Detect]
+  trainable_params=751507
+
+weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+total_frames=300
+accepted_frames=82
+updates_applied=225
+number_of_update_events=225
+optimizer_update_steps=225
+mean_teacher_conf=0.694343
+mean_student_post_conf=0.714367
+mean_detection_loss_updates=8.402300
+mean_total_loss_updates=8.402300
+mean_buffer_size_during_updates=29.991
+
+teacher_vs_student:
+  mean_conf_gap=0.020024
+  median_conf_gap=0.000000
+  fraction_frames_student_gt_teacher=0.436667
+  fraction_frames_student_lt_teacher=0.350000
+  mean_accept_rate_roll=0.228333
+  mean_batch_size_used_on_updates=4.000000
+
+reliability_gates:
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  number_of_checkpoints_saved=0
+
+teacher_candidate_selection:
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  mean_num_candidates=1.646667
+  mean_selected_rank=1.142373
+  fraction_selected_rank_gt1=0.142373
+  mean_selected_score=1.440555
+  selected_rank_gt1_frames=42
+  selected_rank_gt1_examples_saved=8
+
+update_schedule:
+  update_every_frames=1
+  updates_per_event=1
+  mean_updates_per_event=1.000000
+  number_of_update_events=225
+
+buffer_config:
+  buffer_size=32
+  update_batch_size=4
+  min_buffer_before_update=4
+  buffer_sample_mode=recent
+  max_updates_per_frame_legacy=1
+
+outputs:
+  csv=adapt_log.csv
+  summary=summary.txt
+  final_student_weights=student_final.pt
+  plot_teacher_vs_student_conf.png
+  plot_conf_gap.png
+  plot_conf_gap_roll.png
+  plot_teacher_conf_roll.png
+  plot_student_conf_roll.png
+  plot_accept_rate_roll.png
+  plot_update_count_roll.png
+  plot_accept_update_flags.png
+  plot_buffer_size.png
+  plot_selected_rank.png
+  plot_selected_score_roll.png
+  plot_batch_size_used.png
+  plot_det_loss.png
+  hist_conf_gap.png
+  hist_update_latency.png
+  selected_rank_gt1_dir=selected_rank_gt1 (8 saved)
