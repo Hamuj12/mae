@@ -1,0 +1,9 @@
+Full Stream Reliability Summary
+
+Dataset: lab
+model, frames, det@0.25, weird, high_conf_weird, box_jump, bad_rate, max_bad, p95_bad, long>50, max_good
+fda_mix, 6735, 98.2%, 21.5%, 10.9%, 1.9%, 23.5%, 41, 10.0, 0, 235
+adapter_base, 6735, 84.5%, 6.3%, 0.3%, 3.1%, 19.5%, 71, 31.3, 2, 465
+current_odad, 6735, 87.0%, 36.3%, 15.4%, 9.1%, 45.9%, 198, 70.8, 14, 238
+membank_prev, 6735, 85.6%, 6.2%, 0.4%, 3.0%, 18.2%, 67, 20.9, 2, 465
+source_anchor_candidate, 6735, 84.6%, 6.4%, 0.4%, 2.8%, 19.3%, 67, 23.0, 3, 464

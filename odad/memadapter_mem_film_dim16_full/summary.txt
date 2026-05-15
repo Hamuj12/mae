@@ -1,0 +1,239 @@
+Online Adaptation Summary
+
+startup:
+  adaptation_mode=adapter
+  update_scope=head_only
+  neck_start_idx=10
+  head_idx=22
+  adapter_enabled=1
+  adapter_layers=18,21
+  adapter_reduction=8
+  adapter_min_channels=8
+  adapter_scale=1.000
+  adapter_train_detect_head=0
+  memory_adapter_enabled=1
+  memory_adapter_dim=16
+  memory_adapter_source_layer=21
+  memory_adapter_ema=0.950
+  memory_adapter_min_conf=0.800
+  memory_adapter_min_area_frac=0.001000
+  memory_adapter_update_on_accepted_only=1
+  memory_adapter_conditioning=film
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  coverage_consistency_enable=0
+  coverage_buffer_size=64
+  coverage_batch_size=2
+  coverage_weight=0.100
+  coverage_candidate_conf_min=0.250
+  coverage_candidate_conf_max=0.800
+  coverage_loss_type=pred_conf_margin
+  coverage_margin=0.050
+  coverage_max_loss=2.000
+  coverage_region_expand=0.250
+  coverage_region_min_candidates=1
+  coverage_region_center_radius_frac=0.100
+  coverage_region_use_cls=1
+  coverage_region_objectness_weight=1.000
+  update_every_frames=1
+  updates_per_event=1
+  max_updates_per_frame_legacy=1
+  save_checkpoints_every=500
+  save_final_weights=1
+  final_weights_name=student_final.pt
+  unfrozen_modules=[18:ResidualConvAdapter(C=128, hidden=16, params=8592, scale=1), 21:ResidualConvAdapter(C=256, hidden=32, params=29488, scale=1)]
+  adapter_trainable_params=38080
+  memory_adapter_trainable_params=17168
+  trainable_params=38080
+  total_param_tensors=198
+  frozen_param_tensors=184
+  frozen_param_numel=3011043
+  optimizer_param_tensors=14
+  optimizer_param_numel=38080
+  non_optimizer_trainable_tensors=0
+
+weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+total_frames=6735
+accepted_frames=2608
+updates_applied=6660
+number_of_update_events=6660
+optimizer_update_steps=6660
+adaptation_mode=adapter
+memory_adapter_enabled=1
+memory_adapter_dim=16
+memory_adapter_source_layer=21
+memory_adapter_updates=2608
+memory_adapter_initialized=1
+memory_adapter_mean_norm=1.000000
+memory_adapter_last_update_frame=6734
+adapter_trainable_params=38080
+memory_adapter_trainable_params=17168
+trainable_params=38080
+total_param_tensors=198
+frozen_param_tensors=184
+frozen_param_numel=3011043
+optimizer_param_tensors=14
+optimizer_param_numel=38080
+non_optimizer_trainable_tensors=0
+mean_teacher_conf=0.589487
+mean_student_post_conf=0.611561
+mean_detection_loss_updates=6.215669
+mean_total_loss_updates=6.215669
+mean_coverage_loss_updates=0.000000
+mean_coverage_region_student_conf=n/a
+mean_coverage_region_teacher_conf=n/a
+mean_coverage_region_conf_gap=n/a
+mean_memory_conditioning_norm=1.105443
+mean_buffer_size_during_updates=31.932
+mean_coverage_buffer_size_during_updates=0.000
+
+resource_metrics:
+  mean_update_latency_ms=564.663
+  mean_pre_update_sync_latency_ms=0.020
+  mean_batch_build_latency_ms=550.752
+  mean_update_forward_latency_ms=4.363
+  mean_update_loss_latency_ms=3.807
+  mean_update_backward_step_latency_ms=4.610
+  peak_cuda_allocated_mb=375.8
+  peak_cuda_reserved_mb=522.0
+  final_checkpoint_size_mb=5.994
+  checkpoint_reload_status=ok
+
+teacher_vs_student:
+  mean_conf_gap=0.022074
+  median_conf_gap=0.013142
+  fraction_frames_student_gt_teacher=0.685078
+  fraction_frames_student_lt_teacher=0.299480
+  mean_accept_rate_roll=0.379946
+  mean_batch_size_used_on_updates=4.000000
+
+reliability_gates:
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  number_of_checkpoints_saved=13
+
+teacher_candidate_selection:
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  mean_num_candidates=0.858203
+  mean_selected_rank=1.018773
+  fraction_selected_rank_gt1=0.018773
+  mean_selected_score=1.583538
+  selected_rank_gt1_frames=97
+  selected_rank_gt1_examples_saved=8
+
+coverage_consistency:
+  coverage_consistency_enable=0
+  coverage_loss_type=pred_conf_margin
+  coverage_weight=0.100
+  coverage_margin=0.050
+  coverage_max_loss=2.000
+  coverage_region_expand=0.250
+  coverage_region_min_candidates=1
+  coverage_region_center_radius_frac=0.100
+  coverage_region_use_cls=1
+  coverage_region_objectness_weight=1.000
+  coverage_candidate_conf_min=0.250
+  coverage_candidate_conf_max=0.800
+  coverage_buffer_size=0
+  coverage_entries_added=0
+  coverage_entries_sampled=0
+  coverage_region_entries_skipped=0
+  mean_coverage_loss_updates=0.000000
+  mean_coverage_samples_updates=0.000000
+  mean_coverage_buffer_size_during_updates=0.000
+  mean_coverage_region_entries_skipped=0.000
+  mean_coverage_region_student_conf=n/a
+  mean_coverage_region_teacher_conf=n/a
+  mean_coverage_region_conf_gap=n/a
+  coverage_reason_counts={}
+
+memory_adapter:
+  memory_adapter_enabled=1
+  memory_adapter_dim=16
+  memory_adapter_source_layer=21
+  memory_adapter_ema=0.950
+  memory_adapter_min_conf=0.800
+  memory_adapter_min_area_frac=0.001000
+  memory_adapter_update_on_accepted_only=1
+  memory_adapter_conditioning=film
+  memory_adapter_updates=2608
+  memory_adapter_initialized=1
+  memory_adapter_mean_norm=1.000000
+  memory_adapter_last_update_frame=6734
+  memory_adapter_trainable_params=17168
+  mean_memory_conditioning_norm=1.105443
+
+update_schedule:
+  update_every_frames=1
+  updates_per_event=1
+  mean_updates_per_event=1.000000
+  number_of_update_events=6660
+
+buffer_config:
+  buffer_size=32
+  update_batch_size=4
+  min_buffer_before_update=4
+  buffer_sample_mode=recent
+  max_updates_per_frame_legacy=1
+
+outputs:
+  csv=adapt_log.csv
+  summary=summary.txt
+  final_student_weights=student_final.pt
+  plot_teacher_vs_student_conf.png
+  plot_conf_gap.png
+  plot_conf_gap_roll.png
+  plot_teacher_conf_roll.png
+  plot_student_conf_roll.png
+  plot_accept_rate_roll.png
+  plot_update_count_roll.png
+  plot_accept_update_flags.png
+  plot_buffer_size.png
+  plot_selected_rank.png
+  plot_selected_score_roll.png
+  plot_batch_size_used.png
+  plot_det_loss.png
+  plot_coverage_loss.png
+  plot_coverage_region_loss.png
+  plot_coverage_region_conf_gap.png
+  plot_coverage_buffer_size.png
+  plot_memory_adapter_norm.png
+  plot_memory_adapter_updates.png
+  hist_conf_gap.png
+  hist_update_latency.png
+  selected_rank_gt1_dir=selected_rank_gt1 (8 saved)
+
+intermediate_checkpoints:
+  checkpoints/student_frame_000500.pt
+  checkpoints/student_frame_001000.pt
+  checkpoints/student_frame_001500.pt
+  checkpoints/student_frame_002000.pt
+  checkpoints/student_frame_002500.pt
+  checkpoints/student_frame_003000.pt
+  checkpoints/student_frame_003500.pt
+  checkpoints/student_frame_004000.pt
+  checkpoints/student_frame_004500.pt
+  checkpoints/student_frame_005000.pt
+  checkpoints/student_frame_005500.pt
+  checkpoints/student_frame_006000.pt
+  checkpoints/student_frame_006500.pt

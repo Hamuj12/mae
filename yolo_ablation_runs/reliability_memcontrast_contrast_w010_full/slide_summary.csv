@@ -1,0 +1,6 @@
+dataset,model,det_rate_at_conf_pct,mean_top1_conf,median_top1_conf,p90_top1_conf,p99_top1_conf,std_top1_conf,delta_det_rate_vs_baseline_pp,delta_mean_top1_conf_vs_baseline,delta_det_rate_vs_odad_baseline_pp,delta_mean_top1_conf_vs_odad_baseline
+lab,fda_mix,98.25,0.7710,0.8178,0.9250,0.9509,0.1653,,,,
+lab,adapter_base,84.48,0.7175,0.8741,0.9700,0.9866,0.3179,,,,
+lab,current_odad,87.04,0.7337,0.8943,0.9947,0.9984,0.3157,,,,
+lab,membank_prev,85.61,0.7161,0.8616,0.9672,0.9820,0.3086,,,,
+lab,memcontrast_candidate,85.21,0.7195,0.8654,0.9721,0.9869,0.3126,,,,

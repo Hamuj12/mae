@@ -1,0 +1,7 @@
+policy,frame,image_path,conf,x1,y1,x2,y2,box_area_frac,weird,border,tiny,large,threshold_used,reason_accepted,manual_label_blank
+adaptive_025_to_005_strict,17,/home/hm25936/datasets_for_yolo/lab_images_6000/images/test/img_00018.jpg,0.1466,696.68,514.62,1053.94,781.09,0.040438,0,0,0,0,0.05,strict_low_conf_accept; prev_iou=0.764; center_shift=0.009; area_ratio=1.31; next_iou=0.841; next_center_shift=0.012; next_area_ratio=1.18,
+adaptive_025_to_005_strict,25,/home/hm25936/datasets_for_yolo/lab_images_6000/images/test/img_00026.jpg,0.2085,696.57,506.88,1089.23,772.08,0.044233,0,0,0,0,0.05,strict_low_conf_accept; prev_iou=0.929; center_shift=0.004; area_ratio=1.08; next_iou=0.832; next_center_shift=0.013; next_area_ratio=1.15,
+adaptive_025_to_015_stable,25,/home/hm25936/datasets_for_yolo/lab_images_6000/images/test/img_00026.jpg,0.2085,696.57,506.88,1089.23,772.08,0.044233,0,0,0,0,0.15,stable_low_conf_accept; prev_iou=0.929; center_shift=0.004; area_ratio=1.08,
+hysteresis_policy,25,/home/hm25936/datasets_for_yolo/lab_images_6000/images/test/img_00026.jpg,0.2085,696.57,506.88,1089.23,772.08,0.044233,0,0,0,0,0.15,hysteresis_low_conf_accept; prev_iou=0.929; center_shift=0.004; area_ratio=1.08,
+static_015,8,/home/hm25936/datasets_for_yolo/lab_images_6000/images/test/img_00009.jpg,0.2213,768.12,68.24,1232.37,349.52,0.055468,0,0,0,0,0.15,conf 0.221 >= 0.15,
+static_015,25,/home/hm25936/datasets_for_yolo/lab_images_6000/images/test/img_00026.jpg,0.2085,696.57,506.88,1089.23,772.08,0.044233,0,0,0,0,0.15,conf 0.208 >= 0.15,

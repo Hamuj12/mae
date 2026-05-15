@@ -1,0 +1,17 @@
+Paired failure summary
+
+Memory-bank threshold points:
+  conf 0.25: det=85.6% weird=6.2% jump=3.0% bad=18.2% max_bad=67
+  conf 0.20: det=86.9% weird=6.2% jump=3.0% bad=17.2% max_bad=67
+  conf 0.15: det=88.4% weird=6.2% jump=3.0% bad=16.0% max_bad=51
+  conf 0.10: det=90.3% weird=6.2% jump=3.0% bad=14.5% max_bad=49
+  conf 0.05: det=93.0% weird=6.2% jump=3.0% bad=12.3% max_bad=46
+
+Paired category counts:
+  fda_mix_good_membank_bad: 2530
+  membank_good_fda_mix_bad: 3773
+  current_odad_good_membank_bad: 288
+  adapter_bad_membank_good: 450
+  membank_low_conf_candidate: 227
+  membank_no_detection_or_tiny_conf: 1965
+  membank_weird_or_border: 1251

@@ -1,0 +1,13 @@
+ODAD reporting notes
+
+Source of truth:
+- yolo_ablation_runs/membank_threshold_policy_eval/policy_summary.csv
+- yolo_ablation_runs/membank_threshold_policy_eval/operating_point_recommendation.txt
+
+Recommended report point:
+- Memory-bank ODAD, static confidence threshold 0.15.
+- det=88.4%, weird=6.2%, box_jump=3.0%, bad=16.0%, max_bad_streak=51.
+
+Use caveat:
+- Weird, jump, bad, and streak metrics are proxy reliability metrics over the ordered lab-image stream, not label-aware accuracy.
+- Static 0.05 improves detection/bad proxy numerically but is reserved for manual review because of occasional flare/overexposed-region boxes.

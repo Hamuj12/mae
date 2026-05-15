@@ -1,0 +1,47 @@
+Dataset: Lab
+root: /home/hm25936/datasets_for_yolo/lab_images_6000
+eval_images: 6735
+conf_threshold (for det_rate): 0.250
+iou: 0.450
+
+Reliability mode:
+  labels:              YOLO labels not found at /home/hm25936/datasets_for_yolo/lab_images_6000/labels/test; using proxy reliability metrics only.
+
+[FDA-mix]
+  det_rate@conf:       98.2%  (6617/6735)
+  top1_conf mean/med:  0.771 / 0.818
+  top1_conf std:       0.165
+  top1_conf p90/p99:   0.925 / 0.951
+  mean ± 2σ:           [0.440, 1.102]
+  mean ± 3σ:           [0.275, 1.267]
+  hist:                hist_top1conf_fda_mix.png
+
+[Adapter Base]
+  det_rate@conf:       84.5%  (5690/6735)
+  top1_conf mean/med:  0.718 / 0.874
+  top1_conf std:       0.318
+  top1_conf p90/p99:   0.970 / 0.987
+  mean ± 2σ:           [0.082, 1.353]
+  mean ± 3σ:           [-0.236, 1.671]
+  hist:                hist_top1conf_adapter_base.png
+
+[Current Odad]
+  det_rate@conf:       87.0%  (5862/6735)
+  top1_conf mean/med:  0.734 / 0.894
+  top1_conf std:       0.316
+  top1_conf p90/p99:   0.995 / 0.998
+  mean ± 2σ:           [0.102, 1.365]
+  mean ± 3σ:           [-0.214, 1.681]
+  hist:                hist_top1conf_current_odad.png
+
+[Mem Adapter Candidate]
+  det_rate@conf:       81.5%  (5491/6735)
+  top1_conf mean/med:  0.699 / 0.877
+  top1_conf std:       0.343
+  top1_conf p90/p99:   0.977 / 0.989
+  mean ± 2σ:           [0.013, 1.385]
+  mean ± 3σ:           [-0.330, 1.728]
+  hist:                hist_top1conf_mem_adapter_candidate.png
+
+Slide-ready artifacts:
+  cdf:                 cdf_top1conf_lab.png

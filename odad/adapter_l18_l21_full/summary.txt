@@ -1,0 +1,137 @@
+Online Adaptation Summary
+
+startup:
+  adaptation_mode=adapter
+  update_scope=head_only
+  neck_start_idx=10
+  head_idx=22
+  adapter_enabled=1
+  adapter_layers=18,21
+  adapter_reduction=8
+  adapter_min_channels=8
+  adapter_scale=1.000
+  adapter_train_detect_head=0
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  update_every_frames=1
+  updates_per_event=1
+  max_updates_per_frame_legacy=1
+  save_checkpoints_every=500
+  save_final_weights=1
+  final_weights_name=student_final.pt
+  unfrozen_modules=[18:ResidualConvAdapter(C=128, hidden=16, params=4240, scale=1), 21:ResidualConvAdapter(C=256, hidden=32, params=16672, scale=1)]
+  adapter_trainable_params=20912
+  trainable_params=20912
+
+weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+total_frames=6735
+accepted_frames=2622
+updates_applied=6660
+number_of_update_events=6660
+optimizer_update_steps=6660
+adaptation_mode=adapter
+adapter_trainable_params=20912
+trainable_params=20912
+mean_teacher_conf=0.596335
+mean_student_post_conf=0.618942
+mean_detection_loss_updates=6.289968
+mean_total_loss_updates=6.289968
+mean_buffer_size_during_updates=31.932
+
+resource_metrics:
+  mean_update_latency_ms=571.608
+  peak_cuda_allocated_mb=333.2
+  peak_cuda_reserved_mb=434.0
+  final_checkpoint_size_mb=5.958
+  checkpoint_reload_status=ok
+
+teacher_vs_student:
+  mean_conf_gap=0.022607
+  median_conf_gap=0.014917
+  fraction_frames_student_gt_teacher=0.684039
+  fraction_frames_student_lt_teacher=0.303786
+  mean_accept_rate_roll=0.382025
+  mean_batch_size_used_on_updates=4.000000
+
+reliability_gates:
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  number_of_checkpoints_saved=13
+
+teacher_candidate_selection:
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  mean_num_candidates=0.872012
+  mean_selected_rank=1.018494
+  fraction_selected_rank_gt1=0.018494
+  mean_selected_score=1.583503
+  selected_rank_gt1_frames=97
+  selected_rank_gt1_examples_saved=8
+
+update_schedule:
+  update_every_frames=1
+  updates_per_event=1
+  mean_updates_per_event=1.000000
+  number_of_update_events=6660
+
+buffer_config:
+  buffer_size=32
+  update_batch_size=4
+  min_buffer_before_update=4
+  buffer_sample_mode=recent
+  max_updates_per_frame_legacy=1
+
+outputs:
+  csv=adapt_log.csv
+  summary=summary.txt
+  final_student_weights=student_final.pt
+  plot_teacher_vs_student_conf.png
+  plot_conf_gap.png
+  plot_conf_gap_roll.png
+  plot_teacher_conf_roll.png
+  plot_student_conf_roll.png
+  plot_accept_rate_roll.png
+  plot_update_count_roll.png
+  plot_accept_update_flags.png
+  plot_buffer_size.png
+  plot_selected_rank.png
+  plot_selected_score_roll.png
+  plot_batch_size_used.png
+  plot_det_loss.png
+  hist_conf_gap.png
+  hist_update_latency.png
+  selected_rank_gt1_dir=selected_rank_gt1 (8 saved)
+
+intermediate_checkpoints:
+  checkpoints/student_frame_000500.pt
+  checkpoints/student_frame_001000.pt
+  checkpoints/student_frame_001500.pt
+  checkpoints/student_frame_002000.pt
+  checkpoints/student_frame_002500.pt
+  checkpoints/student_frame_003000.pt
+  checkpoints/student_frame_003500.pt
+  checkpoints/student_frame_004000.pt
+  checkpoints/student_frame_004500.pt
+  checkpoints/student_frame_005000.pt
+  checkpoints/student_frame_005500.pt
+  checkpoints/student_frame_006000.pt
+  checkpoints/student_frame_006500.pt

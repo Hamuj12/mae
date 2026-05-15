@@ -1,0 +1,1 @@
+Recommended operating point: conf=0.05. Lowering the threshold recovers the detection target while keeping proxy reliability within limits, so the main issue looks like confidence calibration/operating threshold rather than capability.

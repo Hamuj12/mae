@@ -1,0 +1,11 @@
+ODAD threshold policy summary
+
+policy, det, weird, accepted_weird, jump, bad, max_bad, p95_bad, low_conf_accepts, low_conf_weird, low_conf_jump
+static_025: det=85.6% weird=6.2% accepted_weird=3.3% jump=3.0% bad=18.2% max_bad=67 p95_bad=20.9 low_accept=0.0% low_weird=nan% low_jump=nan%
+static_020: det=86.9% weird=6.2% accepted_weird=3.5% jump=3.0% bad=17.2% max_bad=67 p95_bad=20.9 low_accept=1.3% low_weird=19.1% low_jump=7.9%
+static_015: det=88.4% weird=6.2% accepted_weird=3.8% jump=3.0% bad=16.0% max_bad=51 p95_bad=20.2 low_accept=2.8% low_weird=18.0% low_jump=7.9%
+static_010: det=90.3% weird=6.2% accepted_weird=4.1% jump=3.0% bad=14.5% max_bad=49 p95_bad=19.3 low_accept=4.7% low_weird=17.5% low_jump=8.6%
+static_005: det=93.0% weird=6.2% accepted_weird=4.4% jump=3.0% bad=12.3% max_bad=46 p95_bad=20.1 low_accept=7.4% low_weird=16.0% low_jump=10.2%
+adaptive_025_to_015_stable: det=87.6% weird=6.2% accepted_weird=3.3% jump=3.0% bad=16.2% max_bad=67 p95_bad=20.3 low_accept=2.0% low_weird=0.0% low_jump=2.3%
+adaptive_025_to_005_strict: det=87.7% weird=6.2% accepted_weird=3.3% jump=3.0% bad=16.2% max_bad=67 p95_bad=23.5 low_accept=2.1% low_weird=0.0% low_jump=3.6%
+hysteresis_policy: det=86.4% weird=6.2% accepted_weird=3.3% jump=3.0% bad=17.4% max_bad=67 p95_bad=21.8 low_accept=0.8% low_weird=0.0% low_jump=0.0%

@@ -1,0 +1,31 @@
+Checkpoint Selection Summary
+
+active_reference=/home/hm25936/mae/odad/online_adapt_topk2_full/student_final.pt
+active_reference_kind=current_odad
+active_final_reference=/home/hm25936/mae/odad/online_adapt_topk2_full/student_final.pt
+active_final_kind=current_odad
+eval_frames=500
+checkpoint_count_available=13
+checkpoint_count_evaluated=13
+checkpoint_selection_stride=1
+checkpoint_selection_max_checkpoints=0
+
+active_reference_metrics:
+  det_rate_at_conf=0.9680
+  weird_box_rate=0.2780
+  high_conf_weird_rate=0.1300
+  box_jump_rate=0.1380
+  max_bad_streak=51
+  max_good_streak=129
+  composite_score=0.687500
+
+best_checkpoints:
+  best_det_rate: frame=5500 det=0.9680 weird=0.1720 high_conf_weird=0.0460 box_jump=0.0380 max_bad=78 max_good=235 score=0.909500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_005500.pt
+  best_composite_score: frame=5500 det=0.9680 weird=0.1720 high_conf_weird=0.0460 box_jump=0.0380 max_bad=78 max_good=235 score=0.909500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_005500.pt
+  best_reliability_given_det_floor_95: frame=5500 det=0.9680 weird=0.1720 high_conf_weird=0.0460 box_jump=0.0380 max_bad=78 max_good=235 score=0.909500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_005500.pt
+  best_reliability_given_det_floor_93: frame=5500 det=0.9680 weird=0.1720 high_conf_weird=0.0460 box_jump=0.0380 max_bad=78 max_good=235 score=0.909500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_005500.pt
+  best_max_good_streak: frame=5500 det=0.9680 weird=0.1720 high_conf_weird=0.0460 box_jump=0.0380 max_bad=78 max_good=235 score=0.909500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_005500.pt
+  best_min_bad_streak: frame=6000 det=0.8720 weird=0.1340 high_conf_weird=0.0200 box_jump=0.0740 max_bad=39 max_good=174 score=0.835500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_006000.pt
+  best_edge_feasible_score_if_latency_memory_available: frame=5500 det=0.9680 weird=0.1720 high_conf_weird=0.0460 box_jump=0.0380 max_bad=78 max_good=235 score=0.909500 checkpoint=/home/hm25936/mae/odad/shadow_manager_odad_active_full_diagnostic/checkpoints/shadow_frame_005500.pt
+
+edge_feasible_note=latency and memory budgets are disabled, so edge-feasible ranking is unconstrained.

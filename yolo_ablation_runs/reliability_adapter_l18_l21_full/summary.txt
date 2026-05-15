@@ -1,0 +1,77 @@
+YOLO Ablation (Top-1 Confidence Stats)
+device=cuda:0
+conf_threshold=0.250 iou=0.450
+n_vis_per_dataset=8 eval_images_per_dataset=all bins=30
+reliability_mode=true
+ordered_eval=True
+use_labels=auto
+gallery_models=fda_mix
+
+Datasets:
+  - lab: /home/hm25936/datasets_for_yolo/lab_images_6000
+
+==== Lab ====
+eval_images: 6735
+conf_threshold (for det_rate): 0.250
+iou: 0.450
+
+Reliability mode:
+  labels:              YOLO labels not found at /home/hm25936/datasets_for_yolo/lab_images_6000/labels/test; using proxy reliability metrics only.
+
+[FDA-mix]
+  det_rate@conf:       98.2%  (6617/6735)
+  top1_conf mean/med:  0.771 / 0.818
+  top1_conf std:       0.165
+  top1_conf p90/p99:   0.925 / 0.951
+  mean ± 2σ:           [0.440, 1.102]
+  mean ± 3σ:           [0.275, 1.267]
+  hist:                hist_top1conf_fda_mix.png
+
+[Adapter Candidate]
+  det_rate@conf:       84.5%  (5690/6735)
+  top1_conf mean/med:  0.718 / 0.874
+  top1_conf std:       0.318
+  top1_conf p90/p99:   0.970 / 0.987
+  mean ± 2σ:           [0.082, 1.353]
+  mean ± 3σ:           [-0.236, 1.671]
+  hist:                hist_top1conf_adapter_candidate.png
+
+[Current Odad]
+  det_rate@conf:       87.0%  (5862/6735)
+  top1_conf mean/med:  0.734 / 0.894
+  top1_conf std:       0.316
+  top1_conf p90/p99:   0.995 / 0.998
+  mean ± 2σ:           [0.102, 1.365]
+  mean ± 3σ:           [-0.214, 1.681]
+  hist:                hist_top1conf_current_odad.png
+
+Slide-ready artifacts:
+  cdf:                 cdf_top1conf_lab.png
+
+
+==== Slide-ready artifacts ====
+  grouped_bar_det_rate.png
+  grouped_bar_mean_conf.png
+  cdf_top1conf_lab.png
+  precision_style_rank_plot.png
+  slide_summary.csv
+  slide_summary.tex
+  odad_delta_summary.txt
+
+==== Reliability artifacts ====
+  reliability_summary.csv
+  reliability_summary.txt
+  temporal_reliability_summary.csv
+  paired_failure_summary.csv
+  reliability_bar_weird_box_rate.png
+  temporal_box_jump_rate.png
+  failure_streaks_by_model.png
+  reliability_galleries/
+
+==== Full-stream streak artifacts ====
+  full_stream_reliability_summary.csv
+  full_stream_reliability_summary.txt
+  full_stream_streaks.csv
+  streak_diagnostics/bad_streaks_all.csv
+  streak_diagnostics/top_bad_streaks_summary.txt
+  streak_contact_sheets=18

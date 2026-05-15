@@ -1,0 +1,9 @@
+model,policy,conf,det_rate,weird_rate,box_jump_rate,bad_rate,max_bad_streak,note
+FDA-mix,static_025,0.25,0.982,0.215,0.019,0.235,41,High detection baseline; reliability proxy failures remain elevated.
+Current ODAD,static_025,0.25,0.87,0.363,0.091,0.459,198,Existing ODAD baseline at default threshold.
+Adapter Base,static_025,0.25,0.844840407371521,0.06310319155454636,0.031185030937194824,0.19465479254722595,71,Adapter baseline from reliability_adapter_l18_l21_full full-stream summary.
+Memory-bank ODAD,static_025,0.25,0.8561246991157532,0.0619153678417205,0.0301455296576023,0.1817371994256973,67,Default threshold; under-confident for memory-bank ODAD.
+Memory-bank ODAD,static_020,0.20,0.8693392872810364,0.0619153678417205,0.0301455296576023,0.1716406792402267,67,Intermediate threshold in static sweep.
+Memory-bank ODAD,static_015,0.15,0.8841871023178101,0.0619153678417205,0.0301455296576023,0.1596139520406723,51,Recommended reportable/deployable operating point.
+Memory-bank ODAD,static_010,0.10,0.902746856212616,0.0619153678417205,0.0301455296576023,0.1447661519050598,49,Higher-recall static point; not selected as main report point.
+Memory-bank ODAD,static_005,0.05,0.930215299129486,0.0619153678417205,0.0301455296576023,0.1230883449316024,46,Aggressive/manual-review candidate only.

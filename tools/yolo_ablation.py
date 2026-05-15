@@ -340,6 +340,29 @@ def parse_args() -> argparse.Namespace:
         default=2.5,
         help="Symmetric area ratio threshold for temporal box-size jump events.",
     )
+    parser.add_argument(
+        "--streak-diagnostics",
+        action="store_true",
+        help="Enable detailed good/bad streak segment diagnostics.",
+    )
+    parser.add_argument(
+        "--streak-topk",
+        type=int,
+        default=5,
+        help="Number of longest bad streaks to summarize/visualize per model.",
+    )
+    parser.add_argument(
+        "--streak-contact-sheet-every",
+        type=int,
+        default=5,
+        help="Sample every Nth frame inside a streak for contact sheet visualization.",
+    )
+    parser.add_argument(
+        "--streak-contact-sheet-max-frames",
+        type=int,
+        default=18,
+        help="Maximum frames per streak contact sheet.",
+    )
     return parser.parse_args()
 
 
@@ -515,6 +538,11 @@ def safe_mean(values: Sequence[float]) -> float:
 def safe_median(values: Sequence[float]) -> float:
     arr = np.asarray([v for v in values if np.isfinite(v)], dtype=np.float32)
     return float(np.median(arr)) if arr.size else float("nan")
+
+
+def safe_percentile(values: Sequence[float], q: float) -> float:
+    arr = np.asarray([v for v in values if np.isfinite(v)], dtype=np.float32)
+    return float(np.percentile(arr, q)) if arr.size else float("nan")
 
 
 def safe_rate(flags: Sequence[bool]) -> float:
@@ -1663,6 +1691,322 @@ def save_gallery_strip(
     return output_path
 
 
+def proxy_reason_text(state: Mapping[str, bool]) -> str:
+    reasons = []
+    if state.get("low_conf"):
+        reasons.append("low")
+    if state.get("weird"):
+        reasons.append("weird")
+    if state.get("box_jump"):
+        reasons.append("jump")
+    return ",".join(reasons) if reasons else "clean"
+
+
+def overlay_proxy_status(panel: Image.Image, status: str, reason: str) -> Image.Image:
+    draw = ImageDraw.Draw(panel)
+    small_font = load_gallery_font(12, bold=True)
+    color = "#DC2626" if status == "BAD" else "#16A34A"
+    text = f"{status} {reason}" if reason else status
+    bbox = draw.textbbox((0, 0), text, font=small_font)
+    pad_x = 5
+    pad_y = 3
+    x2 = panel.width - 8
+    y1 = 27
+    x1 = max(8, x2 - (bbox[2] - bbox[0]) - 2 * pad_x)
+    y2 = y1 + (bbox[3] - bbox[1]) + 2 * pad_y
+    draw.rectangle((x1, y1, x2, y2), fill=color)
+    draw.text((x1 + pad_x, y1 + pad_y - 1), text, font=small_font, fill="white")
+    return panel
+
+
+def sample_streak_indices(start_idx: int, end_idx: int, every: int, max_frames: int) -> List[int]:
+    every = max(1, int(every))
+    max_frames = max(1, int(max_frames))
+    indices = list(range(int(start_idx), int(end_idx) + 1, every))
+    if int(end_idx) not in indices:
+        indices.append(int(end_idx))
+    indices = sorted(set(indices))
+    if len(indices) > max_frames:
+        indices = sorted(set(int(v) for v in np.linspace(int(start_idx), int(end_idx), num=max_frames)))
+    return indices
+
+
+def save_streak_contact_sheet(
+    dataset_name: str,
+    focus_model_name: str,
+    row: Mapping[str, object],
+    records_by_model: Mapping[str, Sequence[Top1PredictionRecord]],
+    temporal_records_by_model: Mapping[str, Sequence[TemporalPredictionRecord]],
+    model_names_for_sheet: Sequence[str],
+    output_path: Path,
+    conf_threshold: float,
+    good_conf: float,
+    bad_conf: float,
+    bad_iou: float,
+    every: int,
+    max_frames: int,
+) -> Path:
+    start_idx = int(row["start_index"])
+    end_idx = int(row["end_index"])
+    sampled_indices = sample_streak_indices(start_idx, end_idx, every=every, max_frames=max_frames)
+    focus_records = records_by_model[focus_model_name]
+    panels_by_row: List[List[Image.Image]] = []
+
+    for image_idx in sampled_indices:
+        image_path = focus_records[image_idx].image_path
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+        row_panels: List[Image.Image] = [
+            render_gallery_panel(
+                image=image,
+                title=f"Input f{image_idx + 1}",
+                record=None,
+                label_record=None,
+                label_aware=None,
+                good_conf=good_conf,
+                bad_conf=bad_conf,
+                bad_iou=bad_iou,
+                is_input=True,
+            )
+        ]
+        for model_name in model_names_for_sheet:
+            model_records = records_by_model.get(model_name)
+            model_temporal = temporal_records_by_model.get(model_name)
+            if model_records is None or model_temporal is None or image_idx >= len(model_records):
+                continue
+            record = model_records[image_idx]
+            temporal_record = model_temporal[image_idx] if image_idx < len(model_temporal) else None
+            state = proxy_state_for_frame(
+                record,
+                temporal_record,
+                conf_threshold=conf_threshold,
+                good_conf=good_conf,
+            )
+            status = "BAD" if state["bad"] else "GOOD"
+            reason = proxy_reason_text(state)
+            panel = render_gallery_panel(
+                image=image,
+                title=display_name(model_name),
+                record=record,
+                label_record=None,
+                label_aware=None,
+                good_conf=good_conf,
+                bad_conf=bad_conf,
+                bad_iou=bad_iou,
+            )
+            row_panels.append(overlay_proxy_status(panel, status=status, reason=reason))
+        panels_by_row.append(row_panels)
+
+    if not panels_by_row:
+        raise RuntimeError(f"No frames available for streak contact sheet: {output_path}")
+
+    title_font = load_gallery_font(18, bold=True)
+    small_font = load_gallery_font(13, bold=False)
+    title_h = 58
+    row_gap = 8
+    widths = [sum(panel.width for panel in panels) for panels in panels_by_row]
+    row_heights = [max(panel.height for panel in panels) for panels in panels_by_row]
+    sheet_w = max(widths)
+    sheet_h = title_h + sum(row_heights) + row_gap * (len(row_heights) - 1)
+    sheet = Image.new("RGB", (sheet_w, sheet_h), "white")
+    draw = ImageDraw.Draw(sheet)
+    title = (
+        f"{dataset_name} | {display_name(focus_model_name)} bad streak "
+        f"rank {int(row['rank_by_model_length'])} | frames {int(row['start_frame'])}-{int(row['end_frame'])} "
+        f"({int(row['length'])} frames)"
+    )
+    draw.text((10, 7), title, font=title_font, fill="#0F172A")
+    reason = (
+        f"low={row.get('low_conf_count')} weird={row.get('weird_count')} "
+        f"jump={row.get('box_jump_count')} high-conf-weird={row.get('high_conf_weird_count')}"
+    )
+    draw.text((10, 33), reason, font=small_font, fill="#334155")
+
+    y = title_h
+    for panels, row_h in zip(panels_by_row, row_heights):
+        x = 0
+        for panel in panels:
+            sheet.paste(panel, (x, y))
+            x += panel.width
+        y += row_h + row_gap
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+    return output_path
+
+
+def write_full_stream_reliability_outputs(
+    rows: Sequence[Mapping[str, object]],
+    output_root: Path,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    fieldnames = [
+        "dataset",
+        "dataset_label",
+        "model",
+        "model_label",
+        "n_images",
+        "det_rate_at_conf",
+        "mean_top1_conf",
+        "median_top1_conf",
+        "low_conf_rate",
+        "no_detection_rate",
+        "weird_box_rate",
+        "high_conf_weird_rate",
+        "box_jump_rate",
+        "bad_frame_rate",
+        "good_frame_rate",
+        "bad_streak_count",
+        "max_bad_streak",
+        "mean_bad_streak_len",
+        "p90_bad_streak_len",
+        "p95_bad_streak_len",
+        "bad_streaks_gt_10",
+        "bad_streaks_gt_30",
+        "bad_streaks_gt_50",
+        "bad_streaks_gt_80",
+        "good_streak_count",
+        "max_good_streak",
+        "mean_good_streak_len",
+        "p90_good_streak_len",
+        "p95_good_streak_len",
+    ]
+    csv_path = write_csv_rows(rows, output_root / "full_stream_reliability_summary.csv", fieldnames)
+    if not rows:
+        return csv_path, None
+
+    lines = ["Full Stream Reliability Summary", ""]
+    for dataset_name in sorted({str(row["dataset"]) for row in rows}):
+        lines.append(f"Dataset: {dataset_name}")
+        lines.append(
+            "model, frames, det@0.25, weird, high_conf_weird, box_jump, bad_rate, "
+            "max_bad, p95_bad, long>50, max_good"
+        )
+        for row in [r for r in rows if str(r["dataset"]) == dataset_name]:
+            lines.append(
+                f"{row['model']}, {int(row['n_images'])}, "
+                f"{100.0 * safe_float(row.get('det_rate_at_conf')):.1f}%, "
+                f"{100.0 * safe_float(row.get('weird_box_rate')):.1f}%, "
+                f"{100.0 * safe_float(row.get('high_conf_weird_rate')):.1f}%, "
+                f"{100.0 * safe_float(row.get('box_jump_rate')):.1f}%, "
+                f"{100.0 * safe_float(row.get('bad_frame_rate')):.1f}%, "
+                f"{safe_float(row.get('max_bad_streak'), 0.0):.0f}, "
+                f"{safe_float(row.get('p95_bad_streak_len'), 0.0):.1f}, "
+                f"{int(safe_float(row.get('bad_streaks_gt_50'), 0.0))}, "
+                f"{safe_float(row.get('max_good_streak'), 0.0):.0f}"
+            )
+        lines.append("")
+    txt_path = output_root / "full_stream_reliability_summary.txt"
+    txt_path.write_text("\n".join(lines), encoding="utf-8")
+    return csv_path, txt_path
+
+
+def write_streak_diagnostics_outputs(
+    all_streak_rows: Sequence[Mapping[str, object]],
+    output_root: Path,
+    records_by_dataset_model: Mapping[str, Mapping[str, Sequence[Top1PredictionRecord]]],
+    temporal_by_dataset_model: Mapping[str, Mapping[str, Sequence[TemporalPredictionRecord]]],
+    model_names: Sequence[str],
+    args: argparse.Namespace,
+) -> Tuple[Optional[Path], Optional[Path], List[Path]]:
+    if not all_streak_rows:
+        return None, None, []
+
+    fieldnames: List[str] = []
+    for row in all_streak_rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    full_streaks_path = write_csv_rows(all_streak_rows, output_root / "full_stream_streaks.csv", fieldnames)
+    diag_root = output_root / "streak_diagnostics"
+    diag_root.mkdir(parents=True, exist_ok=True)
+    diag_csv_path = write_csv_rows(all_streak_rows, diag_root / "bad_streaks_all.csv", fieldnames)
+
+    lines = ["Top Bad Streak Diagnostics", ""]
+    contact_sheet_paths: List[Path] = []
+    comparison_model_names = list(model_names)
+    topk = max(0, int(args.streak_topk))
+    for dataset_name in sorted({str(row["dataset"]) for row in all_streak_rows}):
+        lines.append(f"Dataset: {dataset_name}")
+        for model_name in model_names:
+            rows = [
+                row
+                for row in all_streak_rows
+                if str(row["dataset"]) == dataset_name
+                and str(row["model"]) == model_name
+                and int(row["rank_by_model_length"]) <= topk
+            ]
+            if not rows:
+                continue
+            lines.append(f"  {model_name}:")
+            for row in rows:
+                compare_bits = []
+                for compare_name in ("fda_mix", "current_odad", "odad_final"):
+                    prefix = sanitize_filename(compare_name)
+                    if f"{prefix}_bad_count" in row:
+                        compare_bits.append(
+                            f"{compare_name}_bad={row.get(f'{prefix}_bad_count')}/{int(row['length'])}"
+                        )
+                compare_text = ", ".join(compare_bits) if compare_bits else "comparison=n/a"
+                lines.append(
+                    "    "
+                    f"rank={int(row['rank_by_model_length'])} frames={int(row['start_frame'])}-{int(row['end_frame'])} "
+                    f"len={int(row['length'])} low={row.get('low_conf_count')} weird={row.get('weird_count')} "
+                    f"jump={row.get('box_jump_count')} high_conf_weird={row.get('high_conf_weird_count')} "
+                    f"{compare_text}"
+                )
+                if bool(args.streak_diagnostics):
+                    model_dir = diag_root / sanitize_filename(model_name)
+                    focus_path = model_dir / (
+                        f"streak_{int(row['rank_by_model_length'])}_frames_"
+                        f"{int(row['start_frame'])}_{int(row['end_frame'])}.png"
+                    )
+                    comparison_path = model_dir / (
+                        f"streak_{int(row['rank_by_model_length'])}_comparison_contact_sheet.png"
+                    )
+                    records_by_model = records_by_dataset_model[dataset_name]
+                    temporal_by_model = temporal_by_dataset_model[dataset_name]
+                    contact_sheet_paths.append(
+                        save_streak_contact_sheet(
+                            dataset_name=dataset_name,
+                            focus_model_name=model_name,
+                            row=row,
+                            records_by_model=records_by_model,
+                            temporal_records_by_model=temporal_by_model,
+                            model_names_for_sheet=[model_name],
+                            output_path=focus_path,
+                            conf_threshold=float(args.conf),
+                            good_conf=float(args.good_conf),
+                            bad_conf=float(args.bad_conf),
+                            bad_iou=float(args.bad_iou),
+                            every=int(args.streak_contact_sheet_every),
+                            max_frames=int(args.streak_contact_sheet_max_frames),
+                        )
+                    )
+                    contact_sheet_paths.append(
+                        save_streak_contact_sheet(
+                            dataset_name=dataset_name,
+                            focus_model_name=model_name,
+                            row=row,
+                            records_by_model=records_by_model,
+                            temporal_records_by_model=temporal_by_model,
+                            model_names_for_sheet=comparison_model_names,
+                            output_path=comparison_path,
+                            conf_threshold=float(args.conf),
+                            good_conf=float(args.good_conf),
+                            bad_conf=float(args.bad_conf),
+                            bad_iou=float(args.bad_iou),
+                            every=int(args.streak_contact_sheet_every),
+                            max_frames=int(args.streak_contact_sheet_max_frames),
+                        )
+                    )
+        lines.append("")
+
+    summary_path = diag_root / "top_bad_streaks_summary.txt"
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return diag_csv_path or full_streaks_path, summary_path, contact_sheet_paths
+
+
 def select_paired_failure_examples(
     dataset_name: str,
     image_paths: Sequence[Path],
@@ -2131,6 +2475,232 @@ def failure_streak_lengths(flags: Sequence[bool]) -> List[int]:
     return lengths
 
 
+def proxy_state_for_frame(
+    record: Top1PredictionRecord,
+    temporal_record: Optional[TemporalPredictionRecord],
+    conf_threshold: float,
+    good_conf: float,
+) -> Dict[str, bool]:
+    low_conf = bool((not record.has_detection) or record.top1_conf < float(conf_threshold))
+    weird = prediction_is_weird(record)
+    box_jump = bool(temporal_record.box_jump) if temporal_record is not None else False
+    high_conf_weird = bool(record.top1_conf >= float(good_conf) and weird)
+    bad = bool(low_conf or weird or box_jump)
+    good = bool(record.has_detection and record.top1_conf >= float(conf_threshold) and not weird and not box_jump)
+    return {
+        "low_conf": low_conf,
+        "weird": weird,
+        "box_jump": box_jump,
+        "high_conf_weird": high_conf_weird,
+        "bad": bad,
+        "good": good,
+        "no_detection": bool(not record.has_detection),
+    }
+
+
+def proxy_states_for_records(
+    records: Sequence[Top1PredictionRecord],
+    temporal_records: Sequence[TemporalPredictionRecord],
+    conf_threshold: float,
+    good_conf: float,
+) -> List[Dict[str, bool]]:
+    states: List[Dict[str, bool]] = []
+    for idx, record in enumerate(records):
+        temporal_record = temporal_records[idx] if idx < len(temporal_records) else None
+        states.append(proxy_state_for_frame(record, temporal_record, conf_threshold, good_conf))
+    return states
+
+
+def contiguous_true_segments(flags: Sequence[bool]) -> List[Tuple[int, int, int]]:
+    segments: List[Tuple[int, int, int]] = []
+    start: Optional[int] = None
+    for idx, flag in enumerate(flags):
+        if flag and start is None:
+            start = idx
+        elif not flag and start is not None:
+            end = idx - 1
+            segments.append((start, end, end - start + 1))
+            start = None
+    if start is not None:
+        end = len(flags) - 1
+        segments.append((start, end, end - start + 1))
+    return segments
+
+
+def summarize_proxy_range(
+    records: Sequence[Top1PredictionRecord],
+    temporal_records: Sequence[TemporalPredictionRecord],
+    start_idx: int,
+    end_idx: int,
+    conf_threshold: float,
+    good_conf: float,
+) -> Dict[str, object]:
+    subset_records = list(records[int(start_idx) : int(end_idx) + 1])
+    subset_temporal = list(temporal_records[int(start_idx) : int(end_idx) + 1])
+    states = proxy_states_for_records(
+        subset_records,
+        subset_temporal,
+        conf_threshold=conf_threshold,
+        good_conf=good_conf,
+    )
+    bad_flags = [bool(state["bad"]) for state in states]
+    good_flags = [bool(state["good"]) for state in states]
+    bad_streaks = failure_streak_lengths(bad_flags)
+    good_streaks = failure_streak_lengths(good_flags)
+    n = len(subset_records)
+    return {
+        "n_frames": n,
+        "det_rate_at_conf": safe_rate([record.top1_conf >= float(conf_threshold) for record in subset_records]),
+        "mean_top1_conf": safe_mean([record.top1_conf for record in subset_records]),
+        "low_conf_count": int(sum(bool(state["low_conf"]) for state in states)),
+        "no_detection_count": int(sum(bool(state["no_detection"]) for state in states)),
+        "weird_count": int(sum(bool(state["weird"]) for state in states)),
+        "box_jump_count": int(sum(bool(state["box_jump"]) for state in states)),
+        "high_conf_weird_count": int(sum(bool(state["high_conf_weird"]) for state in states)),
+        "bad_count": int(sum(bad_flags)),
+        "good_count": int(sum(good_flags)),
+        "bad_rate": safe_rate(bad_flags),
+        "good_rate": safe_rate(good_flags),
+        "max_bad_streak": int(max(bad_streaks) if bad_streaks else 0),
+        "max_good_streak": int(max(good_streaks) if good_streaks else 0),
+    }
+
+
+def aggregate_proxy_stream_reliability(
+    dataset_name: str,
+    dataset_label: str,
+    model_name: str,
+    model_label: str,
+    records: Sequence[Top1PredictionRecord],
+    temporal_records: Sequence[TemporalPredictionRecord],
+    conf_threshold: float,
+    good_conf: float,
+) -> Dict[str, object]:
+    states = proxy_states_for_records(records, temporal_records, conf_threshold=conf_threshold, good_conf=good_conf)
+    bad_flags = [bool(state["bad"]) for state in states]
+    good_flags = [bool(state["good"]) for state in states]
+    weird_flags = [bool(state["weird"]) for state in states]
+    high_conf_weird_flags = [bool(state["high_conf_weird"]) for state in states]
+    box_jump_flags = [bool(state["box_jump"]) for state in states]
+    low_conf_flags = [bool(state["low_conf"]) for state in states]
+    no_detection_flags = [bool(state["no_detection"]) for state in states]
+    bad_streaks = failure_streak_lengths(bad_flags)
+    good_streaks = failure_streak_lengths(good_flags)
+    box_jump_denominator_flags = box_jump_flags[1:] if len(box_jump_flags) > 1 else box_jump_flags
+
+    row: Dict[str, object] = {
+        "dataset": dataset_name,
+        "dataset_label": dataset_label,
+        "model": model_name,
+        "model_label": model_label,
+        "n_images": len(records),
+        "det_rate_at_conf": safe_rate([record.top1_conf >= float(conf_threshold) for record in records]),
+        "mean_top1_conf": safe_mean([record.top1_conf for record in records]),
+        "median_top1_conf": safe_median([record.top1_conf for record in records]),
+        "low_conf_rate": safe_rate(low_conf_flags),
+        "no_detection_rate": safe_rate(no_detection_flags),
+        "weird_box_rate": safe_rate(weird_flags),
+        "high_conf_weird_rate": safe_rate(high_conf_weird_flags),
+        "box_jump_rate": safe_rate(box_jump_denominator_flags),
+        "bad_frame_rate": safe_rate(bad_flags),
+        "good_frame_rate": safe_rate(good_flags),
+        "bad_streak_count": len(bad_streaks),
+        "max_bad_streak": int(max(bad_streaks) if bad_streaks else 0),
+        "mean_bad_streak_len": safe_mean([float(length) for length in bad_streaks]),
+        "p90_bad_streak_len": safe_percentile([float(length) for length in bad_streaks], 90),
+        "p95_bad_streak_len": safe_percentile([float(length) for length in bad_streaks], 95),
+        "bad_streaks_gt_10": int(sum(length > 10 for length in bad_streaks)),
+        "bad_streaks_gt_30": int(sum(length > 30 for length in bad_streaks)),
+        "bad_streaks_gt_50": int(sum(length > 50 for length in bad_streaks)),
+        "bad_streaks_gt_80": int(sum(length > 80 for length in bad_streaks)),
+        "good_streak_count": len(good_streaks),
+        "max_good_streak": int(max(good_streaks) if good_streaks else 0),
+        "mean_good_streak_len": safe_mean([float(length) for length in good_streaks]),
+        "p90_good_streak_len": safe_percentile([float(length) for length in good_streaks], 90),
+        "p95_good_streak_len": safe_percentile([float(length) for length in good_streaks], 95),
+    }
+    return row
+
+
+def build_bad_streak_rows(
+    dataset_name: str,
+    dataset_label: str,
+    records_by_model: Mapping[str, Sequence[Top1PredictionRecord]],
+    temporal_records_by_model: Mapping[str, Sequence[TemporalPredictionRecord]],
+    model_names: Sequence[str],
+    conf_threshold: float,
+    good_conf: float,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for model_name in model_names:
+        records = records_by_model.get(model_name)
+        temporal_records = temporal_records_by_model.get(model_name)
+        if records is None or temporal_records is None:
+            continue
+        states = proxy_states_for_records(records, temporal_records, conf_threshold=conf_threshold, good_conf=good_conf)
+        bad_segments = contiguous_true_segments([bool(state["bad"]) for state in states])
+        for segment_index, (start_idx, end_idx, length) in enumerate(bad_segments, start=1):
+            focus_summary = summarize_proxy_range(
+                records,
+                temporal_records,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                conf_threshold=conf_threshold,
+                good_conf=good_conf,
+            )
+            row: Dict[str, object] = {
+                "dataset": dataset_name,
+                "dataset_label": dataset_label,
+                "model": model_name,
+                "model_label": display_name(model_name),
+                "segment_index": segment_index,
+                "start_index": start_idx,
+                "end_index": end_idx,
+                "start_frame": start_idx + 1,
+                "end_frame": end_idx + 1,
+                "length": length,
+                "start_image": str(records[start_idx].image_path),
+                "end_image": str(records[end_idx].image_path),
+                "low_conf_count": focus_summary["low_conf_count"],
+                "no_detection_count": focus_summary["no_detection_count"],
+                "weird_count": focus_summary["weird_count"],
+                "box_jump_count": focus_summary["box_jump_count"],
+                "high_conf_weird_count": focus_summary["high_conf_weird_count"],
+                "bad_rate": focus_summary["bad_rate"],
+                "good_rate": focus_summary["good_rate"],
+                "mean_top1_conf": focus_summary["mean_top1_conf"],
+            }
+            for compare_name in model_names:
+                compare_records = records_by_model.get(compare_name)
+                compare_temporal = temporal_records_by_model.get(compare_name)
+                if compare_records is None or compare_temporal is None:
+                    continue
+                compare_summary = summarize_proxy_range(
+                    compare_records,
+                    compare_temporal,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    conf_threshold=conf_threshold,
+                    good_conf=good_conf,
+                )
+                prefix = sanitize_filename(compare_name)
+                row[f"{prefix}_bad_count"] = compare_summary["bad_count"]
+                row[f"{prefix}_bad_rate"] = compare_summary["bad_rate"]
+                row[f"{prefix}_low_conf_count"] = compare_summary["low_conf_count"]
+                row[f"{prefix}_weird_count"] = compare_summary["weird_count"]
+                row[f"{prefix}_box_jump_count"] = compare_summary["box_jump_count"]
+                row[f"{prefix}_high_conf_weird_count"] = compare_summary["high_conf_weird_count"]
+                row[f"{prefix}_max_bad_streak"] = compare_summary["max_bad_streak"]
+            rows.append(row)
+    rows.sort(key=lambda item: (str(item["dataset"]), str(item["model"]), -int(item["length"]), int(item["start_frame"])))
+    ranks_by_model: Dict[Tuple[str, str], int] = {}
+    for row in rows:
+        key = (str(row["dataset"]), str(row["model"]))
+        ranks_by_model[key] = ranks_by_model.get(key, 0) + 1
+        row["rank_by_model_length"] = ranks_by_model[key]
+    return rows
+
+
 def aggregate_temporal_reliability(
     dataset_name: str,
     dataset_label: str,
@@ -2148,10 +2718,19 @@ def aggregate_temporal_reliability(
     for idx, record in enumerate(records):
         label_aware = label_aware_records[idx] if label_aware_records is not None else None
         label_record = label_records.get(record.image_path) if label_records is not None else None
+        temporal_record = temporal_records[idx] if idx < len(temporal_records) else None
+        has_box_jump = bool(temporal_record.box_jump) if temporal_record is not None else False
         if label_aware is not None and label_record is not None and label_record.gt_boxes_xyxy:
-            failure_flags.append(bool((not label_aware.top1_correct_at_iou) or prediction_is_weird(record)))
+            failure_flags.append(bool((not label_aware.top1_correct_at_iou) or prediction_is_weird(record) or has_box_jump))
         else:
-            failure_flags.append(bool((not record.has_detection) or record.top1_conf < float(conf_threshold) or prediction_is_weird(record)))
+            failure_flags.append(
+                bool(
+                    (not record.has_detection)
+                    or record.top1_conf < float(conf_threshold)
+                    or prediction_is_weird(record)
+                    or has_box_jump
+                )
+            )
 
     streaks = failure_streak_lengths(failure_flags)
     good_flags: List[bool] = []
@@ -2190,7 +2769,7 @@ def aggregate_temporal_reliability(
         "max_failure_streak": max(streaks) if streaks else 0,
         "mean_failure_streak_len": safe_mean([float(length) for length in streaks]),
         "failure_rate": safe_rate(failure_flags),
-        "failure_basis": "label_correct_or_weird" if label_aware_records is not None else "proxy_conf_or_weird",
+        "failure_basis": "label_correct_or_weird_or_box_jump" if label_aware_records is not None else "proxy_conf_or_weird_or_box_jump",
         "good_streak_count": len(good_streaks),
         "max_good_streak": max(good_streaks) if good_streaks else 0,
         "mean_good_streak_len": safe_mean([float(length) for length in good_streaks]),
@@ -2471,7 +3050,8 @@ def main() -> None:
     global_lines.append("YOLO Ablation (Top-1 Confidence Stats)")
     global_lines.append(f"device={device_str}")
     global_lines.append(f"conf_threshold={float(args.conf):.3f} iou={float(args.iou):.3f}")
-    global_lines.append(f"n_vis_per_dataset={int(args.n)} eval_images_per_dataset={int(args.eval_images)} bins={int(args.hist_bins)}")
+    eval_images_text = "all" if int(args.eval_images) <= 0 else str(int(args.eval_images))
+    global_lines.append(f"n_vis_per_dataset={int(args.n)} eval_images_per_dataset={eval_images_text} bins={int(args.hist_bins)}")
     if args.reliability_mode:
         global_lines.append("reliability_mode=true")
         global_lines.append(f"ordered_eval={ordered_eval}")
@@ -2497,6 +3077,10 @@ def main() -> None:
         category: [] for category in PAIRED_FAILURE_CATEGORIES
     }
     label_notes: List[str] = []
+    full_stream_reliability_rows: List[Dict[str, object]] = []
+    full_stream_streak_rows: List[Dict[str, object]] = []
+    records_by_dataset_model: Dict[str, Dict[str, Sequence[Top1PredictionRecord]]] = {}
+    temporal_by_dataset_model: Dict[str, Dict[str, Sequence[TemporalPredictionRecord]]] = {}
 
     for ds in dataset_specs:
         ds_out = output_root / ds.name
@@ -2506,7 +3090,7 @@ def main() -> None:
         utils.LOGGER.info("==== Dataset: %s (%s) ====", ds.name, ds.root)
         all_images = gather_images(ds.root)
         n_vis = min(int(args.n), len(all_images))
-        n_eval = min(int(args.eval_images), len(all_images))
+        n_eval = len(all_images) if int(args.eval_images) <= 0 else min(int(args.eval_images), len(all_images))
 
         vis_images = rng.sample(all_images, n_vis) if n_vis > 0 else []
         if ordered_eval:
@@ -2691,6 +3275,34 @@ def main() -> None:
                         ):
                             reliability_row[key] = temporal_summary.get(key)
                         break
+
+            records_by_dataset_model[ds.name] = dict(reliability_records_by_model)
+            temporal_by_dataset_model[ds.name] = dict(temporal_records_by_model)
+            for name in model_names:
+                if name in reliability_records_by_model and name in temporal_records_by_model:
+                    full_stream_reliability_rows.append(
+                        aggregate_proxy_stream_reliability(
+                            dataset_name=ds.name,
+                            dataset_label=ds_label,
+                            model_name=name,
+                            model_label=display_name(name),
+                            records=reliability_records_by_model[name],
+                            temporal_records=temporal_records_by_model[name],
+                            conf_threshold=float(args.conf),
+                            good_conf=float(args.good_conf),
+                        )
+                    )
+            full_stream_streak_rows.extend(
+                build_bad_streak_rows(
+                    dataset_name=ds.name,
+                    dataset_label=ds_label,
+                    records_by_model=reliability_records_by_model,
+                    temporal_records_by_model=temporal_records_by_model,
+                    model_names=model_names,
+                    conf_threshold=float(args.conf),
+                    good_conf=float(args.good_conf),
+                )
+            )
 
             selected_by_category = select_paired_failure_examples(
                 dataset_name=ds.name,
@@ -2996,6 +3608,26 @@ def main() -> None:
                     global_lines.append(f"  {Path(path).name}")
             global_lines.append("  reliability_galleries/")
 
+            full_stream_csv_path, full_stream_txt_path = write_full_stream_reliability_outputs(
+                full_stream_reliability_rows,
+                output_root=output_root,
+            )
+            streak_csv_path, streak_summary_path, contact_sheet_paths = write_streak_diagnostics_outputs(
+                all_streak_rows=full_stream_streak_rows,
+                output_root=output_root,
+                records_by_dataset_model=records_by_dataset_model,
+                temporal_by_dataset_model=temporal_by_dataset_model,
+                model_names=model_names,
+                args=args,
+            )
+            global_lines.append("")
+            global_lines.append("==== Full-stream streak artifacts ====")
+            for path in [full_stream_csv_path, full_stream_txt_path, output_root / "full_stream_streaks.csv", streak_csv_path, streak_summary_path]:
+                if path is not None and Path(path).exists():
+                    global_lines.append(f"  {Path(path).relative_to(output_root)}")
+            if contact_sheet_paths:
+                global_lines.append(f"  streak_contact_sheets={len(contact_sheet_paths)}")
+
     if neg_dataset_specs:
         global_lines.append("")
         global_lines.append("==== Negative datasets (FP proxy rates) ====")
@@ -3008,7 +3640,7 @@ def main() -> None:
 
             utils.LOGGER.info("==== Negative Dataset: %s (%s) ====", nds.name, nds.root)
             all_images = gather_images(nds.root)
-            n_eval = min(int(args.eval_images), len(all_images))
+            n_eval = len(all_images) if int(args.eval_images) <= 0 else min(int(args.eval_images), len(all_images))
             eval_images = rng.sample(all_images, n_eval) if n_eval > 0 else []
             nds_label = dataset_display_name(nds.name)
 

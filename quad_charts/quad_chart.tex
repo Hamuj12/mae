@@ -61,66 +61,65 @@
 
 \begin{document}
 \tiny
-\begin{frame}{\author{} Quad Chart - May 5, 2026 }
+\begin{frame}{Hamza Mujtaba Quad Chart - Apr 2026}
 
 \FourQuad%
 {
     \quadrantTitle{ODAD Update}
-    {\usebeamercolor[fg]{title} (1) Online adaptation development}
+    {\usebeamercolor[fg]{title} (1) Memory-bank ODAD operating point}
     \begin{itemize}
-        \item \textbf{Top-k teacher selection} remains the best deployable ODAD branch.
-        \item Track-aware/multi-track memory cleaned boxes but reduced detection.
-        \item Stricter memory/geometry gates suppress valid target views.
-        \item Next: checkpoint selection/rollback using online reliability proxies.
+        \item Failure audit showed memory-bank ODAD is mainly \textbf{under-confident}, not incapable.
+        \item Static threshold calibration recovers detection while preserving reliability.
+        \item \textbf{Recommended report point: conf=0.15}.
+        \item Architecture work is paused while reporting/calibration results are consolidated.
     \end{itemize}
 }
 {
-    \quadrantTitle{Quantitative Ablation / Reliability}
-    {\usebeamercolor[fg]{title} (2) Accuracy + error metrics on lab imagery}
+    \quadrantTitle{Quantitative Reliability Snapshot}
+    {\usebeamercolor[fg]{title} (2) Full-stream proxy metrics}
     \vspace{0.3mm}
     \begin{center}
     \begingroup
     \tiny
-    \setlength{\tabcolsep}{2.0pt}
+    \setlength{\tabcolsep}{1.9pt}
     \renewcommand{\arraystretch}{1.05}
     \begin{tabular}{lccccc}
         \toprule
-        Model & Det. & Weird & Jump & Bad & Good \\
+        Model & Conf. & Det. & Weird & Jump & Max Bad \\
         \midrule
-        FDA-mix & \textbf{99.6\%} & 21.6\% & \textbf{2.0\%} & \textbf{15} & 97 \\
-        Current ODAD & 96.8\% & 27.8\% & 10.6\% & 42 & 135 \\
-        Multi-track & 93.2\% & 24.4\% & 8.0\% & 42 & \textbf{163} \\
+        Current ODAD & 0.25 & 87.0\% & 36.3\% & 9.1\% & 198 \\
+        Memory ODAD & 0.25 & 85.6\% & 6.2\% & 3.0\% & 67 \\
+        \textbf{Memory ODAD} & \textbf{0.15} & \textbf{88.4\%} & \textbf{6.2\%} & \textbf{3.0\%} & \textbf{51} \\
+        FDA-mix & 0.25 & 98.2\% & 21.5\% & 1.9\% & 41 \\
         \bottomrule
     \end{tabular}
     \endgroup
     \end{center}
-    \vspace{-2.2mm}
-    {\tiny Streaks use ordered frames; Good = conf$\ge$0.25, no weird box/jump.}
-    \vspace{-1.0mm}
+    \vspace{-1.5mm}
+    {\tiny Det. = detection rate; Weird/Jump/Max Bad are proxy reliability metrics.}
+    \vspace{-0.5mm}
     \begin{itemize}
-        \item Multi-track improves symptoms but misses the 95\% detection target.
-        \item Current ODAD remains the best deployable tradeoff.
-        \item Streaks expose stability better than confidence alone.
+        \item Memory-bank @0.15 improves detection over default while retaining low proxy failures.
+        \item Current ODAD has similar detection but much worse weird/jump/streak behavior.
     \end{itemize}
 }
 {
     \quadrantTitle{Lab Updates}
-    {\usebeamercolor[fg]{title} (3) SSTI/Poster Updates}
+    {\usebeamercolor[fg]{title} (3) Pose-pipeline relevance}
     \begin{itemize}
-        \item USSF Symposium poster drafted; awaiting final team review.
-        \item Reliability tooling now writes summaries, streaks, and galleries.
-        \item Next ODAD run: online checkpoint selection/rollback.
+        \item FDA-trained YOLO-Segment remains active detector in current pose pipeline.
+        \item Memory-bank ODAD provides a lower-failure online adaptation candidate.
+        \item Next step: manually audit aggressive 0.05 threshold before calibration/head-bias work.
+        \item Reporting now emphasizes calibrated operating point rather than new architecture.
     \end{itemize}
 }
 {
-    \quadrantTitle{Qualitative Reliability Examples}
-    {\usebeamercolor[fg]{title} (4) ODAD vs FDA-mix galleries}\par
+    \quadrantTitle{Qualitative / Operating Point}
+    {\usebeamercolor[fg]{title} (4) Low-confidence accepts and threshold tradeoff}\par
     \begin{minipage}{\linewidth}
     \centering
-    \includegraphics[width=0.98\linewidth,height=0.158\textheight,keepaspectratio]{odad_images/multitrack_fail_example.png}\\[-0.5mm]
-    {\tiny FDA-mix good / Multi-track bad}\\[0.5mm]
-    \includegraphics[width=0.98\linewidth,height=0.158\textheight,keepaspectratio]{odad_images/multitrack_success_example.png}\\[-0.5mm]
-    {\tiny Multi-track good / FDA-mix weak}
+    \includegraphics[width=0.98\linewidth,height=0.31\textheight,keepaspectratio]{odad_images/odad_threshold_tradeoff_clean.png}\\[-0.5mm]
+    {\tiny Static threshold sweep: 0.15 is the reportable balance; 0.05 remains manual-review/aggressive.}
     \end{minipage}
 }
 \end{frame}

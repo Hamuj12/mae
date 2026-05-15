@@ -1,0 +1,34 @@
+ODAD artifact cleanup recommendations
+
+Do not delete important baselines automatically. Prefer archiving older negative branches after the report is finalized.
+
+Minimal active ODAD folders to keep:
+- odad/online_adapt_topk2_full
+- odad/adapter_l18_l21_full
+- odad/membank_bank16_top2_teacherroi_full
+- odad/source_topksim_w005_full
+- odad/shadow_manager_full
+- odad/shadow_manager_odad_active_full_diagnostic
+
+Minimal active yolo_ablation_runs folders to keep:
+- yolo_ablation_runs/membank_threshold_policy_eval
+- yolo_ablation_runs/failure_audit_membank_operating_point
+- yolo_ablation_runs/reliability_membank_bank16_top2_teacherroi_full
+- yolo_ablation_runs/reliability_adapter_l18_l21_full
+- yolo_ablation_runs/reliability_shadow_streak_fullstream_gpu
+- yolo_ablation_runs/compare_models_odad_topk2_slide_ready
+
+Optional historical negative-branch folders to archive:
+- ODAD experiments superseded by memory-bank threshold calibration.
+- Track-aware or multi-track branches that reduced detection and are no longer report candidates.
+- Earlier shadow-manager diagnostics not referenced by the current report.
+
+Clearly safe smoke/unit folders to delete only after manual inspection:
+- Short max-frame smoke outputs.
+- Probe folders created only to validate script wiring.
+- Empty or failed plotting scratch directories.
+
+Suggested approach:
+- Move archive candidates to a timestamped archive directory outside the active report path.
+- Keep summaries, CSVs, plots, and final weights for every branch cited in slides or reports.
+- Do not run rm -rf from this recommendation file without a manual path-by-path review.

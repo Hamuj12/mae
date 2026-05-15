@@ -1,0 +1,5 @@
+dataset,model,det_rate_at_conf_pct,mean_top1_conf,median_top1_conf,p90_top1_conf,p99_top1_conf,std_top1_conf,delta_det_rate_vs_baseline_pp,delta_mean_top1_conf_vs_baseline,delta_det_rate_vs_odad_baseline_pp,delta_mean_top1_conf_vs_odad_baseline
+lab,fda_mix,98.25,0.7710,0.8178,0.9250,0.9509,0.1653,,,,
+lab,current_odad,87.04,0.7337,0.8943,0.9947,0.9984,0.3157,,,,
+lab,shadow_5500,78.38,0.7143,0.9825,0.9981,0.9995,0.3749,,,,
+lab,shadow_6500,80.77,0.6711,0.8463,0.9807,0.9939,0.3380,,,,

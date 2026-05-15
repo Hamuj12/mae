@@ -1,0 +1,6 @@
+Operating point recommendation
+
+recommended_policy=static_015 det=0.9250 weird=0.0500 box_jump=0.0000 bad=0.0750 max_bad=2
+minimum_criteria_met=1
+strong_criteria_met=1
+Recommend static_015 because adaptive policies did not beat its detection/reliability tradeoff.

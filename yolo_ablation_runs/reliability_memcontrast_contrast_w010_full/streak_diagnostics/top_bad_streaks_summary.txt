@@ -1,0 +1,23 @@
+Top Bad Streak Diagnostics
+
+Dataset: lab
+  fda_mix:
+    rank=1 frames=3208-3248 len=41 low=5 weird=39 jump=0 high_conf_weird=17 fda_mix_bad=41/41, current_odad_bad=4/41
+    rank=2 frames=1000-1036 len=37 low=0 weird=36 jump=3 high_conf_weird=14 fda_mix_bad=37/37, current_odad_bad=6/37
+    rank=3 frames=4301-4334 len=34 low=2 weird=33 jump=2 high_conf_weird=3 fda_mix_bad=34/34, current_odad_bad=24/34
+  adapter_base:
+    rank=1 frames=3984-4054 len=71 low=70 weird=18 jump=19 high_conf_weird=0 fda_mix_bad=16/71, current_odad_bad=71/71
+    rank=2 frames=5055-5105 len=51 low=49 weird=10 jump=17 high_conf_weird=0 fda_mix_bad=16/51, current_odad_bad=51/51
+    rank=3 frames=2874-2923 len=50 low=50 weird=12 jump=12 high_conf_weird=0 fda_mix_bad=12/50, current_odad_bad=50/50
+  current_odad:
+    rank=1 frames=450-647 len=198 low=12 weird=192 jump=26 high_conf_weird=82 fda_mix_bad=58/198, current_odad_bad=198/198
+    rank=2 frames=3750-3928 len=179 low=1 weird=177 jump=8 high_conf_weird=91 fda_mix_bad=28/179, current_odad_bad=179/179
+    rank=3 frames=4816-4967 len=152 low=18 weird=144 jump=16 high_conf_weird=55 fda_mix_bad=68/152, current_odad_bad=152/152
+  membank_prev:
+    rank=1 frames=3984-4050 len=67 low=67 weird=20 jump=18 high_conf_weird=0 fda_mix_bad=16/67, current_odad_bad=67/67
+    rank=2 frames=2872-2923 len=52 low=52 weird=13 jump=8 high_conf_weird=0 fda_mix_bad=12/52, current_odad_bad=52/52
+    rank=3 frames=6144-6189 len=46 low=46 weird=6 jump=9 high_conf_weird=0 fda_mix_bad=14/46, current_odad_bad=46/46
+  memcontrast_candidate:
+    rank=1 frames=3984-4050 len=67 low=67 weird=20 jump=11 high_conf_weird=0 fda_mix_bad=16/67, current_odad_bad=67/67
+    rank=2 frames=2872-2923 len=52 low=52 weird=15 jump=8 high_conf_weird=0 fda_mix_bad=12/52, current_odad_bad=52/52
+    rank=3 frames=6139-6189 len=51 low=51 weird=8 jump=10 high_conf_weird=0 fda_mix_bad=15/51, current_odad_bad=51/51

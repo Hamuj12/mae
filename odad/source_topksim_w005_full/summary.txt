@@ -1,0 +1,370 @@
+Online Adaptation Summary
+
+startup:
+  adaptation_mode=adapter
+  update_scope=head_only
+  neck_start_idx=10
+  head_idx=22
+  adapter_enabled=1
+  adapter_layers=18,21
+  adapter_reduction=8
+  adapter_min_channels=8
+  adapter_scale=1.000
+  adapter_train_detect_head=0
+  memory_adapter_enabled=1
+  memory_bank_enabled=1
+  memory_bank_size=16
+  memory_bank_topk=2
+  memory_bank_slot_dim=32
+  memory_bank_query_mode=teacher_roi
+  memory_bank_write_policy=diverse_fifo
+  memory_bank_diversity_thresh=0.850
+  memory_bank_duplicate_thresh=0.950
+  memory_bank_quality_margin=0.050
+  memory_bank_balance_scale_bins=0
+  memory_bank_balance_conf_bins=0
+  memory_bank_stable_medium_write=0
+  memory_bank_stable_conf_min=0.600
+  memory_bank_stable_iou_min=0.550
+  memory_bank_retrieval_temp=0.100
+  memory_adapter_dim=32
+  memory_adapter_source_layer=21
+  memory_adapter_ema=0.950
+  memory_adapter_min_conf=0.800
+  memory_adapter_min_area_frac=0.001000
+  memory_adapter_update_on_accepted_only=1
+  memory_adapter_conditioning=film
+  memory_adapter_disable_conditioning_if_supported=0
+  source_memory_enabled=1
+  source_memory_path=/home/hm25936/mae/odad/source_memory/source_memory.pt
+  source_memory_loss_type=topk_sim
+  source_memory_weight=0.050
+  source_memory_temp=0.100
+  source_memory_topk_pos=4
+  source_memory_neg_k=8
+  source_memory_layer=21
+  source_memory_debug_save=1
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  coverage_aux_enable=0
+  coverage_buffer_size=64
+  coverage_batch_size=2
+  coverage_weight=0.100
+  coverage_candidate_conf_min=0.250
+  coverage_candidate_conf_max=0.800
+  coverage_loss_type=pred_conf_margin
+  coverage_margin=0.050
+  coverage_max_loss=2.000
+  coverage_region_expand=0.250
+  coverage_region_min_candidates=1
+  coverage_region_center_radius_frac=0.100
+  coverage_region_use_cls=1
+  coverage_region_objectness_weight=1.000
+  update_every_frames=1
+  updates_per_event=1
+  max_updates_per_frame_legacy=1
+  save_checkpoints_every=500
+  save_final_weights=1
+  final_weights_name=student_final.pt
+  unfrozen_modules=[18:ResidualConvAdapter(C=128, hidden=16, params=12688, scale=1), 21:ResidualConvAdapter(C=256, hidden=32, params=41792, scale=1)]
+  adapter_trainable_params=54480
+  memory_adapter_trainable_params=33568
+  trainable_params=54480
+  total_param_tensors=198
+  frozen_param_tensors=184
+  frozen_param_numel=3011043
+  optimizer_param_tensors=14
+  optimizer_param_numel=54480
+  non_optimizer_trainable_tensors=0
+
+weights=/home/hm25936/mae/runs/yolov8_baseline/baseline/weights/best.pt
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+total_frames=6735
+accepted_frames=2649
+updates_applied=6660
+number_of_update_events=6660
+optimizer_update_steps=6660
+adaptation_mode=adapter
+memory_adapter_enabled=1
+memory_bank_enabled=1
+memory_bank_size=16
+memory_write_policy=diverse_fifo
+memory_bank_active_slots=16
+memory_bank_writes=21
+memory_bank_writes_total=21
+memory_bank_appends=16
+memory_bank_replacements=5
+memory_bank_duplicate_skips=2628
+memory_bank_low_quality_skips=0
+memory_bank_stable_medium_writes=0
+memory_slot_scale_bin_counts=small:0|medium:14|large:2
+memory_slot_conf_bin_counts=medium:0|high:16
+memory_write_decision_counts=append:16|replace_fifo:0|replace_diverse:5|replace_balanced:0|replace_quality:0|skip_duplicate:2628|skip_low_conf:0|skip_low_area:0|skip_unstable_medium:0
+memory_retrieval_top1_sim=0.931587
+memory_retrieval_mean_topk_sim=0.906686
+memory_retrieval_top1_slot=1
+memory_retrieval_entropy=0.956624
+memory_slot_mean_pairwise_sim=0.868429
+memory_slot_max_pairwise_sim=1.000000
+memory_debug_images_saved=66
+source_memory_enabled=1
+source_memory_path=/home/hm25936/mae/odad/source_memory/source_memory.pt
+source_memory_slots=64
+source_memory_loss_type=topk_sim
+source_memory_weight=0.050000
+source_memory_temp=0.100000
+source_memory_loss=0.042112
+mean_source_memory_loss_updates=0.056457
+source_memory_valid_entries=26640
+source_memory_skipped_updates=0
+source_memory_mean_pos_sim=0.943543
+source_memory_mean_neg_sim=0.335357
+source_memory_margin=0.608187
+source_memory_projection_params=8224
+source_memory_debug_images_saved=64
+memory_adapter_dim=32
+memory_adapter_source_layer=21
+memory_adapter_updates=21
+memory_adapter_initialized=1
+memory_adapter_mean_norm=1.000000
+memory_adapter_last_update_frame=3590
+adapter_trainable_params=54480
+adapter_total_trainable_params=54480
+memory_adapter_trainable_params=33568
+trainable_params=54480
+total_param_tensors=198
+frozen_param_tensors=184
+frozen_param_numel=3011043
+optimizer_param_tensors=14
+optimizer_param_numel=54480
+non_optimizer_trainable_tensors=0
+mean_teacher_conf=0.595041
+mean_student_post_conf=0.619088
+mean_detection_loss_updates=6.377419
+mean_total_loss_updates=6.380242
+mean_coverage_loss_updates=0.000000
+mean_coverage_region_student_conf=n/a
+mean_coverage_region_teacher_conf=n/a
+mean_coverage_region_conf_gap=n/a
+mean_memory_conditioning_norm=1.128662
+mean_buffer_size_during_updates=31.932
+mean_coverage_buffer_size_during_updates=0.000
+
+resource_metrics:
+  mean_update_latency_ms=576.326
+  mean_pre_update_sync_latency_ms=0.025
+  mean_batch_build_latency_ms=557.022
+  mean_update_forward_latency_ms=4.390
+  mean_update_loss_latency_ms=7.500
+  mean_update_backward_step_latency_ms=6.206
+  peak_cuda_allocated_mb=382.8
+  peak_cuda_reserved_mb=490.0
+  final_checkpoint_size_mb=6.030
+  checkpoint_reload_status=ok
+  checkpoint_reload_ok=1
+
+teacher_vs_student:
+  mean_conf_gap=0.024047
+  median_conf_gap=0.011803
+  fraction_frames_student_gt_teacher=0.670082
+  fraction_frames_student_lt_teacher=0.317298
+  mean_accept_rate_roll=0.386034
+  mean_batch_size_used_on_updates=4.000000
+
+reliability_gates:
+  teacher_conf_thresh=0.800
+  temporal_iou_gate=0.500
+  persistence_frames=2
+  persistence_iou=0.500
+  max_center_shift_frac=0.200
+  max_area_ratio=2.500
+  number_of_checkpoints_saved=13
+
+teacher_candidate_selection:
+  teacher_topk=2
+  teacher_candidate_conf_floor=0.250
+  teacher_candidate_score_mode=conf_temporal
+  teacher_candidate_conf_weight=1.000
+  teacher_candidate_temporal_weight=1.000
+  teacher_candidate_min_score=0.000
+  mean_num_candidates=0.870082
+  mean_selected_rank=1.019912
+  fraction_selected_rank_gt1=0.019912
+  mean_selected_score=1.580808
+  selected_rank_gt1_frames=104
+  selected_rank_gt1_examples_saved=8
+
+coverage_aux:
+  coverage_aux_enable=0
+  coverage_loss_type=pred_conf_margin
+  coverage_weight=0.100
+  coverage_margin=0.050
+  coverage_max_loss=2.000
+  coverage_region_expand=0.250
+  coverage_region_min_candidates=1
+  coverage_region_center_radius_frac=0.100
+  coverage_region_use_cls=1
+  coverage_region_objectness_weight=1.000
+  coverage_candidate_conf_min=0.250
+  coverage_candidate_conf_max=0.800
+  coverage_buffer_size=0
+  coverage_entries_added=0
+  coverage_entries_sampled=0
+  coverage_region_entries_skipped=0
+  mean_coverage_loss_updates=0.000000
+  mean_coverage_samples_updates=0.000000
+  mean_coverage_buffer_size_during_updates=0.000
+  mean_coverage_region_entries_skipped=0.000
+  mean_coverage_region_student_conf=n/a
+  mean_coverage_region_teacher_conf=n/a
+  mean_coverage_region_conf_gap=n/a
+  coverage_reason_counts={}
+
+memory_adapter:
+  memory_adapter_enabled=1
+  memory_bank_enabled=1
+  memory_bank_size=16
+  memory_adapter_topk=2
+  memory_adapter_slot_dim=32
+  memory_adapter_query_mode=teacher_roi
+  memory_adapter_write_policy=diverse_fifo
+  memory_write_policy=diverse_fifo
+  memory_adapter_diversity_thresh=0.850
+  memory_adapter_duplicate_thresh=0.950
+  memory_adapter_quality_margin=0.050
+  memory_adapter_balance_scale_bins=0
+  memory_adapter_balance_conf_bins=0
+  memory_adapter_stable_medium_write=0
+  memory_adapter_stable_conf_min=0.600
+  memory_adapter_stable_iou_min=0.550
+  memory_adapter_retrieval_temp=0.100
+  memory_adapter_dim=32
+  memory_adapter_source_layer=21
+  memory_adapter_ema=0.950
+  memory_adapter_min_conf=0.800
+  memory_adapter_min_area_frac=0.001000
+  memory_adapter_update_on_accepted_only=1
+  memory_adapter_conditioning=film
+  memory_adapter_disable_conditioning_if_supported=0
+  memory_adapter_updates=21
+  memory_adapter_initialized=1
+  memory_adapter_mean_norm=1.000000
+  memory_adapter_last_update_frame=3590
+  memory_adapter_trainable_params=33568
+  mean_memory_conditioning_norm=1.128662
+  memory_bank_active_slots=16
+  memory_bank_writes=21
+  memory_bank_appends=16
+  memory_bank_replacements=5
+  memory_bank_duplicate_skips=2628
+  memory_bank_low_quality_skips=0
+  memory_bank_stable_medium_writes=0
+  memory_slot_scale_bin_counts=small:0|medium:14|large:2
+  memory_slot_conf_bin_counts=medium:0|high:16
+  memory_write_decision_counts=append:16|replace_fifo:0|replace_diverse:5|replace_balanced:0|replace_quality:0|skip_duplicate:2628|skip_low_conf:0|skip_low_area:0|skip_unstable_medium:0
+  memory_retrieval_top1_sim=0.931587
+  memory_retrieval_mean_topk_sim=0.906686
+  memory_retrieval_top1_slot=1
+  memory_retrieval_entropy=0.956624
+  memory_slot_mean_pairwise_sim=0.868429
+  memory_slot_max_pairwise_sim=1.000000
+  memory_debug_images_saved=66
+  source_memory_enabled=1
+  source_memory_path=/home/hm25936/mae/odad/source_memory/source_memory.pt
+  source_memory_slots=64
+  source_memory_loss_type=topk_sim
+  source_memory_weight=0.050000
+  source_memory_temp=0.100000
+  source_memory_topk_pos=4
+  source_memory_neg_k=8
+  source_memory_layer=21
+  source_memory_debug_save=1
+  source_memory_loss=0.042112
+  mean_source_memory_loss_updates=0.056457
+  source_memory_valid_entries=26640
+  source_memory_skipped_updates=0
+  source_memory_mean_pos_sim=0.943543
+  source_memory_mean_neg_sim=0.335357
+  source_memory_margin=0.608187
+  source_memory_projection_params=8224
+  source_memory_debug_images_saved=64
+
+update_schedule:
+  update_every_frames=1
+  updates_per_event=1
+  mean_updates_per_event=1.000000
+  number_of_update_events=6660
+
+buffer_config:
+  buffer_size=32
+  update_batch_size=4
+  min_buffer_before_update=4
+  buffer_sample_mode=recent
+  max_updates_per_frame_legacy=1
+
+outputs:
+  csv=adapt_log.csv
+  summary=summary.txt
+  final_student_weights=student_final.pt
+  memory_debug=memory_debug
+  plot_teacher_vs_student_conf.png
+  plot_conf_gap.png
+  plot_conf_gap_roll.png
+  plot_teacher_conf_roll.png
+  plot_student_conf_roll.png
+  plot_accept_rate_roll.png
+  plot_update_count_roll.png
+  plot_accept_update_flags.png
+  plot_buffer_size.png
+  plot_selected_rank.png
+  plot_selected_score_roll.png
+  plot_batch_size_used.png
+  plot_det_loss.png
+  plot_coverage_loss.png
+  plot_coverage_region_loss.png
+  plot_coverage_region_conf_gap.png
+  plot_coverage_buffer_size.png
+  plot_memory_adapter_norm.png
+  plot_memory_adapter_updates.png
+  plot_source_memory_loss.png
+  plot_source_memory_pos_neg_sim.png
+  plot_source_memory_margin.png
+  memory_debug/memory_writes/
+  memory_debug/memory_skipped_writes/
+  memory_debug/retrieval_examples/
+  memory_debug/source_memory_retrieval_examples/
+  memory_debug/memory_slots_final.png
+  memory_debug/memory_similarity_heatmap.png
+  memory_debug/memory_timeline.png
+  memory_debug/memory_summary.csv
+  memory_debug/plot_source_memory_loss.png
+  memory_debug/plot_source_memory_pos_neg_sim.png
+  memory_debug/plot_source_memory_margin.png
+  hist_conf_gap.png
+  hist_update_latency.png
+  selected_rank_gt1_dir=selected_rank_gt1 (8 saved)
+
+intermediate_checkpoints:
+  checkpoints/student_frame_000500.pt
+  checkpoints/student_frame_001000.pt
+  checkpoints/student_frame_001500.pt
+  checkpoints/student_frame_002000.pt
+  checkpoints/student_frame_002500.pt
+  checkpoints/student_frame_003000.pt
+  checkpoints/student_frame_003500.pt
+  checkpoints/student_frame_004000.pt
+  checkpoints/student_frame_004500.pt
+  checkpoints/student_frame_005000.pt
+  checkpoints/student_frame_005500.pt
+  checkpoints/student_frame_006000.pt
+  checkpoints/student_frame_006500.pt

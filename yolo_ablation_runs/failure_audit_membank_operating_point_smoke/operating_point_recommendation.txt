@@ -1,0 +1,1 @@
+No threshold met all deployability limits. Best observed compromise by det-bad score was conf=0.05; remaining issue is not solved by threshold alone.

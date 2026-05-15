@@ -1,0 +1,11 @@
+Reliability summary
+
+Label status:
+  - lab: YOLO labels not found at /home/hm25936/datasets_for_yolo/lab_images_6000/labels/test; using proxy reliability metrics only.
+
+Dataset: lab
+  FDA-mix: det@conf=98.2% weird=21.5% high-conf weird=10.9% box-jump=1.9% max streak=41 max good=235
+  Adapter Base: det@conf=84.5% weird=6.3% high-conf weird=0.3% box-jump=3.1% max streak=71 max good=465
+  Current Odad: det@conf=87.0% weird=36.3% high-conf weird=15.4% box-jump=9.1% max streak=198 max good=238
+  Membank Prev: det@conf=85.6% weird=6.2% high-conf weird=0.4% box-jump=3.0% max streak=67 max good=465
+  Memdiv Candidate: det@conf=85.5% weird=7.2% high-conf weird=0.5% box-jump=3.0% max streak=67 max good=465

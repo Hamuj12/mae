@@ -1,0 +1,27 @@
+Top Bad Streak Diagnostics
+
+Dataset: lab
+  fda_mix:
+    rank=1 frames=3208-3248 len=41 low=5 weird=39 jump=0 high_conf_weird=17 fda_mix_bad=41/41, current_odad_bad=4/41
+    rank=2 frames=1000-1036 len=37 low=0 weird=36 jump=3 high_conf_weird=14 fda_mix_bad=37/37, current_odad_bad=6/37
+    rank=3 frames=4301-4334 len=34 low=2 weird=33 jump=2 high_conf_weird=3 fda_mix_bad=34/34, current_odad_bad=24/34
+    rank=4 frames=2099-2128 len=30 low=0 weird=30 jump=4 high_conf_weird=6 fda_mix_bad=30/30, current_odad_bad=8/30
+    rank=5 frames=5369-5397 len=29 low=0 weird=29 jump=0 high_conf_weird=10 fda_mix_bad=29/29, current_odad_bad=6/29
+  current_odad:
+    rank=1 frames=450-647 len=198 low=12 weird=192 jump=26 high_conf_weird=82 fda_mix_bad=58/198, current_odad_bad=198/198
+    rank=2 frames=3750-3928 len=179 low=1 weird=177 jump=8 high_conf_weird=91 fda_mix_bad=28/179, current_odad_bad=179/179
+    rank=3 frames=4816-4967 len=152 low=18 weird=144 jump=16 high_conf_weird=55 fda_mix_bad=68/152, current_odad_bad=152/152
+    rank=4 frames=6113-6257 len=145 low=8 weird=144 jump=12 high_conf_weird=93 fda_mix_bad=24/145, current_odad_bad=145/145
+    rank=5 frames=2847-2977 len=131 low=13 weird=126 jump=16 high_conf_weird=69 fda_mix_bad=19/131, current_odad_bad=131/131
+  shadow_5500:
+    rank=1 frames=423-550 len=128 low=4 weird=127 jump=2 high_conf_weird=42 fda_mix_bad=37/128, current_odad_bad=118/128
+    rank=2 frames=2864-2976 len=113 low=93 weird=101 jump=19 high_conf_weird=0 fda_mix_bad=16/113, current_odad_bad=113/113
+    rank=3 frames=6134-6237 len=104 low=83 weird=94 jump=12 high_conf_weird=0 fda_mix_bad=16/104, current_odad_bad=104/104
+    rank=4 frames=1516-1617 len=102 low=77 weird=92 jump=27 high_conf_weird=0 fda_mix_bad=14/102, current_odad_bad=101/102
+    rank=5 frames=2613-2714 len=102 low=79 weird=87 jump=14 high_conf_weird=0 fda_mix_bad=31/102, current_odad_bad=101/102
+  shadow_6500:
+    rank=1 frames=418-594 len=177 low=10 weird=171 jump=13 high_conf_weird=32 fda_mix_bad=64/177, current_odad_bad=162/177
+    rank=2 frames=6128-6257 len=130 low=45 weird=126 jump=7 high_conf_weird=0 fda_mix_bad=17/130, current_odad_bad=130/130
+    rank=3 frames=2851-2977 len=127 low=51 weird=120 jump=12 high_conf_weird=8 fda_mix_bad=19/127, current_odad_bad=127/127
+    rank=4 frames=1753-1871 len=119 low=78 weird=101 jump=20 high_conf_weird=0 fda_mix_bad=43/119, current_odad_bad=110/119
+    rank=5 frames=679-789 len=111 low=68 weird=107 jump=8 high_conf_weird=0 fda_mix_bad=13/111, current_odad_bad=110/111

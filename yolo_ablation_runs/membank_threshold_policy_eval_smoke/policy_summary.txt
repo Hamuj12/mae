@@ -1,0 +1,8 @@
+ODAD threshold policy summary
+
+policy, det, weird, accepted_weird, jump, bad, max_bad, p95_bad, low_conf_accepts, low_conf_weird, low_conf_jump
+static_025: det=87.5% weird=5.0% accepted_weird=0.0% jump=0.0% bad=12.5% max_bad=2 p95_bad=2.0 low_accept=0.0% low_weird=nan% low_jump=nan%
+static_015: det=92.5% weird=5.0% accepted_weird=0.0% jump=0.0% bad=7.5% max_bad=2 p95_bad=2.0 low_accept=5.0% low_weird=0.0% low_jump=0.0%
+adaptive_025_to_015_stable: det=90.0% weird=5.0% accepted_weird=0.0% jump=0.0% bad=10.0% max_bad=2 p95_bad=2.0 low_accept=2.5% low_weird=0.0% low_jump=0.0%
+adaptive_025_to_005_strict: det=92.5% weird=5.0% accepted_weird=0.0% jump=0.0% bad=7.5% max_bad=2 p95_bad=2.0 low_accept=5.0% low_weird=0.0% low_jump=0.0%
+hysteresis_policy: det=90.0% weird=5.0% accepted_weird=0.0% jump=0.0% bad=10.0% max_bad=2 p95_bad=2.0 low_accept=2.5% low_weird=0.0% low_jump=0.0%

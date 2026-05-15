@@ -1,0 +1,69 @@
+YOLO Ablation (Top-1 Confidence Stats)
+device=cuda:0
+conf_threshold=0.250 iou=0.450
+n_vis_per_dataset=8 eval_images_per_dataset=500 bins=30
+reliability_mode=true
+ordered_eval=True
+use_labels=auto
+gallery_models=fda_mix
+
+Datasets:
+  - lab: /home/hm25936/datasets_for_yolo/lab_images_6000
+
+==== Lab ====
+eval_images: 500
+conf_threshold (for det_rate): 0.250
+iou: 0.450
+
+Reliability mode:
+  labels:              YOLO labels not found at /home/hm25936/datasets_for_yolo/lab_images_6000/labels/test; using proxy reliability metrics only.
+
+[FDA-mix]
+  det_rate@conf:       99.6%  (498/500)
+  top1_conf mean/med:  0.812 / 0.867
+  top1_conf std:       0.159
+  top1_conf p90/p99:   0.944 / 0.954
+  mean ± 2σ:           [0.494, 1.129]
+  mean ± 3σ:           [0.335, 1.288]
+  hist:                hist_top1conf_fda_mix.png
+
+[Best Shadow]
+  det_rate@conf:       96.8%  (484/500)
+  top1_conf mean/med:  0.884 / 0.990
+  top1_conf std:       0.222
+  top1_conf p90/p99:   0.998 / 0.999
+  mean ± 2σ:           [0.441, 1.327]
+  mean ± 3σ:           [0.220, 1.549]
+  hist:                hist_top1conf_best_shadow.png
+
+[Current Odad]
+  det_rate@conf:       96.8%  (484/500)
+  top1_conf mean/med:  0.831 / 0.970
+  top1_conf std:       0.250
+  top1_conf p90/p99:   0.993 / 0.998
+  mean ± 2σ:           [0.331, 1.331]
+  mean ± 3σ:           [0.081, 1.582]
+  hist:                hist_top1conf_current_odad.png
+
+Slide-ready artifacts:
+  cdf:                 cdf_top1conf_lab.png
+
+
+==== Slide-ready artifacts ====
+  grouped_bar_det_rate.png
+  grouped_bar_mean_conf.png
+  cdf_top1conf_lab.png
+  precision_style_rank_plot.png
+  slide_summary.csv
+  slide_summary.tex
+  odad_delta_summary.txt
+
+==== Reliability artifacts ====
+  reliability_summary.csv
+  reliability_summary.txt
+  temporal_reliability_summary.csv
+  paired_failure_summary.csv
+  reliability_bar_weird_box_rate.png
+  temporal_box_jump_rate.png
+  failure_streaks_by_model.png
+  reliability_galleries/

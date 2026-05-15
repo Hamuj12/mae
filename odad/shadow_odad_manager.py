@@ -14,6 +14,7 @@ import csv
 import gc
 import math
 import random
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -38,6 +39,15 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError("Please install ultralytics: pip install ultralytics") from exc
 
+from odad.adapters import (  # noqa: E402
+    AdapterSpec,
+    adapter_param_count,
+    assert_matching_adapter_state,
+    attach_residual_adapters,
+    apply_adapter_freeze_policy,
+    freeze_frozen_batchnorm_stats,
+    parse_adapter_layers,
+)
 from odad.online_adapt import (  # noqa: E402
     FrameLog,
     LossClass,
@@ -73,6 +83,34 @@ from odad.online_adapt import (  # noqa: E402
 )
 
 
+COMPOSITE_SCORE_WEIGHTS = {
+    "det_rate_at_conf": 1.0,
+    "weird_box_rate": -0.5,
+    "box_jump_rate": -0.75,
+    "high_conf_weird_rate": -0.5,
+    "max_bad_streak": -0.002,
+    "max_good_streak": 0.001,
+}
+
+PROMOTION_POLICY_DEFAULTS = {
+    "strict": {
+        "min_promotion_det_rate": 0.95,
+        "promotion_det_margin": -0.01,
+        "description": "Deployment-safe default.",
+    },
+    "relaxed": {
+        "min_promotion_det_rate": 0.93,
+        "promotion_det_margin": -0.03,
+        "description": "Research diagnostic to test whether reliability gains are worth detection loss.",
+    },
+    "diagnostic": {
+        "min_promotion_det_rate": 0.93,
+        "promotion_det_margin": -0.03,
+        "description": "Logs would-promote events but does not replace active unless explicitly allowed.",
+    },
+}
+
+
 @dataclass
 class ShadowLearnerConfig:
     device: str
@@ -85,8 +123,14 @@ class ShadowLearnerConfig:
     weight_decay: float
     ema_decay: float
     grad_clip: float
+    learner_mode: str
     update_scope: str
     neck_start_idx: int
+    adapter_layers: str
+    adapter_reduction: int
+    adapter_min_channels: int
+    adapter_scale: float
+    adapter_train_detect_head: bool
     buffer_size: int
     update_batch_size: int
     min_buffer_before_update: int
@@ -141,6 +185,33 @@ class ShadowStepResult:
     student_top1: Optional[Top1Det]
 
 
+@dataclass
+class PromotionDecision:
+    promote: bool
+    would_promote: bool
+    hard_gate_passed: bool
+    fail_reasons: List[str]
+    promotion_block_reason: str
+    streak_gate_block_reason: str
+    policy: str
+    active_score: float
+    shadow_score: float
+    composite_score_delta: float
+    det_rate_delta: float
+    weird_rate_delta: float
+    box_jump_delta: float
+    bad_streak_delta: float
+    good_streak_delta: float
+    max_bad_streak_ratio: float
+    max_bad_streak_allowed: float
+    active_p95_bad_streak: float
+    shadow_p95_bad_streak: float
+    p95_bad_streak_delta: float
+    active_long_bad_streak_count: float
+    shadow_long_bad_streak_count: float
+    long_bad_streak_delta: float
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sequential shadow-learning ODAD deployment manager.")
     parser.add_argument("--active-weights", type=str, required=True, help="Initial active model weights used for stable inference.")
@@ -168,12 +239,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-update-throttle", action="store_true", help="Pause shadow updates when recent reliability proxies are poor.")
     parser.add_argument("--throttle-weird-rate", type=float, default=0.35, help="Pause updates if recent weird-box rate exceeds this.")
     parser.add_argument("--throttle-box-jump-rate", type=float, default=0.15, help="Pause updates if recent box-jump rate exceeds this.")
-    parser.add_argument("--min-promotion-det-rate", type=float, default=0.95, help="Minimum candidate Det.@conf required for promotion.")
+    parser.add_argument(
+        "--promotion-policy",
+        choices=["strict", "relaxed", "diagnostic"],
+        default="strict",
+        help="strict uses deployment-safe gates; relaxed allows lower detection floor; diagnostic logs would-promote events.",
+    )
+    parser.add_argument(
+        "--allow-diagnostic-promotions",
+        action="store_true",
+        help="If set with diagnostic policy, actually promote candidates that satisfy diagnostic gates.",
+    )
+    parser.add_argument(
+        "--min-promotion-det-rate",
+        type=float,
+        default=None,
+        help="Minimum candidate Det.@conf required for promotion. Defaults are selected by --promotion-policy.",
+    )
     parser.add_argument(
         "--promotion-det-margin",
         type=float,
-        default=-0.01,
-        help="Candidate det rate may be this much below active if reliability improves. Negative allows small drop.",
+        default=None,
+        help="Candidate det rate may be this much below active if reliability improves. Defaults are selected by --promotion-policy.",
     )
     parser.add_argument(
         "--max-promotion-latency-ms",
@@ -198,6 +285,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema-decay", type=float, default=0.999, help="Shadow teacher EMA decay.")
     parser.add_argument("--grad-clip", type=float, default=10.0, help="Shadow gradient clipping max norm.")
     parser.add_argument(
+        "--shadow-learner-mode",
+        type=str,
+        choices=["head_only", "adapter"],
+        default="head_only",
+        help="Which learner internals to use for shadow adaptation.",
+    )
+    parser.add_argument(
         "--update-scope",
         type=str,
         default="head_only",
@@ -205,6 +299,35 @@ def parse_args() -> argparse.Namespace:
         help="Shadow trainable region.",
     )
     parser.add_argument("--neck-start-idx", type=int, default=-1, help="Manual neck start index override.")
+    parser.add_argument(
+        "--shadow-adapter-layers",
+        type=str,
+        default="21",
+        help="Comma-separated adapter layer indices passed to adapter learner.",
+    )
+    parser.add_argument(
+        "--shadow-adapter-reduction",
+        type=int,
+        default=8,
+        help="Adapter bottleneck reduction ratio.",
+    )
+    parser.add_argument(
+        "--shadow-adapter-min-channels",
+        type=int,
+        default=8,
+        help="Minimum hidden channels in adapter bottleneck.",
+    )
+    parser.add_argument(
+        "--shadow-adapter-scale",
+        type=float,
+        default=1.0,
+        help="Adapter residual scale.",
+    )
+    parser.add_argument(
+        "--shadow-adapter-train-detect-head",
+        action="store_true",
+        help="Allow Detect head training in addition to adapters for ablation.",
+    )
     parser.add_argument("--buffer-size", type=int, default=32, help="Shadow replay buffer capacity.")
     parser.add_argument("--update-batch-size", type=int, default=4, help="Shadow replay mini-batch size.")
     parser.add_argument("--min-buffer-before-update", type=int, default=4, help="Minimum buffer entries before updates.")
@@ -238,9 +361,92 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box-jump-center-frac", type=float, default=0.20, help="Reliability box-jump center shift threshold.")
     parser.add_argument("--good-conf", type=float, default=0.75, help="High-confidence threshold for high-conf weird metrics.")
     parser.add_argument("--warmup", type=int, default=0, help="Shadow teacher warmup frames.")
+    parser.add_argument(
+        "--max-bad-streak-ratio",
+        type=float,
+        default=1.0,
+        help="Candidate max bad streak must be <= active max bad streak times this ratio. 1.0 preserves strict behavior.",
+    )
+    parser.add_argument(
+        "--max-bad-streak-absolute-cap",
+        type=int,
+        default=0,
+        help="If >0, candidate max bad streak must be <= this cap.",
+    )
+    parser.add_argument(
+        "--max-long-bad-streaks",
+        type=int,
+        default=0,
+        help="If >0, reject candidate if number of bad streaks longer than --long-bad-streak-thresh exceeds this.",
+    )
+    parser.add_argument(
+        "--long-bad-streak-thresh",
+        type=int,
+        default=30,
+        help="Threshold for counting long bad streaks.",
+    )
+    parser.add_argument(
+        "--use-p95-bad-streak-gate",
+        action="store_true",
+        help="Use p95 bad-streak length instead of max bad streak as a promotion condition.",
+    )
+    parser.add_argument(
+        "--p95-bad-streak-ratio",
+        type=float,
+        default=1.0,
+        help="Candidate p95 bad streak must be <= active p95 bad streak times this ratio.",
+    )
+    parser.add_argument(
+        "--enable-active-streak-rollback",
+        action="store_true",
+        help="Monitor active inference reliability and rollback to previous active checkpoint if active bad streak gets too long.",
+    )
+    parser.add_argument(
+        "--active-rollback-bad-streak",
+        type=int,
+        default=80,
+        help="Rollback active model if current bad streak reaches this length.",
+    )
+    parser.add_argument(
+        "--active-rollback-min-frames-after-promotion",
+        type=int,
+        default=100,
+        help="Do not rollback immediately after promotion until this many frames have passed.",
+    )
+    parser.add_argument(
+        "--checkpoint-selection",
+        action="store_true",
+        help="After the run, score saved shadow checkpoints and report best checkpoints by multiple criteria.",
+    )
+    parser.add_argument(
+        "--checkpoint-selection-eval-window",
+        type=int,
+        default=500,
+        help="Number of ordered frames used to evaluate each checkpoint for checkpoint selection.",
+    )
+    parser.add_argument(
+        "--checkpoint-selection-stride",
+        type=int,
+        default=1,
+        help="Evaluate every Nth saved checkpoint to reduce runtime. 1 means evaluate all.",
+    )
+    parser.add_argument(
+        "--checkpoint-selection-max-checkpoints",
+        type=int,
+        default=0,
+        help="Optional cap on number of checkpoints evaluated. 0 means no cap.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed.")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress output.")
     return parser.parse_args()
+
+
+def apply_promotion_policy_defaults(args: argparse.Namespace) -> None:
+    policy_defaults = PROMOTION_POLICY_DEFAULTS[str(args.promotion_policy)]
+    if args.min_promotion_det_rate is None:
+        args.min_promotion_det_rate = float(policy_defaults["min_promotion_det_rate"])
+    if args.promotion_det_margin is None:
+        args.promotion_det_margin = float(policy_defaults["promotion_det_margin"])
 
 
 def shadow_config_from_args(args: argparse.Namespace) -> ShadowLearnerConfig:
@@ -255,8 +461,14 @@ def shadow_config_from_args(args: argparse.Namespace) -> ShadowLearnerConfig:
         weight_decay=float(args.weight_decay),
         ema_decay=float(args.ema_decay),
         grad_clip=float(args.grad_clip),
+        learner_mode=str(args.shadow_learner_mode),
         update_scope=str(args.update_scope),
         neck_start_idx=int(args.neck_start_idx),
+        adapter_layers=str(args.shadow_adapter_layers),
+        adapter_reduction=int(args.shadow_adapter_reduction),
+        adapter_min_channels=int(args.shadow_adapter_min_channels),
+        adapter_scale=float(args.shadow_adapter_scale),
+        adapter_train_detect_head=bool(args.shadow_adapter_train_detect_head),
         buffer_size=int(args.buffer_size),
         update_batch_size=int(args.update_batch_size),
         min_buffer_before_update=int(args.min_buffer_before_update),
@@ -300,20 +512,68 @@ class ShadowODADLearner:
         if self.head_idx != teacher_head_idx:
             raise RuntimeError(f"Shadow student/teacher head mismatch: student={self.head_idx}, teacher={teacher_head_idx}")
 
+        self.learner_mode = str(config.learner_mode)
+        self.adapter_enabled = self.learner_mode == "adapter"
+        self.adapter_layer_indices: List[int] = []
+        self.adapter_specs: List[AdapterSpec] = []
+        self.adapter_trainable_params = 0
+        self.train_mode_callback = None
+
         self.neck_start_idx = resolve_neck_start_idx(self.core_model, int(config.neck_start_idx))
-        self.unfrozen_indices = compute_unfrozen_indices(
-            update_scope=config.update_scope,
-            neck_start_idx=self.neck_start_idx,
-            head_idx=self.head_idx,
-            n_layers=len(self.layers),
-        )
-        if config.update_scope == "head_only" and self.layers[self.head_idx].__class__.__name__ != "Detect":
+        if self.adapter_enabled:
+            self.adapter_layer_indices = parse_adapter_layers(str(config.adapter_layers))
+            self.layers, self.adapter_specs = attach_residual_adapters(
+                core_model=self.core_model,
+                layers=self.layers,
+                adapter_layers=self.adapter_layer_indices,
+                imgsz=int(config.imgsz),
+                device=str(config.device),
+                reduction=int(config.adapter_reduction),
+                min_channels=int(config.adapter_min_channels),
+                scale=float(config.adapter_scale),
+            )
+            _, teacher_layers = unwrap_core_and_layers(self.teacher_model)
+            teacher_layers, _teacher_specs = attach_residual_adapters(
+                core_model=self.teacher_model,
+                layers=teacher_layers,
+                adapter_layers=self.adapter_layer_indices,
+                imgsz=int(config.imgsz),
+                device=str(config.device),
+                reduction=int(config.adapter_reduction),
+                min_channels=int(config.adapter_min_channels),
+                scale=float(config.adapter_scale),
+            )
+            self.teacher_model.load_state_dict(self.student_model.state_dict(), strict=True)
+            assert_matching_adapter_state(self.student_model, self.teacher_model)
+            self.adapter_trainable_params = adapter_param_count(self.student_model)
+            self.unfrozen_indices = [self.head_idx] if bool(config.adapter_train_detect_head) else []
+            self.train_mode_callback = freeze_frozen_batchnorm_stats
+        else:
+            self.unfrozen_indices = compute_unfrozen_indices(
+                update_scope=config.update_scope,
+                neck_start_idx=self.neck_start_idx,
+                head_idx=self.head_idx,
+                n_layers=len(self.layers),
+            )
+        if (
+            not self.adapter_enabled
+            and config.update_scope == "head_only"
+            and self.layers[self.head_idx].__class__.__name__ != "Detect"
+        ):
             raise RuntimeError(
                 f"update_scope=head_only expects Detect head, found {self.layers[self.head_idx].__class__.__name__}."
             )
 
-        apply_freeze_policy(self.student_model, self.layers, self.unfrozen_indices)
-        expected_trainable = param_id_set_for_indices(self.layers, self.unfrozen_indices)
+        if self.adapter_enabled:
+            expected_trainable = apply_adapter_freeze_policy(
+                model=self.student_model,
+                layers=self.layers,
+                head_idx=self.head_idx,
+                train_detect_head=bool(config.adapter_train_detect_head),
+            )
+        else:
+            apply_freeze_policy(self.student_model, self.layers, self.unfrozen_indices)
+            expected_trainable = param_id_set_for_indices(self.layers, self.unfrozen_indices)
         actual_trainable = {id(param) for param in self.student_model.parameters() if param.requires_grad}
         if expected_trainable != actual_trainable:
             raise RuntimeError("Shadow freeze policy mismatch.")
@@ -327,7 +587,21 @@ class ShadowODADLearner:
             weight_decay=config.weight_decay,
         )
         self.trainable_params = int(sum(param.numel() for param in self.optim_params))
-        self.unfrozen_modules = [f"{idx}:{self.layers[idx].__class__.__name__}" for idx in self.unfrozen_indices]
+        if self.adapter_enabled:
+            self.unfrozen_modules = [
+                (
+                    f"{spec.layer_idx}:ResidualConvAdapter("
+                    f"C={spec.in_channels}, hidden={spec.hidden_channels}, params={spec.param_count}, scale={spec.scale:g})"
+                )
+                for spec in self.adapter_specs
+            ]
+            if bool(config.adapter_train_detect_head):
+                self.unfrozen_modules.append(f"{self.head_idx}:{self.layers[self.head_idx].__class__.__name__}")
+        else:
+            self.unfrozen_modules = [f"{idx}:{self.layers[idx].__class__.__name__}" for idx in self.unfrozen_indices]
+        self.student_model.odad_adaptation_mode = self.learner_mode
+        self.student_model.odad_adapter_train_detect_head = bool(config.adapter_train_detect_head)
+        self.student_model.odad_adapter_specs = [spec.__dict__.copy() for spec in self.adapter_specs]
 
         if isinstance(self.student_model.args, dict):
             hyp_dict = dict(self.student_model.args)
@@ -461,7 +735,15 @@ class ShadowODADLearner:
                 if not target_entries:
                     break
 
-                apply_freeze_policy(self.student_model, self.layers, self.unfrozen_indices)
+                if self.adapter_enabled:
+                    apply_adapter_freeze_policy(
+                        model=self.student_model,
+                        layers=self.layers,
+                        head_idx=self.head_idx,
+                        train_detect_head=bool(cfg.adapter_train_detect_head),
+                    )
+                else:
+                    apply_freeze_policy(self.student_model, self.layers, self.unfrozen_indices)
                 update_t0 = time.time()
                 batch = build_training_batch(
                     target_entries=target_entries,
@@ -476,6 +758,7 @@ class ShadowODADLearner:
                     optim_params=self.optim_params,
                     batch=batch,
                     grad_clip=cfg.grad_clip,
+                    train_mode_callback=self.train_mode_callback,
                 )
                 update_latency_ms += (time.time() - update_t0) * 1000.0
                 update_teacher_ema(
@@ -650,6 +933,28 @@ def prediction_record_from_top1(
     )
 
 
+def prediction_record_is_weird(record: PredictionRecord) -> bool:
+    return bool(record.tiny_box or record.large_box or record.border_touching)
+
+
+def prediction_record_is_bad(record: PredictionRecord, args: argparse.Namespace) -> bool:
+    return bool(
+        (not record.has_detection)
+        or record.top1_conf < float(args.conf)
+        or prediction_record_is_weird(record)
+        or record.box_jump
+    )
+
+
+def prediction_record_is_good(record: PredictionRecord, args: argparse.Namespace) -> bool:
+    return bool(
+        record.has_detection
+        and record.top1_conf >= float(args.conf)
+        and not prediction_record_is_weird(record)
+        and not record.box_jump
+    )
+
+
 def reliability_metrics(records: Sequence[PredictionRecord], args: argparse.Namespace) -> Dict[str, float]:
     n = len(records)
     if n == 0:
@@ -661,29 +966,33 @@ def reliability_metrics(records: Sequence[PredictionRecord], args: argparse.Name
             "weird_box_rate": float("nan"),
             "high_conf_weird_rate": float("nan"),
             "box_jump_rate": float("nan"),
+            "bad_frame_rate": float("nan"),
+            "good_frame_rate": float("nan"),
+            "bad_streak_count": 0,
             "max_bad_streak": 0,
+            "mean_bad_streak_len": float("nan"),
+            "p90_bad_streak_len": float("nan"),
+            "p95_bad_streak_len": float("nan"),
+            "long_bad_streak_count": 0,
             "max_good_streak": 0,
             "mean_good_streak_len": float("nan"),
             "num_good_streaks": 0,
+            "p90_good_streak_len": float("nan"),
+            "p95_good_streak_len": float("nan"),
             "mean_inference_latency_ms": float("nan"),
             "p90_inference_latency_ms": float("nan"),
         }
-    weird_flags = [bool(r.tiny_box or r.large_box or r.border_touching) for r in records]
+    weird_flags = [prediction_record_is_weird(r) for r in records]
     high_conf_weird = [bool(r.top1_conf >= float(args.good_conf) and weird) for r, weird in zip(records, weird_flags)]
     box_jump_flags = [bool(r.box_jump) for r in records]
     det_flags = [bool(r.top1_conf >= float(args.conf)) for r in records]
-    bad_flags = [
-        bool((not r.has_detection) or r.top1_conf < float(args.conf) or weird or r.box_jump)
-        for r, weird in zip(records, weird_flags)
-    ]
-    good_flags = [
-        bool(r.has_detection and r.top1_conf >= float(args.conf) and (not weird) and (not r.box_jump))
-        for r, weird in zip(records, weird_flags)
-    ]
+    bad_flags = [prediction_record_is_bad(r, args) for r in records]
+    good_flags = [prediction_record_is_good(r, args) for r in records]
     bad_streaks = streak_lengths(bad_flags)
     good_streaks = streak_lengths(good_flags)
     latencies = [r.latency_ms for r in records]
     confs = np.asarray([r.top1_conf for r in records], dtype=np.float32)
+    long_bad_thresh = int(getattr(args, "long_bad_streak_thresh", 30))
     return {
         "n_frames": float(n),
         "det_rate_at_conf": float(np.mean(np.asarray(det_flags, dtype=np.float32))),
@@ -692,24 +1001,40 @@ def reliability_metrics(records: Sequence[PredictionRecord], args: argparse.Name
         "weird_box_rate": float(np.mean(np.asarray(weird_flags, dtype=np.float32))),
         "high_conf_weird_rate": float(np.mean(np.asarray(high_conf_weird, dtype=np.float32))),
         "box_jump_rate": float(np.mean(np.asarray(box_jump_flags, dtype=np.float32))) if n > 1 else 0.0,
+        "bad_frame_rate": float(np.mean(np.asarray(bad_flags, dtype=np.float32))),
+        "good_frame_rate": float(np.mean(np.asarray(good_flags, dtype=np.float32))),
+        "bad_streak_count": float(len(bad_streaks)),
         "max_bad_streak": float(max(bad_streaks) if bad_streaks else 0),
+        "mean_bad_streak_len": mean_or_nan([float(v) for v in bad_streaks]),
+        "p90_bad_streak_len": percentile_or_nan([float(v) for v in bad_streaks], 90),
+        "p95_bad_streak_len": percentile_or_nan([float(v) for v in bad_streaks], 95),
+        "long_bad_streak_count": float(sum(int(length) > long_bad_thresh for length in bad_streaks)),
         "max_good_streak": float(max(good_streaks) if good_streaks else 0),
         "mean_good_streak_len": mean_or_nan([float(v) for v in good_streaks]),
         "num_good_streaks": float(len(good_streaks)),
+        "p90_good_streak_len": percentile_or_nan([float(v) for v in good_streaks], 90),
+        "p95_good_streak_len": percentile_or_nan([float(v) for v in good_streaks], 95),
         "mean_inference_latency_ms": mean_or_nan(latencies),
         "p90_inference_latency_ms": percentile_or_nan(latencies, 90),
     }
 
 
+def composite_score(metrics: Mapping[str, float]) -> float:
+    score = 0.0
+    for metric_name, weight in COMPOSITE_SCORE_WEIGHTS.items():
+        score += float(weight) * float(metrics.get(metric_name, 0.0))
+    return float(score)
+
+
 def promotion_score(metrics: Mapping[str, float]) -> float:
-    return float(
-        float(metrics.get("det_rate_at_conf", 0.0))
-        - 0.5 * float(metrics.get("weird_box_rate", 0.0))
-        - 0.75 * float(metrics.get("box_jump_rate", 0.0))
-        - 0.5 * float(metrics.get("high_conf_weird_rate", 0.0))
-        - 0.002 * float(metrics.get("max_bad_streak", 0.0))
-        + 0.001 * float(metrics.get("max_good_streak", 0.0))
-    )
+    return composite_score(metrics)
+
+
+def add_score_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    score = composite_score(metrics)
+    metrics["composite_score"] = score
+    metrics["promotion_score"] = score
+    return metrics
 
 
 def evaluate_model_window(
@@ -743,8 +1068,7 @@ def evaluate_model_window(
         )
         records.append(record)
         prev_record = record
-    metrics = reliability_metrics(records, args)
-    metrics["promotion_score"] = promotion_score(metrics)
+    metrics = add_score_metrics(reliability_metrics(records, args))
     return records, metrics
 
 
@@ -765,39 +1089,112 @@ def cuda_resource_metrics(device: str) -> Dict[str, float]:
     }
 
 
-def should_promote(
+def metric_strongly_improved(
+    active_metrics: Mapping[str, float],
+    shadow_metrics: Mapping[str, float],
+    metric_name: str,
+    min_abs_delta: float,
+    min_relative_drop: float,
+) -> bool:
+    active_value = float(active_metrics.get(metric_name, float("nan")))
+    shadow_value = float(shadow_metrics.get(metric_name, float("nan")))
+    if not (math.isfinite(active_value) and math.isfinite(shadow_value)):
+        return False
+    abs_improved = shadow_value <= active_value - float(min_abs_delta)
+    rel_improved = active_value > 0.0 and shadow_value <= active_value * (1.0 - float(min_relative_drop))
+    return bool(abs_improved or rel_improved)
+
+
+def relaxed_streak_gate_has_strong_reliability_gain(
+    active_metrics: Mapping[str, float],
+    shadow_metrics: Mapping[str, float],
+) -> bool:
+    return bool(
+        metric_strongly_improved(active_metrics, shadow_metrics, "weird_box_rate", 0.01, 0.10)
+        and metric_strongly_improved(active_metrics, shadow_metrics, "high_conf_weird_rate", 0.005, 0.10)
+        and metric_strongly_improved(active_metrics, shadow_metrics, "box_jump_rate", 0.005, 0.10)
+        and float(shadow_metrics.get("composite_score", promotion_score(shadow_metrics)))
+        > float(active_metrics.get("composite_score", promotion_score(active_metrics)))
+    )
+
+
+def evaluate_promotion_decision(
     active_metrics: Mapping[str, float],
     shadow_metrics: Mapping[str, float],
     resource_metrics: Mapping[str, float],
     promotions_so_far: int,
     args: argparse.Namespace,
-) -> Tuple[bool, List[str]]:
+) -> PromotionDecision:
     reasons: List[str] = []
+    hard_gate_reasons: List[str] = []
     active_score = promotion_score(active_metrics)
     shadow_score = promotion_score(shadow_metrics)
     shadow_det = float(shadow_metrics["det_rate_at_conf"])
     active_det = float(active_metrics["det_rate_at_conf"])
+    policy = str(args.promotion_policy)
+    active_max_bad = float(active_metrics.get("max_bad_streak", 0.0))
+    shadow_max_bad = float(shadow_metrics.get("max_bad_streak", 0.0))
+    max_bad_ratio_gate = max(0.0, float(args.max_bad_streak_ratio))
+    max_bad_allowed = active_max_bad * max_bad_ratio_gate
+    if active_max_bad <= 0.0:
+        max_bad_ratio = 0.0 if shadow_max_bad <= 0.0 else float("inf")
+    else:
+        max_bad_ratio = shadow_max_bad / active_max_bad
+    active_p95_bad = float(active_metrics.get("p95_bad_streak_len", 0.0))
+    shadow_p95_bad = float(shadow_metrics.get("p95_bad_streak_len", 0.0))
+    if not math.isfinite(active_p95_bad):
+        active_p95_bad = 0.0
+    if not math.isfinite(shadow_p95_bad):
+        shadow_p95_bad = 0.0
+    p95_allowed = active_p95_bad * max(0.0, float(args.p95_bad_streak_ratio))
+    active_long_bad_count = float(active_metrics.get("long_bad_streak_count", 0.0))
+    shadow_long_bad_count = float(shadow_metrics.get("long_bad_streak_count", 0.0))
 
-    relaxed_floor = (
-        float(args.promotion_det_margin) < 0.0
-        and shadow_det >= active_det + float(args.promotion_det_margin)
-        and shadow_score > active_score
-    )
-    checks = [
+    streak_gate_reasons: List[str] = []
+    if bool(args.use_p95_bad_streak_gate):
+        if shadow_p95_bad > p95_allowed + 1e-12:
+            streak_gate_reasons.append(
+                "p95_bad_streak_gate"
+                f"(shadow={shadow_p95_bad:.2f}, active={active_p95_bad:.2f}, allowed={p95_allowed:.2f})"
+            )
+    else:
+        if shadow_max_bad > max_bad_allowed + 1e-12:
+            streak_gate_reasons.append(
+                "max_bad_streak_ratio_gate"
+                f"(shadow={shadow_max_bad:.0f}, active={active_max_bad:.0f}, ratio={max_bad_ratio_gate:.3f}, allowed={max_bad_allowed:.1f})"
+            )
+        relaxed_max_bad_used = bool(max_bad_ratio_gate > 1.0 and shadow_max_bad > active_max_bad + 1e-12)
+        if relaxed_max_bad_used and not relaxed_streak_gate_has_strong_reliability_gain(active_metrics, shadow_metrics):
+            streak_gate_reasons.append("relaxed_streak_gate_requires_strong_reliability_gain")
+    absolute_cap = int(args.max_bad_streak_absolute_cap)
+    if absolute_cap > 0 and shadow_max_bad > float(absolute_cap) + 1e-12:
+        streak_gate_reasons.append(f"max_bad_streak_absolute_cap(shadow={shadow_max_bad:.0f}, cap={absolute_cap})")
+    max_long_bad = int(args.max_long_bad_streaks)
+    if max_long_bad > 0 and shadow_long_bad_count > float(max_long_bad) + 1e-12:
+        streak_gate_reasons.append(
+            "max_long_bad_streaks"
+            f"(shadow={shadow_long_bad_count:.0f}, max={max_long_bad}, thresh={int(args.long_bad_streak_thresh)})"
+        )
+    streak_gate_block_reason = "passed" if not streak_gate_reasons else ";".join(streak_gate_reasons)
+
+    checks: List[Tuple[bool, str, bool]] = [
         (
             promotions_so_far < int(args.max_promotions),
             f"max_promotions_reached({promotions_so_far}/{int(args.max_promotions)})",
+            True,
         ),
         (
-            shadow_det >= float(args.min_promotion_det_rate) or relaxed_floor,
+            shadow_det >= float(args.min_promotion_det_rate),
             (
                 "det_floor"
-                f"(shadow={shadow_det:.4f}, min={float(args.min_promotion_det_rate):.4f}, relaxed={int(relaxed_floor)})"
+                f"(shadow={shadow_det:.4f}, min={float(args.min_promotion_det_rate):.4f})"
             ),
+            True,
         ),
         (
             shadow_det >= active_det + float(args.promotion_det_margin),
             f"det_margin(shadow={shadow_det:.4f}, active={active_det:.4f}, margin={float(args.promotion_det_margin):.4f})",
+            True,
         ),
         (
             float(shadow_metrics["weird_box_rate"]) <= float(active_metrics["weird_box_rate"]) + 1e-12,
@@ -805,6 +1202,7 @@ def should_promote(
                 "weird_not_improved"
                 f"(shadow={float(shadow_metrics['weird_box_rate']):.4f}, active={float(active_metrics['weird_box_rate']):.4f})"
             ),
+            False,
         ),
         (
             float(shadow_metrics["box_jump_rate"]) <= float(active_metrics["box_jump_rate"]) + 1e-12,
@@ -812,13 +1210,12 @@ def should_promote(
                 "box_jump_not_improved"
                 f"(shadow={float(shadow_metrics['box_jump_rate']):.4f}, active={float(active_metrics['box_jump_rate']):.4f})"
             ),
+            False,
         ),
         (
-            float(shadow_metrics["max_bad_streak"]) <= float(active_metrics["max_bad_streak"]) + 1e-12,
-            (
-                "max_bad_streak_not_improved"
-                f"(shadow={float(shadow_metrics['max_bad_streak']):.0f}, active={float(active_metrics['max_bad_streak']):.0f})"
-            ),
+            not streak_gate_reasons,
+            f"streak_gate({streak_gate_block_reason})",
+            False,
         ),
         (
             float(shadow_metrics["max_good_streak"]) >= float(active_metrics["max_good_streak"]) - 1e-12
@@ -827,10 +1224,12 @@ def should_promote(
                 "max_good_streak_or_score"
                 f"(shadow_good={float(shadow_metrics['max_good_streak']):.0f}, active_good={float(active_metrics['max_good_streak']):.0f})"
             ),
+            False,
         ),
         (
             shadow_score > active_score,
             f"score_not_improved(shadow={shadow_score:.6f}, active={active_score:.6f})",
+            False,
         ),
     ]
     if float(args.max_promotion_latency_ms) > 0.0:
@@ -841,6 +1240,7 @@ def should_promote(
                     "latency_budget"
                     f"(shadow={float(shadow_metrics['mean_inference_latency_ms']):.3f}, max={float(args.max_promotion_latency_ms):.3f})"
                 ),
+                True,
             )
         )
     if float(args.max_promotion_memory_mb) > 0.0:
@@ -849,13 +1249,47 @@ def should_promote(
             (
                 math.isfinite(peak_reserved) and peak_reserved <= float(args.max_promotion_memory_mb),
                 f"memory_budget(peak_reserved={peak_reserved:.1f}, max={float(args.max_promotion_memory_mb):.1f})",
+                True,
             )
         )
 
-    for passed, fail_reason in checks:
+    for passed, fail_reason, hard_gate in checks:
         if not passed:
             reasons.append(fail_reason)
-    return len(reasons) == 0, reasons
+            if hard_gate:
+                hard_gate_reasons.append(fail_reason)
+
+    would_promote = len(reasons) == 0
+    promote = bool(would_promote and (policy != "diagnostic" or bool(args.allow_diagnostic_promotions)))
+    block_reason = "passed" if would_promote else ";".join(reasons)
+    if would_promote and policy == "diagnostic" and not bool(args.allow_diagnostic_promotions):
+        block_reason = "diagnostic_would_promote_not_applied"
+
+    return PromotionDecision(
+        promote=promote,
+        would_promote=would_promote,
+        hard_gate_passed=len(hard_gate_reasons) == 0,
+        fail_reasons=reasons,
+        promotion_block_reason=block_reason,
+        streak_gate_block_reason=streak_gate_block_reason,
+        policy=policy,
+        active_score=active_score,
+        shadow_score=shadow_score,
+        composite_score_delta=shadow_score - active_score,
+        det_rate_delta=shadow_det - active_det,
+        weird_rate_delta=float(shadow_metrics["weird_box_rate"]) - float(active_metrics["weird_box_rate"]),
+        box_jump_delta=float(shadow_metrics["box_jump_rate"]) - float(active_metrics["box_jump_rate"]),
+        bad_streak_delta=float(shadow_metrics["max_bad_streak"]) - float(active_metrics["max_bad_streak"]),
+        good_streak_delta=float(shadow_metrics["max_good_streak"]) - float(active_metrics["max_good_streak"]),
+        max_bad_streak_ratio=float(max_bad_ratio),
+        max_bad_streak_allowed=float(max_bad_allowed),
+        active_p95_bad_streak=active_p95_bad,
+        shadow_p95_bad_streak=shadow_p95_bad,
+        p95_bad_streak_delta=shadow_p95_bad - active_p95_bad,
+        active_long_bad_streak_count=active_long_bad_count,
+        shadow_long_bad_streak_count=shadow_long_bad_count,
+        long_bad_streak_delta=shadow_long_bad_count - active_long_bad_count,
+    )
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, object]], fieldnames: Sequence[str]) -> None:
@@ -885,6 +1319,8 @@ def summarize_resource_row(
     shadow_logs: Sequence[FrameLog],
     checkpoint_path: Optional[Path],
     trainable_params: int,
+    adapter_trainable_params: int,
+    learner_mode: str,
     device: str,
 ) -> Dict[str, object]:
     active_mean = mean_or_nan(active_latencies)
@@ -906,6 +1342,8 @@ def summarize_resource_row(
         "current_cuda_allocated_mb": resource["current_cuda_allocated_mb"],
         "current_cuda_reserved_mb": resource["current_cuda_reserved_mb"],
         "checkpoint_size_mb": path_size_mb(checkpoint_path),
+        "shadow_learner_mode": str(learner_mode),
+        "adapter_trainable_params": int(adapter_trainable_params),
         "trainable_params": int(trainable_params),
     }
 
@@ -1025,8 +1463,401 @@ def maybe_progress(total: int, disabled: bool):
     return tqdm(total=total, desc="Shadow ODAD", dynamic_ncols=True)
 
 
+def infer_model_kind(weights: str) -> str:
+    text = str(weights).lower()
+    name = Path(str(weights)).name.lower()
+    if "fda_mix" in text or "yolov8_fda_mix" in text:
+        return "fda_mix"
+    if "adapter" in text:
+        return "adapter_odad"
+    if "online_adapt_topk2_full" in text or "topk2" in text:
+        return "current_odad"
+    if "shadow_frame_" in name:
+        return "shadow_checkpoint"
+    if "active_frame_" in name:
+        return "promoted_shadow"
+    if "yolov8_baseline" in text or ("baseline" in text and "weights/best.pt" in text):
+        return "baseline"
+    return "custom"
+
+
+def reset_cuda_peak_stats(device: str) -> None:
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(torch.device(str(device)))
+
+
+def checkpoint_frame_from_path(path: Path) -> int:
+    match = re.search(r"frame_(\d+)", path.stem)
+    return int(match.group(1)) if match else -1
+
+
+def collect_checkpoint_selection_paths(checkpoints_dir: Path, args: argparse.Namespace) -> List[Path]:
+    paths = sorted(checkpoints_dir.glob("*.pt"), key=lambda p: (checkpoint_frame_from_path(p), str(p)))
+    stride = max(1, int(args.checkpoint_selection_stride))
+    paths = paths[::stride]
+    max_checkpoints = int(args.checkpoint_selection_max_checkpoints)
+    if max_checkpoints > 0:
+        paths = paths[:max_checkpoints]
+    return paths
+
+
+def safe_row_float(row: Mapping[str, object], key: str, default: float = float("nan")) -> float:
+    try:
+        return float(row.get(key, default))
+    except Exception:
+        return default
+
+
+def row_edge_feasible(row: Mapping[str, object], args: argparse.Namespace) -> bool:
+    latency_limit = float(args.max_promotion_latency_ms)
+    memory_limit = float(args.max_promotion_memory_mb)
+    latency_ok = True
+    memory_ok = True
+    if latency_limit > 0.0:
+        latency_ok = safe_row_float(row, "mean_inference_latency_ms") <= latency_limit
+    if memory_limit > 0.0:
+        peak_memory = safe_row_float(row, "peak_memory_mb")
+        memory_ok = math.isfinite(peak_memory) and peak_memory <= memory_limit
+    return bool(latency_ok and memory_ok)
+
+
+def choose_best_checkpoint(
+    rows: Sequence[Mapping[str, object]],
+    category: str,
+    args: argparse.Namespace,
+) -> Optional[Mapping[str, object]]:
+    candidates = list(rows)
+    if category == "best_reliability_given_det_floor_95":
+        candidates = [row for row in candidates if safe_row_float(row, "det_rate_at_conf") >= 0.95]
+    elif category == "best_reliability_given_det_floor_93":
+        candidates = [row for row in candidates if safe_row_float(row, "det_rate_at_conf") >= 0.93]
+    elif category == "best_edge_feasible_score_if_latency_memory_available":
+        candidates = [row for row in candidates if row_edge_feasible(row, args)]
+
+    if not candidates:
+        return None
+
+    if category == "best_det_rate":
+        key_fn = lambda row: (
+            safe_row_float(row, "det_rate_at_conf"),
+            safe_row_float(row, "composite_score"),
+            -safe_row_float(row, "weird_box_rate"),
+            -safe_row_float(row, "box_jump_rate"),
+        )
+        return max(candidates, key=key_fn)
+    if category == "best_max_good_streak":
+        key_fn = lambda row: (
+            safe_row_float(row, "max_good_streak"),
+            safe_row_float(row, "composite_score"),
+            safe_row_float(row, "det_rate_at_conf"),
+        )
+        return max(candidates, key=key_fn)
+    if category == "best_min_bad_streak":
+        key_fn = lambda row: (
+            -safe_row_float(row, "max_bad_streak", 1e9),
+            safe_row_float(row, "composite_score"),
+            safe_row_float(row, "det_rate_at_conf"),
+        )
+        return max(candidates, key=key_fn)
+
+    key_fn = lambda row: (
+        safe_row_float(row, "composite_score"),
+        safe_row_float(row, "det_rate_at_conf"),
+        -safe_row_float(row, "weird_box_rate"),
+        -safe_row_float(row, "box_jump_rate"),
+        -safe_row_float(row, "max_bad_streak"),
+        safe_row_float(row, "max_good_streak"),
+    )
+    return max(candidates, key=key_fn)
+
+
+def checkpoint_selection_categories(
+    rows: Sequence[Mapping[str, object]],
+    args: argparse.Namespace,
+) -> Dict[str, Optional[Mapping[str, object]]]:
+    categories = [
+        "best_det_rate",
+        "best_composite_score",
+        "best_reliability_given_det_floor_95",
+        "best_reliability_given_det_floor_93",
+        "best_max_good_streak",
+        "best_min_bad_streak",
+        "best_edge_feasible_score_if_latency_memory_available",
+    ]
+    return {category: choose_best_checkpoint(rows, category, args) for category in categories}
+
+
+def save_checkpoint_selection_plots(
+    out_dir: Path,
+    rows: Sequence[Mapping[str, object]],
+    active_reference_metrics: Mapping[str, float],
+) -> None:
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    x = np.asarray(
+        [
+            int(row["checkpoint_frame"]) if int(row["checkpoint_frame"]) >= 0 else int(row["checkpoint_index"])
+            for row in rows
+        ],
+        dtype=np.int32,
+    )
+
+    def arr(key: str) -> np.ndarray:
+        return np.asarray([safe_row_float(row, key) for row in rows], dtype=np.float32)
+
+    ref_score = np.full_like(arr("composite_score"), float(active_reference_metrics.get("composite_score", float("nan"))))
+    save_plot_lines(
+        x,
+        [arr("composite_score"), ref_score],
+        ["shadow_checkpoint", "active_reference"],
+        "Checkpoint Selection Score",
+        "checkpoint_frame",
+        "score",
+        plots_dir / "plot_checkpoint_selection_score.png",
+    )
+    save_plot_lines(
+        x,
+        [arr("det_rate_at_conf"), arr("weird_box_rate"), arr("box_jump_rate")],
+        ["det_rate", "weird_rate", "box_jump_rate"],
+        "Checkpoint Selection Detection and Reliability",
+        "checkpoint_frame",
+        "rate",
+        plots_dir / "plot_checkpoint_selection_det_weird_jump.png",
+    )
+    save_plot_lines(
+        x,
+        [arr("max_good_streak"), arr("max_bad_streak")],
+        ["max_good_streak", "max_bad_streak"],
+        "Checkpoint Selection Streaks",
+        "checkpoint_frame",
+        "frames",
+        plots_dir / "plot_checkpoint_selection_streaks.png",
+    )
+
+
+def format_checkpoint_summary_row(category: str, row: Optional[Mapping[str, object]]) -> str:
+    if row is None:
+        return f"  {category}: n/a"
+    return (
+        f"  {category}: frame={int(row['checkpoint_frame'])} "
+        f"det={safe_row_float(row, 'det_rate_at_conf'):.4f} "
+        f"weird={safe_row_float(row, 'weird_box_rate'):.4f} "
+        f"high_conf_weird={safe_row_float(row, 'high_conf_weird_rate'):.4f} "
+        f"box_jump={safe_row_float(row, 'box_jump_rate'):.4f} "
+        f"max_bad={safe_row_float(row, 'max_bad_streak'):.0f} "
+        f"p95_bad={safe_row_float(row, 'p95_bad_streak_len'):.1f} "
+        f"long_bad={safe_row_float(row, 'long_bad_streak_count'):.0f} "
+        f"max_good={safe_row_float(row, 'max_good_streak'):.0f} "
+        f"score={safe_row_float(row, 'composite_score'):.6f} "
+        f"checkpoint={row['checkpoint']}"
+    )
+
+
+def evaluate_checkpoint_selection(
+    out_dir: Path,
+    checkpoints_dir: Path,
+    images: Sequence[Path],
+    image_sizes: Mapping[Path, Tuple[int, int]],
+    active_initial_weights: str,
+    active_final_weights: str,
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, object]], Dict[str, Optional[Mapping[str, object]]], Dict[str, float]]:
+    checkpoint_paths = collect_checkpoint_selection_paths(checkpoints_dir, args)
+    eval_n = min(max(1, int(args.checkpoint_selection_eval_window)), len(images))
+    eval_paths = list(images[:eval_n])
+    active_reference_metrics: Dict[str, float] = {}
+    final_reference_metrics: Dict[str, float] = {}
+
+    reset_cuda_peak_stats(str(args.device))
+    active_ref_yolo = load_yolo(active_initial_weights, str(args.device))
+    _, active_reference_metrics = evaluate_model_window(
+        model_name="active_reference",
+        yolo_wrapper=active_ref_yolo,
+        image_paths=eval_paths,
+        image_sizes=image_sizes,
+        args=args,
+    )
+    del active_ref_yolo
+    cleanup_cuda()
+
+    if str(active_final_weights) != str(active_initial_weights):
+        reset_cuda_peak_stats(str(args.device))
+        final_ref_yolo = load_yolo(active_final_weights, str(args.device))
+        _, final_reference_metrics = evaluate_model_window(
+            model_name="active_final_reference",
+            yolo_wrapper=final_ref_yolo,
+            image_paths=eval_paths,
+            image_sizes=image_sizes,
+            args=args,
+        )
+        del final_ref_yolo
+        cleanup_cuda()
+
+    rows: List[Dict[str, object]] = []
+    metric_keys = [
+        "n_frames",
+        "det_rate_at_conf",
+        "mean_top1_conf",
+        "median_top1_conf",
+        "weird_box_rate",
+        "high_conf_weird_rate",
+        "box_jump_rate",
+        "bad_frame_rate",
+        "good_frame_rate",
+        "bad_streak_count",
+        "max_bad_streak",
+        "mean_bad_streak_len",
+        "p90_bad_streak_len",
+        "p95_bad_streak_len",
+        "long_bad_streak_count",
+        "max_good_streak",
+        "mean_good_streak_len",
+        "num_good_streaks",
+        "p90_good_streak_len",
+        "p95_good_streak_len",
+        "mean_inference_latency_ms",
+        "p90_inference_latency_ms",
+        "composite_score",
+        "promotion_score",
+    ]
+    for checkpoint_index, checkpoint_path in enumerate(checkpoint_paths, start=1):
+        reset_cuda_peak_stats(str(args.device))
+        candidate_yolo = load_yolo(str(checkpoint_path), str(args.device))
+        _, metrics = evaluate_model_window(
+            model_name="shadow_checkpoint",
+            yolo_wrapper=candidate_yolo,
+            image_paths=eval_paths,
+            image_sizes=image_sizes,
+            args=args,
+        )
+        resource = cuda_resource_metrics(str(args.device))
+        checkpoint_adapter_params = int(adapter_param_count(candidate_yolo.model))
+        del candidate_yolo
+        cleanup_cuda()
+
+        row: Dict[str, object] = {
+            "checkpoint_index": checkpoint_index,
+            "checkpoint_frame": checkpoint_frame_from_path(checkpoint_path),
+            "checkpoint": str(checkpoint_path),
+            "model_kind": infer_model_kind(str(checkpoint_path)),
+            "shadow_learner_mode": str(args.shadow_learner_mode),
+            "adapter_trainable_params": checkpoint_adapter_params,
+            "eval_start_frame": 0,
+            "eval_end_frame": eval_n - 1,
+            "active_reference_checkpoint": active_initial_weights,
+        }
+        for key in metric_keys:
+            row[key] = metrics.get(key, float("nan"))
+        row.update(
+            {
+                "checkpoint_size_mb": path_size_mb(checkpoint_path),
+                "peak_cuda_allocated_mb": resource["peak_cuda_allocated_mb"],
+                "peak_cuda_reserved_mb": resource["peak_cuda_reserved_mb"],
+                "peak_memory_mb": resource["peak_cuda_reserved_mb"],
+                "active_ref_det_rate_delta": float(metrics["det_rate_at_conf"])
+                - float(active_reference_metrics.get("det_rate_at_conf", float("nan"))),
+                "active_ref_composite_delta": float(metrics["composite_score"])
+                - float(active_reference_metrics.get("composite_score", float("nan"))),
+                "active_ref_weird_delta": float(metrics["weird_box_rate"])
+                - float(active_reference_metrics.get("weird_box_rate", float("nan"))),
+                "active_ref_box_jump_delta": float(metrics["box_jump_rate"])
+                - float(active_reference_metrics.get("box_jump_rate", float("nan"))),
+                "active_ref_bad_streak_delta": float(metrics["max_bad_streak"])
+                - float(active_reference_metrics.get("max_bad_streak", float("nan"))),
+                "active_ref_good_streak_delta": float(metrics["max_good_streak"])
+                - float(active_reference_metrics.get("max_good_streak", float("nan"))),
+            }
+        )
+        row["edge_feasible"] = int(row_edge_feasible(row, args))
+        rows.append(row)
+
+    categories = checkpoint_selection_categories(rows, args)
+    fieldnames = [
+        "checkpoint_index",
+        "checkpoint_frame",
+        "checkpoint",
+        "model_kind",
+        "shadow_learner_mode",
+        "adapter_trainable_params",
+        "eval_start_frame",
+        "eval_end_frame",
+        "active_reference_checkpoint",
+        *metric_keys,
+        "checkpoint_size_mb",
+        "peak_cuda_allocated_mb",
+        "peak_cuda_reserved_mb",
+        "peak_memory_mb",
+        "active_ref_det_rate_delta",
+        "active_ref_composite_delta",
+        "active_ref_weird_delta",
+        "active_ref_box_jump_delta",
+        "active_ref_bad_streak_delta",
+        "active_ref_good_streak_delta",
+        "edge_feasible",
+    ]
+    write_csv(out_dir / "checkpoint_selection.csv", rows, fieldnames)
+    save_checkpoint_selection_plots(out_dir, rows, active_reference_metrics)
+
+    summary_lines = [
+        "Checkpoint Selection Summary",
+        "",
+        f"active_reference={active_initial_weights}",
+        f"active_reference_kind={infer_model_kind(active_initial_weights)}",
+        f"active_final_reference={active_final_weights}",
+        f"active_final_kind={infer_model_kind(active_final_weights)}",
+        f"shadow_learner_mode={str(args.shadow_learner_mode)}",
+        f"shadow_adapter_layers={str(args.shadow_adapter_layers) if str(args.shadow_learner_mode) == 'adapter' else 'n/a'}",
+        f"eval_frames={eval_n}",
+        f"checkpoint_count_available={len(sorted(checkpoints_dir.glob('*.pt')))}",
+        f"checkpoint_count_evaluated={len(rows)}",
+        f"checkpoint_selection_stride={max(1, int(args.checkpoint_selection_stride))}",
+        f"checkpoint_selection_max_checkpoints={int(args.checkpoint_selection_max_checkpoints)}",
+        "",
+        "active_reference_metrics:",
+        format_metric("det_rate_at_conf", float(active_reference_metrics.get("det_rate_at_conf", float("nan"))), ".4f", prefix="  "),
+        format_metric("weird_box_rate", float(active_reference_metrics.get("weird_box_rate", float("nan"))), ".4f", prefix="  "),
+        format_metric("high_conf_weird_rate", float(active_reference_metrics.get("high_conf_weird_rate", float("nan"))), ".4f", prefix="  "),
+        format_metric("box_jump_rate", float(active_reference_metrics.get("box_jump_rate", float("nan"))), ".4f", prefix="  "),
+        format_metric("max_bad_streak", float(active_reference_metrics.get("max_bad_streak", float("nan"))), ".0f", prefix="  "),
+        format_metric("max_good_streak", float(active_reference_metrics.get("max_good_streak", float("nan"))), ".0f", prefix="  "),
+        format_metric("composite_score", float(active_reference_metrics.get("composite_score", float("nan"))), ".6f", prefix="  "),
+    ]
+    if final_reference_metrics:
+        summary_lines.extend(
+            [
+                "",
+                "active_final_reference_metrics:",
+                format_metric(
+                    "det_rate_at_conf",
+                    float(final_reference_metrics.get("det_rate_at_conf", float("nan"))),
+                    ".4f",
+                    prefix="  ",
+                ),
+                format_metric(
+                    "composite_score",
+                    float(final_reference_metrics.get("composite_score", float("nan"))),
+                    ".6f",
+                    prefix="  ",
+                ),
+            ]
+        )
+    summary_lines.extend(["", "best_checkpoints:"])
+    for category, row in categories.items():
+        summary_lines.append(format_checkpoint_summary_row(category, row))
+    if float(args.max_promotion_latency_ms) <= 0.0 and float(args.max_promotion_memory_mb) <= 0.0:
+        summary_lines.extend(
+            [
+                "",
+                "edge_feasible_note=latency and memory budgets are disabled, so edge-feasible ranking is unconstrained.",
+            ]
+        )
+    (out_dir / "checkpoint_selection_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+    return rows, categories, active_reference_metrics
+
+
 def main() -> None:
     args = parse_args()
+    apply_promotion_policy_defaults(args)
     random.seed(int(args.seed))
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
@@ -1051,6 +1882,9 @@ def main() -> None:
 
     active_weights = str(args.active_weights)
     shadow_init_weights = str(args.shadow_init_weights or active_weights)
+    active_initial_weights = active_weights
+    active_initial_kind = infer_model_kind(active_initial_weights)
+    shadow_init_kind = infer_model_kind(shadow_init_weights)
     active_yolo = load_yolo(active_weights, str(args.device))
     shadow_cfg = shadow_config_from_args(args)
     shadow = ShadowODADLearner(shadow_init_weights, shadow_cfg, seed=int(args.seed))
@@ -1062,6 +1896,7 @@ def main() -> None:
     recent_shadow_records: deque[PredictionRecord] = deque(maxlen=max(20, min(100, int(args.eval_window))))
     manager_rows: List[Dict[str, object]] = []
     promotion_rows: List[Dict[str, object]] = []
+    active_streak_rollback_rows: List[Dict[str, object]] = []
     window_metric_rows: List[Dict[str, object]] = []
     resource_rows: List[Dict[str, object]] = []
     active_frame_latencies: List[float] = []
@@ -1071,6 +1906,10 @@ def main() -> None:
     promotions = 0
     rollbacks = 0
     consecutive_failures = 0
+    active_current_bad_streak = 0
+    active_streak_rollbacks = 0
+    previous_active_checkpoint_for_rollback: Optional[str] = None
+    last_active_promotion_frame: Optional[int] = None
     last_candidate_checkpoint: Optional[Path] = None
     last_promoted_checkpoint: Optional[Path] = None
 
@@ -1096,6 +1935,10 @@ def main() -> None:
             args=args,
         )
         active_prev_record = active_record
+        if prediction_record_is_bad(active_record, args):
+            active_current_bad_streak += 1
+        else:
+            active_current_bad_streak = 0
         active_frame_latencies.append(float(active_latency_ms))
         rolling_window.append(img_path)
 
@@ -1140,12 +1983,50 @@ def main() -> None:
                 "shadow_updates_this_frame": shadow_step.log.updates_this_frame,
                 "shadow_buffer_size": shadow_step.log.buffer_size,
                 "shadow_accepted": shadow_step.log.accepted_final,
+                "shadow_learner_mode": shadow.learner_mode,
                 "update_paused": int(update_paused),
                 "throttle_weird_rate": throttle_metrics.get("weird_box_rate", float("nan")),
                 "throttle_box_jump_rate": throttle_metrics.get("box_jump_rate", float("nan")),
                 "active_weights": active_weights,
+                "active_model_kind": infer_model_kind(active_weights),
+                "promotion_policy": str(args.promotion_policy),
+                "active_current_bad_streak": active_current_bad_streak,
             }
         )
+
+        if (
+            bool(args.enable_active_streak_rollback)
+            and previous_active_checkpoint_for_rollback
+            and last_active_promotion_frame is not None
+        ):
+            frames_after_promotion = (idx + 1) - int(last_active_promotion_frame)
+            if (
+                active_current_bad_streak >= int(args.active_rollback_bad_streak)
+                and frames_after_promotion >= int(args.active_rollback_min_frames_after_promotion)
+            ):
+                replaced_active_path = active_weights
+                rolled_back_active_path = str(previous_active_checkpoint_for_rollback)
+                del active_yolo
+                cleanup_cuda()
+                active_weights = rolled_back_active_path
+                active_yolo = load_yolo(active_weights, str(args.device))
+                active_streak_rollbacks += 1
+                active_streak_rollback_rows.append(
+                    {
+                        "frame": idx + 1,
+                        "current_bad_streak": active_current_bad_streak,
+                        "frames_after_promotion": frames_after_promotion,
+                        "previous_active_path": previous_active_checkpoint_for_rollback,
+                        "replaced_active_path": replaced_active_path,
+                        "rolled_back_active_path": rolled_back_active_path,
+                        "active_rollback_bad_streak": int(args.active_rollback_bad_streak),
+                        "active_rollback_min_frames_after_promotion": int(args.active_rollback_min_frames_after_promotion),
+                    }
+                )
+                active_current_bad_streak = 0
+                active_prev_record = None
+                previous_active_checkpoint_for_rollback = None
+                last_active_promotion_frame = None
 
         should_eval = (
             len(rolling_window) >= min(int(args.eval_window), len(images))
@@ -1183,24 +2064,31 @@ def main() -> None:
                 shadow_logs=shadow_logs,
                 checkpoint_path=candidate_checkpoint,
                 trainable_params=shadow.trainable_params,
+                adapter_trainable_params=shadow.adapter_trainable_params,
+                learner_mode=shadow.learner_mode,
                 device=str(args.device),
             )
             resource_rows.append(resource)
-            active_metrics["promotion_score"] = promotion_score(active_metrics)
-            shadow_metrics["promotion_score"] = promotion_score(shadow_metrics)
+            add_score_metrics(active_metrics)
+            add_score_metrics(shadow_metrics)
             window_metric_rows.append(flatten_metrics_row(idx + 1, "active", active_metrics, active_weights))
             window_metric_rows.append(flatten_metrics_row(idx + 1, "shadow", shadow_metrics, str(candidate_checkpoint)))
 
-            promote, fail_reasons = should_promote(
+            decision = evaluate_promotion_decision(
                 active_metrics=active_metrics,
                 shadow_metrics=shadow_metrics,
                 resource_metrics=resource,
                 promotions_so_far=promotions,
                 args=args,
             )
+            promote = decision.promote
             event = "promote" if promote else "reject"
+            if decision.would_promote and not promote:
+                event = "would_promote"
             promoted_checkpoint = ""
             if promote:
+                previous_active_checkpoint_for_rollback = active_weights
+                last_active_promotion_frame = idx + 1
                 promoted_path = shadow.save_checkpoint(
                     promoted_dir / f"active_frame_{idx + 1:06d}.pt",
                     checkpoint_type="promoted_active",
@@ -1213,6 +2101,8 @@ def main() -> None:
                 active_yolo = load_yolo(active_weights, str(args.device))
                 promotions += 1
                 consecutive_failures = 0
+                active_current_bad_streak = 0
+                active_prev_record = None
                 del shadow
                 cleanup_cuda()
                 shadow = ShadowODADLearner(active_weights, shadow_cfg, seed=int(args.seed) + idx + promotions)
@@ -1220,43 +2110,67 @@ def main() -> None:
                 recent_shadow_records.clear()
                 shadow_recent_prev_record = None
             else:
-                consecutive_failures += 1
-                rollback_now = bool(
-                    int(args.rollback_on_failures) > 0
-                    and consecutive_failures >= int(args.rollback_on_failures)
-                    and promotions < int(args.max_promotions)
-                )
-                if rollback_now:
-                    event = "rollback"
-                    rollbacks += 1
+                if decision.would_promote:
                     consecutive_failures = 0
-                    del shadow
-                    cleanup_cuda()
-                    shadow = ShadowODADLearner(active_weights, shadow_cfg, seed=int(args.seed) + idx + rollbacks)
-                    shadow.warmup(window_paths[-min(len(window_paths), int(args.warmup)) :], int(args.warmup))
-                    recent_shadow_records.clear()
-                    shadow_recent_prev_record = None
+                else:
+                    consecutive_failures += 1
+                    rollback_now = bool(
+                        int(args.rollback_on_failures) > 0
+                        and consecutive_failures >= int(args.rollback_on_failures)
+                        and promotions < int(args.max_promotions)
+                    )
+                    if rollback_now:
+                        event = "rollback"
+                        rollbacks += 1
+                        consecutive_failures = 0
+                        del shadow
+                        cleanup_cuda()
+                        shadow = ShadowODADLearner(active_weights, shadow_cfg, seed=int(args.seed) + idx + rollbacks)
+                        shadow.warmup(window_paths[-min(len(window_paths), int(args.warmup)) :], int(args.warmup))
+                        recent_shadow_records.clear()
+                        shadow_recent_prev_record = None
 
             promotion_rows.append(
                 {
                     "frame": idx + 1,
+                    "policy": decision.policy,
                     "event": event,
                     "promoted": int(promote),
+                    "would_promote": int(decision.would_promote),
+                    "hard_gate_passed": int(decision.hard_gate_passed),
+                    "promotion_block_reason": decision.promotion_block_reason,
+                    "streak_gate_block_reason": decision.streak_gate_block_reason,
                     "active_score": active_metrics["promotion_score"],
                     "shadow_score": shadow_metrics["promotion_score"],
+                    "active_composite_score": active_metrics["composite_score"],
+                    "shadow_composite_score": shadow_metrics["composite_score"],
+                    "composite_score_delta": decision.composite_score_delta,
+                    "det_rate_delta": decision.det_rate_delta,
+                    "weird_rate_delta": decision.weird_rate_delta,
+                    "box_jump_delta": decision.box_jump_delta,
+                    "bad_streak_delta": decision.bad_streak_delta,
+                    "good_streak_delta": decision.good_streak_delta,
                     "active_det_rate": active_metrics["det_rate_at_conf"],
                     "shadow_det_rate": shadow_metrics["det_rate_at_conf"],
                     "active_weird_rate": active_metrics["weird_box_rate"],
                     "shadow_weird_rate": shadow_metrics["weird_box_rate"],
                     "active_box_jump_rate": active_metrics["box_jump_rate"],
                     "shadow_box_jump_rate": shadow_metrics["box_jump_rate"],
+                    "max_bad_streak_ratio": decision.max_bad_streak_ratio,
+                    "max_bad_streak_allowed": decision.max_bad_streak_allowed,
                     "active_max_bad_streak": active_metrics["max_bad_streak"],
                     "shadow_max_bad_streak": shadow_metrics["max_bad_streak"],
+                    "active_p95_bad_streak": decision.active_p95_bad_streak,
+                    "shadow_p95_bad_streak": decision.shadow_p95_bad_streak,
+                    "p95_bad_streak_delta": decision.p95_bad_streak_delta,
+                    "active_long_bad_streak_count": decision.active_long_bad_streak_count,
+                    "shadow_long_bad_streak_count": decision.shadow_long_bad_streak_count,
+                    "long_bad_streak_delta": decision.long_bad_streak_delta,
                     "active_max_good_streak": active_metrics["max_good_streak"],
                     "shadow_max_good_streak": shadow_metrics["max_good_streak"],
                     "candidate_checkpoint": str(candidate_checkpoint),
                     "promoted_checkpoint": promoted_checkpoint,
-                    "fail_reasons": ";".join(fail_reasons),
+                    "fail_reasons": ";".join(decision.fail_reasons),
                     "consecutive_failures": consecutive_failures,
                     "promotions": promotions,
                     "rollbacks": rollbacks,
@@ -1286,6 +2200,8 @@ def main() -> None:
             shadow_logs=shadow_logs,
             checkpoint_path=last_candidate_checkpoint,
             trainable_params=shadow.trainable_params,
+            adapter_trainable_params=shadow.adapter_trainable_params,
+            learner_mode=shadow.learner_mode,
             device=str(args.device),
         )
     )
@@ -1307,10 +2223,14 @@ def main() -> None:
             "shadow_updates_this_frame",
             "shadow_buffer_size",
             "shadow_accepted",
+            "shadow_learner_mode",
             "update_paused",
             "throttle_weird_rate",
             "throttle_box_jump_rate",
             "active_weights",
+            "active_model_kind",
+            "promotion_policy",
+            "active_current_bad_streak",
         ],
     )
     write_csv(
@@ -1318,18 +2238,39 @@ def main() -> None:
         promotion_rows,
         [
             "frame",
+            "policy",
             "event",
             "promoted",
+            "would_promote",
+            "hard_gate_passed",
+            "promotion_block_reason",
+            "streak_gate_block_reason",
             "active_score",
             "shadow_score",
+            "active_composite_score",
+            "shadow_composite_score",
+            "composite_score_delta",
+            "det_rate_delta",
+            "weird_rate_delta",
+            "box_jump_delta",
+            "bad_streak_delta",
+            "good_streak_delta",
             "active_det_rate",
             "shadow_det_rate",
             "active_weird_rate",
             "shadow_weird_rate",
             "active_box_jump_rate",
             "shadow_box_jump_rate",
+            "max_bad_streak_ratio",
+            "max_bad_streak_allowed",
             "active_max_bad_streak",
             "shadow_max_bad_streak",
+            "active_p95_bad_streak",
+            "shadow_p95_bad_streak",
+            "p95_bad_streak_delta",
+            "active_long_bad_streak_count",
+            "shadow_long_bad_streak_count",
+            "long_bad_streak_delta",
             "active_max_good_streak",
             "shadow_max_good_streak",
             "candidate_checkpoint",
@@ -1338,6 +2279,20 @@ def main() -> None:
             "consecutive_failures",
             "promotions",
             "rollbacks",
+        ],
+    )
+    write_csv(
+        out_dir / "active_streak_rollback_events.csv",
+        active_streak_rollback_rows,
+        [
+            "frame",
+            "current_bad_streak",
+            "frames_after_promotion",
+            "previous_active_path",
+            "replaced_active_path",
+            "rolled_back_active_path",
+            "active_rollback_bad_streak",
+            "active_rollback_min_frames_after_promotion",
         ],
     )
     metric_fields = [
@@ -1351,12 +2306,22 @@ def main() -> None:
         "weird_box_rate",
         "high_conf_weird_rate",
         "box_jump_rate",
+        "bad_frame_rate",
+        "good_frame_rate",
+        "bad_streak_count",
         "max_bad_streak",
+        "mean_bad_streak_len",
+        "p90_bad_streak_len",
+        "p95_bad_streak_len",
+        "long_bad_streak_count",
         "max_good_streak",
         "mean_good_streak_len",
         "num_good_streaks",
+        "p90_good_streak_len",
+        "p95_good_streak_len",
         "mean_inference_latency_ms",
         "p90_inference_latency_ms",
+        "composite_score",
         "promotion_score",
     ]
     write_csv(out_dir / "active_vs_shadow_window_metrics.csv", window_metric_rows, metric_fields)
@@ -1377,10 +2342,29 @@ def main() -> None:
             "current_cuda_allocated_mb",
             "current_cuda_reserved_mb",
             "checkpoint_size_mb",
+            "shadow_learner_mode",
+            "adapter_trainable_params",
             "trainable_params",
         ],
     )
     save_manager_plots(out_dir, manager_rows, window_metric_rows, resource_rows)
+
+    checkpoint_selection_rows: List[Dict[str, object]] = []
+    checkpoint_selection_winners: Dict[str, Optional[Mapping[str, object]]] = {}
+    checkpoint_selection_active_ref: Dict[str, float] = {}
+    if bool(args.checkpoint_selection):
+        del active_yolo
+        del shadow
+        cleanup_cuda()
+        checkpoint_selection_rows, checkpoint_selection_winners, checkpoint_selection_active_ref = evaluate_checkpoint_selection(
+            out_dir=out_dir,
+            checkpoints_dir=checkpoints_dir,
+            images=images,
+            image_sizes=image_sizes,
+            active_initial_weights=active_initial_weights,
+            active_final_weights=active_weights,
+            args=args,
+        )
 
     final_resource = resource_rows[-1]
     last_eval_rows = window_metric_rows[-2:] if len(window_metric_rows) >= 2 else []
@@ -1391,16 +2375,28 @@ def main() -> None:
         "  active_model=stable inference model used on every stream frame",
         "  shadow_model=clean top-k2 ODAD learner updated in background",
         "  promotion=label-free same-window active-vs-shadow reliability/resource gate",
+        f"  shadow_learner_mode={str(args.shadow_learner_mode)}",
+        f"  shadow_adapter_layers={str(args.shadow_adapter_layers) if str(args.shadow_learner_mode) == 'adapter' else 'n/a'}",
+        f"  shadow_adapter_reduction={int(args.shadow_adapter_reduction)}",
+        f"  shadow_adapter_scale={float(args.shadow_adapter_scale):.3f}",
+        f"  shadow_adapter_train_detect_head={int(bool(args.shadow_adapter_train_detect_head))}",
         "",
         f"active_initial_weights={args.active_weights}",
+        f"active_initial_kind={active_initial_kind}",
         f"shadow_initial_weights={shadow_init_weights}",
+        f"shadow_initial_kind={shadow_init_kind}",
         f"active_final_weights={active_weights}",
+        f"active_final_kind={infer_model_kind(active_weights)}",
         f"dataset={args.dataset}",
         f"frames={len(images)}",
         f"eval_window={int(args.eval_window)}",
         f"promotion_every_frames={int(args.promotion_every_frames)}",
+        f"promotion_policy={str(args.promotion_policy)}",
+        f"promotion_policy_description={PROMOTION_POLICY_DEFAULTS[str(args.promotion_policy)]['description']}",
+        f"allow_diagnostic_promotions={int(bool(args.allow_diagnostic_promotions))}",
         f"promotions={promotions}",
         f"rollbacks={rollbacks}",
+        f"active_streak_rollbacks={active_streak_rollbacks}",
         f"last_candidate_checkpoint={last_candidate_checkpoint if last_candidate_checkpoint is not None else 'n/a'}",
         f"last_promoted_checkpoint={last_promoted_checkpoint if last_promoted_checkpoint is not None else 'n/a'}",
         "",
@@ -1414,24 +2410,45 @@ def main() -> None:
         format_metric("peak_cuda_allocated_mb", float(final_resource["peak_cuda_allocated_mb"]), ".1f", prefix="  "),
         format_metric("peak_cuda_reserved_mb", float(final_resource["peak_cuda_reserved_mb"]), ".1f", prefix="  "),
         format_metric("checkpoint_size_mb", float(final_resource["checkpoint_size_mb"]), ".3f", prefix="  "),
+        f"  adapter_trainable_params={int(final_resource['adapter_trainable_params'])}",
         f"  trainable_params={int(final_resource['trainable_params'])}",
         "",
         "promotion_rule:",
         "  score = det_rate - 0.5*weird - 0.75*box_jump - 0.5*high_conf_weird - 0.002*max_bad_streak + 0.001*max_good_streak",
         f"  min_promotion_det_rate={float(args.min_promotion_det_rate):.3f}",
         f"  promotion_det_margin={float(args.promotion_det_margin):.3f}",
+        f"  max_bad_streak_ratio={float(args.max_bad_streak_ratio):.3f}",
+        f"  max_bad_streak_absolute_cap={int(args.max_bad_streak_absolute_cap)}",
+        f"  use_p95_bad_streak_gate={int(bool(args.use_p95_bad_streak_gate))}",
+        f"  p95_bad_streak_ratio={float(args.p95_bad_streak_ratio):.3f}",
+        f"  max_long_bad_streaks={int(args.max_long_bad_streaks)}",
+        f"  long_bad_streak_thresh={int(args.long_bad_streak_thresh)}",
+        f"  enable_active_streak_rollback={int(bool(args.enable_active_streak_rollback))}",
+        f"  active_rollback_bad_streak={int(args.active_rollback_bad_streak)}",
+        f"  active_rollback_min_frames_after_promotion={int(args.active_rollback_min_frames_after_promotion)}",
         f"  max_promotion_latency_ms={float(args.max_promotion_latency_ms):.3f}",
         f"  max_promotion_memory_mb={float(args.max_promotion_memory_mb):.3f}",
         "",
         "outputs:",
         "  manager_log.csv",
         "  promotion_events.csv",
+        "  active_streak_rollback_events.csv",
         "  active_vs_shadow_window_metrics.csv",
         "  resource_metrics.csv",
         "  checkpoints/",
         "  promoted/",
         "  plots/",
     ]
+    if bool(args.checkpoint_selection):
+        summary_lines.extend(
+            [
+                "  checkpoint_selection.csv",
+                "  checkpoint_selection_summary.txt",
+                "  plots/plot_checkpoint_selection_score.png",
+                "  plots/plot_checkpoint_selection_det_weird_jump.png",
+                "  plots/plot_checkpoint_selection_streaks.png",
+            ]
+        )
     if last_eval_rows:
         summary_lines.extend(["", "last_active_vs_shadow_window:"])
         for row in last_eval_rows:
@@ -1442,9 +2459,35 @@ def main() -> None:
                 f"high_conf_weird={float(row['high_conf_weird_rate']):.4f} "
                 f"box_jump={float(row['box_jump_rate']):.4f} "
                 f"max_bad={float(row['max_bad_streak']):.0f} "
+                f"p95_bad={float(row.get('p95_bad_streak_len', float('nan'))):.1f} "
+                f"long_bad={float(row.get('long_bad_streak_count', float('nan'))):.0f} "
                 f"max_good={float(row['max_good_streak']):.0f} "
                 f"score={float(row['promotion_score']):.6f}"
             )
+    if active_streak_rollback_rows:
+        summary_lines.extend(["", "active_streak_rollback_events:"])
+        for row in active_streak_rollback_rows:
+            summary_lines.append(
+                "  "
+                f"frame={int(row['frame'])} bad_streak={int(row['current_bad_streak'])} "
+                f"replaced={row['replaced_active_path']} rolled_back={row['rolled_back_active_path']}"
+            )
+    if bool(args.checkpoint_selection):
+        summary_lines.extend(
+            [
+                "",
+                "checkpoint_selection:",
+                f"  evaluated_checkpoints={len(checkpoint_selection_rows)}",
+                format_metric(
+                    "active_reference_composite_score",
+                    float(checkpoint_selection_active_ref.get("composite_score", float("nan"))),
+                    ".6f",
+                    prefix="  ",
+                ),
+            ]
+        )
+        for category, row in checkpoint_selection_winners.items():
+            summary_lines.append(format_checkpoint_summary_row(category, row))
     (out_dir / "summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
     print(f"Done. Wrote shadow manager outputs to: {out_dir}")
 

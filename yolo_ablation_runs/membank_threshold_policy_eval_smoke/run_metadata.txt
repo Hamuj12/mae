@@ -1,0 +1,8 @@
+dataset=/home/hm25936/datasets_for_yolo/lab_images_6000
+weights=/home/hm25936/mae/odad/membank_bank16_top2_teacherroi_full/student_final.pt
+model_name=membank_bank16_top2_teacherroi_full
+n_images=40
+device=cuda:0
+infer_conf=0.0010
+iou=0.450
+policies=static_025,static_015,adaptive_025_to_015_stable,adaptive_025_to_005_strict,hysteresis_policy
